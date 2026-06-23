@@ -1,0 +1,6 @@
+import type {Conversation} from './types'
+const json=async<T>(url:string,options?:RequestInit):Promise<T>=>{const r=await fetch(url,{headers:{'Content-Type':'application/json'},...options});if(!r.ok)throw new Error((await r.json()).detail||'请求失败');return r.json()}
+export const listConversations=()=>json<Conversation[]>('/api/conversations')
+export const createConversation=()=>json<Conversation>('/api/conversations',{method:'POST',body:JSON.stringify({title:'新任务'})})
+export const getConversation=(id:string)=>json<Conversation>(`/api/conversations/${id}`)
+export async function streamMessage(id:string,content:string,onToken:(token:string)=>void){const r=await fetch(`/api/conversations/${id}/messages/stream`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})});if(!r.ok)throw new Error((await r.json()).detail||'发送失败');const reader=r.body?.getReader();if(!reader)return;const decoder=new TextDecoder();let buffer='';while(true){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const blocks=buffer.split('\n\n');buffer=blocks.pop()||'';for(const block of blocks){const line=block.split('\n').find(v=>v.startsWith('data: '));if(!line)continue;const data=JSON.parse(line.slice(6));if(data.type==='token')onToken(data.content);if(data.type==='error')throw new Error(data.message)}}}

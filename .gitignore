@@ -1,0 +1,13 @@
+api/.venv/
+api/data/
+**/__pycache__/
+*.py[cod]
+api/.env
+data/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+.api.pid
+.web.pid
+.server.pid
+.playwright-cli/
