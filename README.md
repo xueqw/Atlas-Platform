@@ -30,8 +30,8 @@
 ## 一键启动
 
 ```powershell
-cd E:\codexi-agent-platform-demo
-.\start-dev.ps1
+cd E:/codex/ai-agent-platform-demo
+./start-dev.ps1
 ```
 
 - React 工作台：<http://localhost:5173>
