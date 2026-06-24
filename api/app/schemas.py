@@ -89,3 +89,16 @@ class KnowledgeBaseOut(BaseModel):
     description: str
     created_at: datetime
     documents: list[DocumentOut] = []
+
+
+# ── knowledge base (Chroma RAG) ────────────────────────────────────
+
+class KnowledgeIndexRequest(BaseModel):
+    collection: str = Field(default="default", max_length=80)
+    documents: list[str] = Field(min_length=1, max_length=200)
+
+
+class KnowledgeSearchRequest(BaseModel):
+    collection: str = Field(default="default", max_length=80)
+    query: str = Field(min_length=1, max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=50)

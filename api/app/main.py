@@ -11,7 +11,8 @@ from .model_gateway import embed_query, embed_texts, list_providers, stream_agen
 from .connectors import feishu, github_mcp
 from . import tools as agent_tools
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Message
-from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest
+from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest, KnowledgeIndexRequest, KnowledgeSearchRequest
+from .services.rag import delete_collection, index_documents, retrieve
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -306,3 +307,22 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── knowledge base ────────────────────────────────────────────────
+
+@app.post("/api/knowledge/index")
+def knowledge_index(payload: KnowledgeIndexRequest):
+    index_documents(payload.collection, payload.documents)
+    return {"ok": True, "count": len(payload.documents), "collection": payload.collection}
+
+
+@app.post("/api/knowledge/search")
+def knowledge_search(payload: KnowledgeSearchRequest):
+    hits = retrieve(payload.collection, payload.query, top_k=payload.top_k)
+    return {"results": hits, "count": len(hits)}
+
+
+@app.delete("/api/knowledge/{collection_name}", status_code=204)
+def knowledge_delete(collection_name: str):
+    delete_collection(collection_name)
