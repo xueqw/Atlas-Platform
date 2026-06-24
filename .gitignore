@@ -6,8 +6,14 @@ api/.env
 data/
 web/node_modules/
 web/dist/
+web/.vite/
 web/*.tsbuildinfo
 .api.pid
 .web.pid
 .server.pid
 .playwright-cli/
+.idea/
+**/.idea/
+.claude/
+*.log
+README_new.md

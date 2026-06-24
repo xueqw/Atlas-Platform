@@ -76,6 +76,10 @@ const mime = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=u
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
+    if (!url.pathname.startsWith('/api/')) {
+      res.writeHead(302, { Location: `http://localhost:5173${url.pathname}${url.search}` });
+      return res.end();
+    }
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     let file = path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname);
     if (!file.startsWith(PUBLIC)) return json(res, 403, { error: '禁止访问' });

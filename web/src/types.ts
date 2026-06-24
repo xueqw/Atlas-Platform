@@ -1,2 +1,10 @@
+export type Source={document:string;page:number;quote:string;score:number}
 export type Message={id:string;role:'user'|'assistant';content:string;sources:string;created_at:string}
 export type Conversation={id:string;title:string;created_at:string;updated_at:string;messages?:Message[]}
+export type KnowledgeDocument={id:string;knowledge_base_id:string;name:string;content_type:string;size:number;status:string;chunk_count:number;created_at:string}
+export type KnowledgeBase={id:string;name:string;description:string;created_at:string;documents:KnowledgeDocument[]}
+export type Agent={id:string;name:string;description:string;system_prompt:string;model:string;knowledge_base_id:string|null;status:string;created_at:string;updated_at:string}
+export type ModelProvider={id:string;name:string;base_url:string;configured:boolean;models:string[];note:string}
+export type ModelCatalog={default:string;providers:ModelProvider[]}
+export type ModelTestResult={ok:boolean;latency_ms?:number;message?:string}
+export type Connector={provider:string;name:string;description:string;configured:boolean;connected:boolean;account_name:string;actions:string[]}
