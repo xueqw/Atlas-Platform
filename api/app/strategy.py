@@ -28,10 +28,13 @@ PLANNER_SYSTEM = """你是 Atlas 智能体平台的任务规划器（Strategy Ag
 - steps 每项含：id、type(取值 retrieve|respond|tool)、title(中文短语)、executor(取值 rag|llm|mcp_tool)。
 - 通常以一个 respond 步骤收尾；需要检索时 retrieve 步骤放在最前；需要工具时 tool 步骤放在 respond 前。
 - 没有合适步骤时退化为单个 respond 步骤。
+- skills：从下方「可用技能」列表里选出最适合本次任务的技能 id（0..N 个，可为空数组），
+  放进 steps 同级的 "skills" 字段。只填列表中真实存在的 id；不确定就留空数组。
 """
 
 
-def _user_prompt(input_text: str, has_kb: bool, connectors: list[str], agent_prompt: str | None) -> str:
+def _user_prompt(input_text: str, has_kb: bool, connectors: list[str], agent_prompt: str | None,
+                 skill_catalog: list[dict] | None = None) -> str:
     lines = [
         f"用户请求：{input_text}",
         f"当前可用知识库：{'有' if has_kb else '无'}",
@@ -39,6 +42,10 @@ def _user_prompt(input_text: str, has_kb: bool, connectors: list[str], agent_pro
     ]
     if agent_prompt:
         lines.append(f"智能体身份与规则：{agent_prompt[:300]}")
+    if skill_catalog:
+        lines.append("可用技能（id — 名称：描述）：")
+        for s in skill_catalog:
+            lines.append(f"- {s['id']} — {s['name']}：{s['description']}")
     lines.append("请输出 JSON 计划。")
     return "\n".join(lines)
 
@@ -67,7 +74,8 @@ def _parse_json(raw: str) -> dict | None:
     return None
 
 
-def _normalize(data: dict, has_kb: bool, connectors: list[str], input_text: str) -> dict:
+def _normalize(data: dict, has_kb: bool, connectors: list[str], input_text: str,
+               skill_catalog: list[dict] | None = None) -> dict:
     requires_knowledge = bool(data.get("requires_knowledge")) and has_kb
     requires_tools = bool(data.get("requires_tools")) and bool(connectors)
     steps: list[dict] = []
@@ -105,11 +113,15 @@ def _normalize(data: dict, has_kb: bool, connectors: list[str], input_text: str)
         steps.insert(0, {"id": "step_0", "type": "retrieve", "title": "检索知识库", "executor": "rag"})
     if not requires_knowledge:
         steps = [s for s in steps if s["type"] != "retrieve"]
+    # skill 自动选：仅保留 catalog 内真实存在的 id
+    catalog_ids = {s["id"] for s in (skill_catalog or [])}
+    skills = [sid for sid in (data.get("skills") or []) if sid in catalog_ids]
     return {
         "goal": str(data.get("goal") or input_text[:60]),
         "requires_knowledge": requires_knowledge,
         "requires_tools": requires_tools,
         "steps": steps,
+        "skills": skills,
         "source": "llm",
     }
 
@@ -125,19 +137,21 @@ def fallback_plan(input_text: str, has_kb: bool, connectors: list[str]) -> dict:
         "requires_knowledge": has_kb,
         "requires_tools": bool(connectors),
         "steps": steps,
+        "skills": [],
         "source": "fallback",
     }
 
 
 async def plan(*, input_text: str, has_knowledge_base: bool, enabled_connectors: list[str],
-               agent_prompt: str | None, model: str | None) -> dict:
-    """让 Strategy Agent 产出结构化计划；任何异常都退化到确定性计划，绝不阻断主流程。"""
+               agent_prompt: str | None, model: str | None,
+               skill_catalog: list[dict] | None = None) -> dict:
+    """让 Strategy Agent 产出结构化计划（含自动选 skill）；任何异常都退化到确定性计划，绝不阻断主流程。"""
     fallback = fallback_plan(input_text, has_knowledge_base, enabled_connectors)
     try:
         raw = await complete(
             [
                 {"role": "system", "content": PLANNER_SYSTEM},
-                {"role": "user", "content": _user_prompt(input_text, has_knowledge_base, enabled_connectors, agent_prompt)},
+                {"role": "user", "content": _user_prompt(input_text, has_knowledge_base, enabled_connectors, agent_prompt, skill_catalog)},
             ],
             model,
             temperature=0,
@@ -146,6 +160,6 @@ async def plan(*, input_text: str, has_knowledge_base: bool, enabled_connectors:
         data = _parse_json(raw)
         if not data:
             return fallback
-        return _normalize(data, has_knowledge_base, enabled_connectors, input_text)
+        return _normalize(data, has_knowledge_base, enabled_connectors, input_text, skill_catalog)
     except Exception:
         return fallback
