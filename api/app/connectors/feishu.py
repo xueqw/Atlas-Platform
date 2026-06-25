@@ -62,11 +62,11 @@ def is_configured() -> bool:
     return bool(cfg["app_id"] and cfg["app_secret"])
 
 
-def build_authorize_url(state: str) -> str:
+def build_authorize_url(state: str, redirect_uri: str = "") -> str:
     cfg = _config()
     params = {
         "client_id": cfg["app_id"],
-        "redirect_uri": cfg["redirect_uri"],
+        "redirect_uri": redirect_uri or cfg["redirect_uri"],
         "response_type": "code",
         "scope": SCOPES,
         "state": state,
@@ -74,15 +74,15 @@ def build_authorize_url(state: str) -> str:
     return AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
 
 
-async def exchange_code(code: str) -> dict:
-    """用授权码换 user_access_token。"""
+async def exchange_code(code: str, redirect_uri: str = "") -> dict:
+    """用授权码换 user_access_token。redirect_uri 须与授权时一致（登录链路传登录回调）。"""
     cfg = _config()
     payload = {
         "grant_type": "authorization_code",
         "client_id": cfg["app_id"],
         "client_secret": cfg["app_secret"],
         "code": code,
-        "redirect_uri": cfg["redirect_uri"],
+        "redirect_uri": redirect_uri or cfg["redirect_uri"],
     }
     async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
         r = await client.post(TOKEN_URL, json=payload)

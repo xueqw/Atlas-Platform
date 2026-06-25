@@ -2,6 +2,37 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    username: str
+    name: str
+    email: str = ""
+    avatar_url: str = ""
+
+
+class WorkspaceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+
+
+class MeOut(BaseModel):
+    user: UserOut
+    workspace: WorkspaceOut
+    role: str
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class AccountOut(BaseModel):
+    username: str
+    name: str
+
+
 class MessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -98,3 +129,38 @@ class KnowledgeBaseOut(BaseModel):
     description: str
     created_at: datetime
     documents: list[DocumentOut] = []
+
+
+# === Agent Runtime Pipeline（M1） ===
+
+class WorkflowStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    index: int
+    type: str
+    title: str
+    executor: str
+    skill_id: str | None = None
+    status: str
+    input_json: str = ""
+    output_json: str = ""
+    error: str = ""
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class WorkflowRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    conversation_id: str | None = None
+    agent_id: str | None = None
+    user_id: str | None = None
+    input_text: str
+    status: str
+    plan_json: str = ""
+    output_json: str = ""
+    error: str = ""
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    created_at: datetime
+    steps: list[WorkflowStepOut] = []

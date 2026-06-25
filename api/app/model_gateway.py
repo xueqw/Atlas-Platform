@@ -77,6 +77,22 @@ async def test_model(model: str) -> dict:
         return {"ok": False, "message": str(exc)}
 
 
+async def complete(messages: list[dict], model: str | None = None, *, temperature: float = 0.0,
+                   max_tokens: int = 600) -> str:
+    """非流式补全，返回完整文本。供 Strategy Agent 等内部规划用。
+    未配置 key（演示模式）返回空串，让调用方走确定性回退；不注入对话用 SYSTEM_PROMPT。"""
+    base_url, api_key, real_model = resolve_provider(model)
+    if not api_key:
+        return ""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": real_model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    async with httpx.AsyncClient(timeout=40, trust_env=False) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json().get("choices", [{}])[0].get("message", {}).get("content") or ""
+
+
 async def stream_model(messages: list[dict], model: str | None = None):
     base_url, api_key, real_model = resolve_provider(model)
     if not api_key:

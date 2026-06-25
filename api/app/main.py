@@ -1,19 +1,24 @@
 import json
 import secrets
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from . import auth
+from . import strategy
+from . import workflow as wf
+from .auth import current_user, current_workspace_id
+from .config import settings
 from .database import SessionLocal, ensure_schema, get_db
 from .knowledge import extract_pages, search_chunks, split_pages
 from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
 from .connectors import feishu, github_mcp
 from . import tools as agent_tools
-from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Message
-from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest
+from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, User, WorkflowRun
+from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, MeOut, ModelTestRequest, WorkflowRunOut
 
-app = FastAPI(title="Atlas Agent Platform API", version="0.2.0")
+app = FastAPI(title="Atlas Agent Platform API", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -24,62 +29,103 @@ def startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "atlas-api", "version": "0.2.0"}
+    return {"status": "ok", "service": "atlas-api", "version": "0.3.0"}
+
+
+# ============ 认证：账号密码 + httpOnly cookie 会话 ============
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        auth.COOKIE_NAME, token, httponly=True, samesite="lax", secure=False,
+        max_age=settings.session_ttl_hours * 3600, path="/",
+    )
+
+
+@app.get("/api/auth/accounts", response_model=list[AccountOut])
+def list_accounts():
+    """登录页用：列出预置测试账号（不含密码），前端渲染成点选登录的卡片。"""
+    return auth.TEST_ACCOUNTS
+
+
+@app.post("/api/auth/login", response_model=MeOut)
+def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    user = auth.authenticate(db, payload.username, payload.password)
+    if not user:
+        raise HTTPException(401, "账号或密码错误")
+    token = auth.start_session(db, user)
+    _set_session_cookie(response, token)
+    role = db.scalar(select(Membership.role).where(
+        Membership.user_id == user.id, Membership.workspace_id == auth.get_or_create_default_workspace(db).id))
+    return MeOut(user=user, workspace=auth.get_or_create_default_workspace(db), role=role or "member")
+
+
+@app.post("/api/auth/logout", status_code=204)
+def logout(response: Response, atlas_session: str | None = Cookie(default=None), db: Session = Depends(get_db)):
+    auth.destroy_session(db, atlas_session)
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+
+
+@app.get("/api/me", response_model=MeOut)
+def me(user: User = Depends(current_user), ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    workspace = db.get(auth.Workspace, ws)
+    role = db.scalar(select(Membership.role).where(
+        Membership.user_id == user.id, Membership.workspace_id == ws))
+    return MeOut(user=user, workspace=workspace, role=role or "member")
 
 
 @app.get("/api/conversations", response_model=list[ConversationOut])
-def list_conversations(db: Session = Depends(get_db)):
-    return db.scalars(select(Conversation).order_by(Conversation.updated_at.desc())).all()
+def list_conversations(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    return db.scalars(select(Conversation).where(Conversation.workspace_id == ws).order_by(Conversation.updated_at.desc())).all()
 
 
 @app.post("/api/conversations", response_model=ConversationOut, status_code=201)
-def create_conversation(payload: ConversationCreate, db: Session = Depends(get_db)):
-    item = Conversation(title=payload.title.strip() or "新任务")
+def create_conversation(payload: ConversationCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = Conversation(title=payload.title.strip() or "新任务", workspace_id=ws)
     db.add(item); db.commit(); db.refresh(item)
     return item
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=ConversationDetail)
-def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
-    item = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id))
+def get_conversation(conversation_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id, Conversation.workspace_id == ws))
     if not item:
         raise HTTPException(404, "任务不存在")
     return item
 
 
 @app.delete("/api/conversations/{conversation_id}", status_code=204)
-def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
-    item = db.get(Conversation, conversation_id)
+def delete_conversation(conversation_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.workspace_id == ws))
     if not item:
         raise HTTPException(404, "任务不存在")
     db.delete(item); db.commit()
 
 
 @app.get("/api/models")
-def get_models():
+def get_models(user: User = Depends(current_user)):
     return list_providers()
 
 
 @app.post("/api/models/test")
-async def post_model_test(payload: ModelTestRequest):
+async def post_model_test(payload: ModelTestRequest, user: User = Depends(current_user)):
     return await test_model(payload.model)
 
 
 @app.get("/api/agents", response_model=list[AgentOut])
-def list_agents(db: Session = Depends(get_db)):
-    return db.scalars(select(Agent).order_by(Agent.updated_at.desc())).all()
+def list_agents(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    return db.scalars(select(Agent).where(Agent.workspace_id == ws).order_by(Agent.updated_at.desc())).all()
 
 
 @app.post("/api/agents", response_model=AgentOut, status_code=201)
-def create_agent(payload: AgentCreate, db: Session = Depends(get_db)):
-    item = Agent(**payload.model_dump())
+def create_agent(payload: AgentCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = Agent(**payload.model_dump(), workspace_id=ws)
     db.add(item); db.commit(); db.refresh(item)
     return item
 
 
 @app.put("/api/agents/{agent_id}", response_model=AgentOut)
-def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_db)):
-    item = db.get(Agent, agent_id)
+def update_agent(agent_id: str, payload: AgentUpdate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(select(Agent).where(Agent.id == agent_id, Agent.workspace_id == ws))
     if not item:
         raise HTTPException(404, "智能体不存在")
     for key, value in payload.model_dump().items():
@@ -89,36 +135,36 @@ def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_
 
 
 @app.delete("/api/agents/{agent_id}", status_code=204)
-def delete_agent(agent_id: str, db: Session = Depends(get_db)):
-    item = db.get(Agent, agent_id)
+def delete_agent(agent_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(select(Agent).where(Agent.id == agent_id, Agent.workspace_id == ws))
     if not item:
         raise HTTPException(404, "智能体不存在")
     db.delete(item); db.commit()
 
 
 @app.get("/api/knowledge-bases", response_model=list[KnowledgeBaseOut])
-def list_knowledge_bases(db: Session = Depends(get_db)):
-    return db.scalars(select(KnowledgeBase).options(selectinload(KnowledgeBase.documents)).order_by(KnowledgeBase.created_at.desc())).all()
+def list_knowledge_bases(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    return db.scalars(select(KnowledgeBase).where(KnowledgeBase.workspace_id == ws).options(selectinload(KnowledgeBase.documents)).order_by(KnowledgeBase.created_at.desc())).all()
 
 
 @app.post("/api/knowledge-bases", response_model=KnowledgeBaseOut, status_code=201)
-def create_knowledge_base(payload: KnowledgeBaseCreate, db: Session = Depends(get_db)):
-    item = KnowledgeBase(name=payload.name.strip(), description=payload.description.strip())
+def create_knowledge_base(payload: KnowledgeBaseCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = KnowledgeBase(name=payload.name.strip(), description=payload.description.strip(), workspace_id=ws)
     db.add(item); db.commit(); db.refresh(item)
     return item
 
 
 @app.delete("/api/knowledge-bases/{knowledge_base_id}", status_code=204)
-def delete_knowledge_base(knowledge_base_id: str, db: Session = Depends(get_db)):
-    item = db.get(KnowledgeBase, knowledge_base_id)
+def delete_knowledge_base(knowledge_base_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id, KnowledgeBase.workspace_id == ws))
     if not item:
         raise HTTPException(404, "知识库不存在")
     db.delete(item); db.commit()
 
 
 @app.post("/api/knowledge-bases/{knowledge_base_id}/documents", status_code=201)
-async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
+async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    knowledge_base = db.scalar(select(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id, KnowledgeBase.workspace_id == ws))
     if not knowledge_base:
         raise HTTPException(404, "知识库不存在")
     raw = await file.read()
@@ -148,7 +194,7 @@ async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), 
 
 
 @app.post("/api/attachments")
-async def extract_attachment(file: UploadFile = File(...)):
+async def extract_attachment(file: UploadFile = File(...), user: User = Depends(current_user)):
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 10 MB")
@@ -162,8 +208,11 @@ async def extract_attachment(file: UploadFile = File(...)):
 
 
 @app.delete("/api/documents/{document_id}", status_code=204)
-def delete_document(document_id: str, db: Session = Depends(get_db)):
-    item = db.get(Document, document_id)
+def delete_document(document_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = db.scalar(
+        select(Document).join(KnowledgeBase, Document.knowledge_base_id == KnowledgeBase.id)
+        .where(Document.id == document_id, KnowledgeBase.workspace_id == ws)
+    )
     if not item:
         raise HTTPException(404, "文档不存在")
     db.delete(item); db.commit()
@@ -184,29 +233,29 @@ def _deny(text: str) -> bool:
 
 
 @app.get("/api/connectors")
-async def list_connectors(db: Session = Depends(get_db)):
+async def list_connectors(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return {"connectors": [await feishu.get_status(db), await github_mcp.get_status()]}
 
 
 @app.post("/api/connectors/feishu/config")
-async def feishu_config(payload: FeishuConfigRequest, db: Session = Depends(get_db)):
+async def feishu_config(payload: FeishuConfigRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
     feishu.save_config(db, payload.app_id.strip(), payload.app_secret.strip())
     return await feishu.get_status(db)  # 立刻校验凭证
 
 
 @app.delete("/api/connectors/feishu/config", status_code=204)
-def feishu_config_clear(db: Session = Depends(get_db)):
+def feishu_config_clear(user: User = Depends(current_user), db: Session = Depends(get_db)):
     feishu.clear_config(db)
 
 
 @app.post("/api/connectors/github/config")
-async def github_config(payload: GithubConfigRequest, db: Session = Depends(get_db)):
+async def github_config(payload: GithubConfigRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
     github_mcp.save_pat(db, payload.pat.strip())
     return await github_mcp.get_status()  # 立刻验证：返回连接状态+工具数
 
 
 @app.delete("/api/connectors/github", status_code=204)
-def github_disconnect(db: Session = Depends(get_db)):
+def github_disconnect(user: User = Depends(current_user), db: Session = Depends(get_db)):
     github_mcp.clear(db)
 
 
@@ -235,8 +284,8 @@ async def feishu_callback(code: str = "", state: str = "", db: Session = Depends
 
 
 @app.post("/api/conversations/{conversation_id}/messages/stream")
-async def send_message(conversation_id: str, payload: ChatRequest, db: Session = Depends(get_db)):
-    conversation = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id))
+async def send_message(conversation_id: str, payload: ChatRequest, user: User = Depends(current_user), ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    conversation = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id, Conversation.workspace_id == ws))
     if not conversation:
         raise HTTPException(404, "任务不存在")
 
@@ -273,26 +322,26 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
 
         return StreamingResponse(confirm_events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    agent = db.get(Agent, payload.agent_id) if payload.agent_id else None
+    agent = db.scalar(select(Agent).where(Agent.id == payload.agent_id, Agent.workspace_id == ws)) if payload.agent_id else None
     # 以前端选择为准：选智能体时前端会自动把它的库填进下拉框；选「不使用知识库」即真的不用，
     # 不再用 agent.knowledge_base_id 偷偷回退（否则「不使用知识库」会被智能体绑定库覆盖）。
+    # 跨租户防护：只接受属于当前工作区的知识库，否则忽略，绝不检索别家资料。
     knowledge_base_id = payload.knowledge_base_id
-    query_vector = await embed_query(payload.content) if knowledge_base_id else None
-    sources = search_chunks(db, knowledge_base_id, payload.content, query_vector) if knowledge_base_id else []
+    if knowledge_base_id and not db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.id == knowledge_base_id, KnowledgeBase.workspace_id == ws)):
+        knowledge_base_id = None
     user_message = Message(conversation_id=conversation_id, role="user", content=payload.content)
     if not conversation.messages:
         conversation.title = payload.content[:28]
     db.add(user_message); db.commit()
-    history = [{"role": message.role, "content": message.content} for message in conversation.messages]
+    # 基础对话历史（不含知识库上下文）——是否检索交给 Strategy Agent 决定，命中后再注入
+    base_history = [{"role": message.role, "content": message.content} for message in conversation.messages]
     if agent:
-        history.append({"role": "system", "content": f"智能体身份与规则：\n{agent.system_prompt}"})
-    if sources:
-        context = "\n\n".join(f"[{item['document']} 第{item['page']}页]\n{item['content']}" for item in sources)
-        history.append({"role": "system", "content": "知识库资料（仅依据这些资料回答）：\n" + context})
+        base_history.append({"role": "system", "content": f"智能体身份与规则：\n{agent.system_prompt}"})
     if payload.attachment_text:
-        history.append({"role": "system", "content": f"用户上传的文件「{payload.attachment_name or '附件'}」内容：\n{payload.attachment_text[:8000]}"})
-    history.append({"role": "user", "content": payload.content})
+        base_history.append({"role": "system", "content": f"用户上传的文件「{payload.attachment_name or '附件'}」内容：\n{payload.attachment_text[:8000]}"})
+    user_turn = {"role": "user", "content": payload.content}
     model = payload.model
+    has_kb = bool(knowledge_base_id)
 
     # 组装本次可用工具：静态连接器（飞书）+ 动态 MCP 连接器（GitHub）
     tool_specs = agent_tools.specs(payload.connectors)
@@ -307,27 +356,106 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
     def needs_confirm(name: str) -> bool:
         return agent_tools.is_write(name) or name in mcp_write_names
 
+    # === Agent Runtime Pipeline（M1+M2）：本次执行登记为一个 run，由 Strategy Agent 规划 ===
+    run_id = wf.create_run(conversation_id, agent.id if agent else None, user.id, ws, payload.content)
+
+    def sse(payload_obj: dict) -> str:
+        return f"data: {json.dumps(payload_obj, ensure_ascii=False)}\n\n"
+
     async def events():
         parts: list[str] = []
-        public_sources = [{key: item[key] for key in ("document", "page", "quote", "score")} for item in sources]
+        history = list(base_history)
+        public_sources: list[dict] = []
+        respond_step_id: str | None = None
+        awaiting_confirm = False
+        next_idx = 0
+        yield sse({"type": "run_started", "run_id": run_id})
         try:
-            if public_sources:
-                yield f"data: {json.dumps({'type': 'sources', 'sources': public_sources}, ensure_ascii=False)}\n\n"
+            # === M2：Strategy Agent 规划（决定是否检索、是否需要工具、步骤拆解）===
+            yield sse({"type": "planning_started", "run_id": run_id})
+            plan = await strategy.plan(
+                input_text=payload.content, has_knowledge_base=has_kb,
+                enabled_connectors=payload.connectors,
+                agent_prompt=agent.system_prompt if agent else None, model=model,
+            )
+            wf.save_plan(run_id, plan)
+            yield sse({"type": "plan_created", "run_id": run_id, "plan": plan})
+
+            # 步骤①（可选，由计划决定）：知识库检索
+            if plan["requires_knowledge"] and knowledge_base_id:
+                rstep = wf.add_step(run_id, next_idx, "retrieve", "检索知识库", "rag", input_data={"knowledge_base_id": knowledge_base_id})
+                yield sse({"type": "step_started", "step_id": rstep, "index": next_idx, "step_type": "retrieve", "title": "检索知识库"})
+                query_vector = await embed_query(payload.content)
+                with SessionLocal() as rdb:
+                    sources = search_chunks(rdb, knowledge_base_id, payload.content, query_vector)
+                public_sources = [{key: item[key] for key in ("document", "page", "quote", "score")} for item in sources]
+                if sources:
+                    context = "\n\n".join(f"[{item['document']} 第{item['page']}页]\n{item['content']}" for item in sources)
+                    history.append({"role": "system", "content": "知识库资料（仅依据这些资料回答）：\n" + context})
+                wf.finish_step(rstep, "succeeded", output={"hits": len(sources)})
+                yield sse({"type": "step_completed", "step_id": rstep, "status": "succeeded", "output": {"hits": len(sources)}})
+                if public_sources:
+                    yield sse({"type": "sources", "sources": public_sources})
+                next_idx += 1
+
+            history.append(user_turn)
+
+            # 步骤②：生成回答（LLM + 工具循环；M2 工具仍在此循环内执行，M4 由 MCP Strategy Agent 拆成独立 tool step）
+            respond_step_id = wf.add_step(run_id, next_idx, "respond", "生成回答", "llm")
+            yield sse({"type": "step_started", "step_id": respond_step_id, "index": next_idx, "step_type": "respond", "title": "生成回答"})
             async for ev in stream_agent(history, model, tool_specs, execute_tool, needs_confirm=needs_confirm):
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
                     _pending_actions[conversation_id] = {"name": ev["name"], "args": args}
                     prompt = agent_tools.describe_call(ev["name"], args) + "\n\n确认请回复「确认」，取消请回复「取消」。"
                     parts.append(prompt)
-                    yield f"data: {json.dumps({'type': 'token', 'content': prompt}, ensure_ascii=False)}\n\n"
+                    awaiting_confirm = True
+                    yield sse({"type": "token", "content": prompt})
                     continue
                 if ev["type"] == "token":
                     parts.append(ev["content"])
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            save_assistant("".join(parts), json.dumps(public_sources, ensure_ascii=False))
-            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+                yield sse(ev)
+            answer = "".join(parts)
+            save_assistant(answer, json.dumps(public_sources, ensure_ascii=False))
+
+            if awaiting_confirm:
+                # 命中写操作确认闸门：run 暂停等确认（确认回复会另起一次执行）
+                wf.finish_step(respond_step_id, "waiting_confirmation", output={"chars": len(answer)})
+                wf.finish_run(run_id, "waiting_confirmation", output={"answer": answer, "sources": public_sources})
+                yield sse({"type": "step_completed", "step_id": respond_step_id, "status": "waiting_confirmation"})
+                yield sse({"type": "run_completed", "run_id": run_id, "status": "waiting_confirmation"})
+            else:
+                wf.finish_step(respond_step_id, "succeeded", output={"chars": len(answer)})
+                wf.finish_run(run_id, "succeeded", output={"answer": answer, "sources": public_sources})
+                yield sse({"type": "step_completed", "step_id": respond_step_id, "status": "succeeded"})
+                yield sse({"type": "run_completed", "run_id": run_id, "status": "succeeded"})
+            yield sse({"type": "done"})
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            if respond_step_id:
+                wf.finish_step(respond_step_id, "failed", error=str(exc))
+            wf.finish_run(run_id, "failed", error=str(exc))
+            yield sse({"type": "step_failed", "step_id": respond_step_id, "error": str(exc)})
+            yield sse({"type": "run_failed", "run_id": run_id, "error": str(exc)})
+            yield sse({"type": "error", "message": str(exc)})
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ============ Agent Runtime Pipeline：Run 查询（PRD §9.1） ============
+
+@app.get("/api/conversations/{conversation_id}/runs", response_model=list[WorkflowRunOut])
+def list_conversation_runs(conversation_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    if not db.scalar(select(Conversation.id).where(Conversation.id == conversation_id, Conversation.workspace_id == ws)):
+        raise HTTPException(404, "任务不存在")
+    return db.scalars(select(WorkflowRun).options(selectinload(WorkflowRun.steps)).where(
+        WorkflowRun.conversation_id == conversation_id, WorkflowRun.workspace_id == ws).order_by(WorkflowRun.created_at.desc())).all()
+
+
+@app.get("/api/workflows/runs/{run_id}", response_model=WorkflowRunOut)
+def get_workflow_run(run_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    run = db.scalar(select(WorkflowRun).options(selectinload(WorkflowRun.steps)).where(
+        WorkflowRun.id == run_id, WorkflowRun.workspace_id == ws))
+    if not run:
+        raise HTTPException(404, "运行记录不存在")
+    return run
 

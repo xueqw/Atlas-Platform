@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
     feishu_redirect_uri: str = "http://localhost:8000/api/connectors/feishu/callback"
+    # 入口认证：账号密码 + httpOnly cookie 会话
+    session_ttl_hours: int = 24 * 7
+    test_account_password: str = "atlas123"  # 预置测试账号共用密码
     # GitHub 连接器（通过官方远程 MCP Server）
     github_pat: str = ""
     github_mcp_url: str = "https://api.githubcopilot.com/mcp/"
