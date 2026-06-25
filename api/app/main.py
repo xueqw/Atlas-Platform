@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 from . import auth
 from . import strategy
 from . import workflow as wf
+from .tool_strategy import build_tool_policy
 from .auth import current_user, current_workspace_id
 from .config import settings
 from .database import SessionLocal, ensure_schema, get_db
@@ -353,8 +354,11 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         except Exception:
             pass  # GitHub MCP 拉取失败就跳过其工具，不影响整体对话
 
-    def needs_confirm(name: str) -> bool:
-        return agent_tools.is_write(name) or name in mcp_write_names
+    # M4：MCP Strategy Agent 的输入——写操作名集合 + 静态工具的连接器归属
+    static_write_names = {s["function"]["name"] for s in tool_specs
+                          if agent_tools.is_write(s["function"]["name"])}
+    write_names = static_write_names | mcp_write_names
+    connector_of = {name: t["connector"] for name, t in agent_tools.TOOLS.items()}
 
     # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
     # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
@@ -390,6 +394,9 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             from .skills_engine import build_skill_instructions, resolve_skills
             selected_skills = resolve_skills(skill_catalog, manual_skill_ids, plan.get("skills", []))
             plan["skills"] = selected_skills
+            # M4：MCP Strategy Agent——确定性工具策略，落进 plan_json 供审计
+            tool_policy = build_tool_policy(tool_specs, write_names, connector_of, plan.get("requires_tools", False))
+            plan["tool_policy"] = tool_policy
             wf.save_plan(run_id, plan)
             yield sse({"type": "plan_created", "run_id": run_id, "plan": plan})
             if selected_skills:
@@ -423,7 +430,8 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             # 步骤②：生成回答（LLM + 工具循环；M2 工具仍在此循环内执行，M4 由 MCP Strategy Agent 拆成独立 tool step）
             respond_step_id = wf.add_step(run_id, next_idx, "respond", "生成回答", "llm")
             yield sse({"type": "step_started", "step_id": respond_step_id, "index": next_idx, "step_type": "respond", "title": "生成回答"})
-            async for ev in stream_agent(history, model, tool_specs, execute_tool, needs_confirm=needs_confirm):
+            async for ev in stream_agent(history, model, tool_specs, execute_tool,
+                                         needs_confirm=lambda name: name in tool_policy["write_tools"]):
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
                     _pending_actions[conversation_id] = {"name": ev["name"], "args": args}
