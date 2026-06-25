@@ -430,15 +430,35 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             # 步骤②：生成回答（LLM + 工具循环；M2 工具仍在此循环内执行，M4 由 MCP Strategy Agent 拆成独立 tool step）
             respond_step_id = wf.add_step(run_id, next_idx, "respond", "生成回答", "llm")
             yield sse({"type": "step_started", "step_id": respond_step_id, "index": next_idx, "step_type": "respond", "title": "生成回答"})
+            tool_step_id: str | None = None
             async for ev in stream_agent(history, model, tool_specs, execute_tool,
                                          needs_confirm=lambda name: name in tool_policy["write_tools"]):
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
-                    _pending_actions[conversation_id] = {"name": ev["name"], "args": args}
+                    access = "write" if ev["name"] in tool_policy["write_tools"] else "read"
+                    _pending_actions[conversation_id] = {"name": ev["name"], "args": args,
+                                                         "run_id": run_id, "access": access}
                     prompt = agent_tools.describe_call(ev["name"], args) + "\n\n确认请回复「确认」，取消请回复「取消」。"
                     parts.append(prompt)
                     awaiting_confirm = True
                     yield sse({"type": "token", "content": prompt})
+                    continue
+                if ev["type"] == "tool_call":
+                    info = next((t for t in tool_policy["tools"] if t["name"] == ev["name"]),
+                                {"connector": "", "access": "read"})
+                    tool_step_id = wf.add_step(run_id, next_idx, "tool", f"调用工具：{ev['name']}",
+                                               info["connector"], input_data={"args": ev["args"], "access": info["access"]})
+                    yield sse({"type": "step_started", "step_id": tool_step_id, "index": next_idx,
+                               "step_type": "tool", "title": f"调用工具：{ev['name']}"})
+                    next_idx += 1
+                    yield sse({**ev, "access": info["access"]})
+                    continue
+                if ev["type"] == "tool_result":
+                    if tool_step_id:
+                        wf.finish_step(tool_step_id, "succeeded", output={"result": (ev.get("content") or "")[:500]})
+                        yield sse({"type": "step_completed", "step_id": tool_step_id, "status": "succeeded"})
+                        tool_step_id = None
+                    yield sse(ev)
                     continue
                 if ev["type"] == "token":
                     parts.append(ev["content"])
