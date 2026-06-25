@@ -14,3 +14,5 @@ export type Me={user:User;workspace:Workspace;role:string}
 export type Account={username:string;name:string}
 export type PlanStep={id:string;type:string;title:string;executor:string;connector?:string;risk?:string}
 export type Plan={goal:string;requires_knowledge:boolean;requires_tools:boolean;steps:PlanStep[];source:string}
+export type Skill={id:string;name:string;description:string;type:string;trigger_phrases:string;content:string;builtin:boolean;status:string;created_at:string;updated_at:string}
+export type SelectedSkill={id:string;name:string;source:string}
