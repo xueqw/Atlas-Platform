@@ -356,7 +356,14 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     def needs_confirm(name: str) -> bool:
         return agent_tools.is_write(name) or name in mcp_write_names
 
-    # === Agent Runtime Pipeline（M1+M2）：本次执行登记为一个 run，由 Strategy Agent 规划 ===
+    # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
+    # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
+    skill_rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
+    skill_catalog = [{"id": s.id, "name": s.name, "description": s.description,
+                      "trigger_phrases": s.trigger_phrases, "content": s.content} for s in skill_rows]
+    manual_skill_ids = [sid for sid in (payload.skill_ids or []) if any(s["id"] == sid for s in skill_catalog)]
+
+    # === Agent Runtime Pipeline（M1+M2+M3）：本次执行登记为一个 run，由 Strategy Agent 规划 ===
     run_id = wf.create_run(conversation_id, agent.id if agent else None, user.id, ws, payload.content)
 
     def sse(payload_obj: dict) -> str:
@@ -377,9 +384,17 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 input_text=payload.content, has_knowledge_base=has_kb,
                 enabled_connectors=payload.connectors,
                 agent_prompt=agent.system_prompt if agent else None, model=model,
+                skill_catalog=skill_catalog,
             )
+            # M3：手动勾选 ∪ 自动选取，覆写为解析后的对象数组随 plan_json 落库
+            from .skills_engine import build_skill_instructions, resolve_skills
+            selected_skills = resolve_skills(skill_catalog, manual_skill_ids, plan.get("skills", []))
+            plan["skills"] = selected_skills
             wf.save_plan(run_id, plan)
             yield sse({"type": "plan_created", "run_id": run_id, "plan": plan})
+            if selected_skills:
+                yield sse({"type": "skills_selected", "skills": [
+                    {"id": s["id"], "name": s["name"], "source": s["source"]} for s in selected_skills]})
 
             # 步骤①（可选，由计划决定）：知识库检索
             if plan["requires_knowledge"] and knowledge_base_id:
@@ -397,6 +412,11 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 if public_sources:
                     yield sse({"type": "sources", "sources": public_sources})
                 next_idx += 1
+
+            # M3：把选中 skill 的方法论/输出格式注入（在用户消息前）
+            skill_text = build_skill_instructions(selected_skills)
+            if skill_text:
+                history.append({"role": "system", "content": skill_text})
 
             history.append(user_turn)
 
