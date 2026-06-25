@@ -1,14 +1,17 @@
 """
 RAG knowledge base service — Chroma + sentence-transformers.
+Dependencies are lazily loaded: the module imports work without them installed,
+but index_documents / retrieve will raise a friendly error until you run:
+
+    pip install chromadb sentence-transformers
+
 Zero external server dependency: Chroma runs embedded, model auto-downloads.
 """
 
-import logging
-from collections.abc import Sequence
-from pathlib import Path
+from __future__ import annotations
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -17,27 +20,61 @@ _DB_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "chroma"
 _EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # 22 MB — fast CPU, decent Chinese support
 # For Chinese-first demos swap to: "BAAI/bge-small-zh-v1.5"  (198 MB)
 
-_embedder: SentenceTransformer | None = None
+
+# ── lazy singleton holders ────────────────────────────────────────
+
+_embedder: "SentenceTransformer | None" = None
 _client: "chromadb.PersistentClient | None" = None
+_import_checked: bool = False
 
 
-def _get_embedder() -> SentenceTransformer:
+def _ensure_imports() -> None:
+    """Lazily verify that chromadb + sentence-transformers are installed."""
+    global _import_checked
+    if _import_checked:
+        return
+    try:
+        import chromadb  # noqa: F401
+        import sentence_transformers  # noqa: F401
+    except ImportError as exc:
+        msg = (
+            "RAG service requires extra dependencies. "
+            "Install them with:  pip install chromadb sentence-transformers"
+        )
+        raise ImportError(msg) from exc
+    _import_checked = True
+
+
+def _get_embedder() -> "SentenceTransformer":
+    from sentence_transformers import SentenceTransformer
+
     global _embedder
+    _ensure_imports()
     if _embedder is None:
         logger.info("Loading embedding model %s …", _EMBED_MODEL_NAME)
         _embedder = SentenceTransformer(_EMBED_MODEL_NAME)
     return _embedder
 
 
-def _get_client() -> chromadb.PersistentClient:
+def _get_client() -> "chromadb.PersistentClient":
+    import chromadb
+
     global _client
+    _ensure_imports()
     if _client is None:
         _DB_DIR.mkdir(parents=True, exist_ok=True)
         _client = chromadb.PersistentClient(path=str(_DB_DIR))
     return _client
 
 
-def get_collection(name: str) -> chromadb.Collection:
+# re-export the lazy type for type-checkers
+try:
+    import chromadb
+except ImportError:
+    chromadb = None  # type: ignore[no-redef,assignment]
+
+
+def get_collection(name: str) -> "chromadb.Collection":
     """Return (or create) a named Chroma collection."""
     return _get_client().get_or_create_collection(name)
 

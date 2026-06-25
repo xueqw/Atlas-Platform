@@ -1,5 +1,6 @@
 import json
 import secrets
+from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -14,13 +15,15 @@ from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase,
 from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest, KnowledgeIndexRequest, KnowledgeSearchRequest
 from .services.rag import delete_collection, index_documents, retrieve
 
-app = FastAPI(title="Atlas Agent Platform API", version="0.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     ensure_schema()
+    yield
+
+
+app = FastAPI(title="Atlas Agent Platform API", version="0.2.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/api/health")
