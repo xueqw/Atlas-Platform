@@ -6,23 +6,56 @@ tools/list 拿到 GitHub 的全部工具，转成 OpenAI 兼容声明给模型�
 """
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from ..config import settings
+from ..database import SessionLocal
+from ..models import ConnectorToken
 
 PROVIDER = "github"
 _cache: dict = {"specs": None, "writes": None}  # 工具清单缓存，避免每条消息都重新拉
 
 
+def resolve_pat() -> str:
+    """优先用界面里配置（存数据库）的 PAT，其次回退 .env。"""
+    with SessionLocal() as db:
+        row = db.scalar(select(ConnectorToken).where(ConnectorToken.provider == PROVIDER))
+        if row and row.access_token:
+            return row.access_token
+    return settings.github_pat
+
+
+def save_pat(db: Session, pat: str) -> None:
+    row = db.scalar(select(ConnectorToken).where(ConnectorToken.provider == PROVIDER))
+    if not row:
+        row = ConnectorToken(provider=PROVIDER)
+        db.add(row)
+    row.access_token = pat
+    row.expires_at = datetime.now(timezone.utc) + timedelta(days=36500)  # PAT 无固定过期，占位
+    row.account_name = "PAT"
+    db.commit()
+    _cache["specs"] = None  # PAT 变了，工具缓存作废，下次重新拉
+
+
+def clear(db: Session) -> None:
+    row = db.scalar(select(ConnectorToken).where(ConnectorToken.provider == PROVIDER))
+    if row:
+        db.delete(row); db.commit()
+    _cache["specs"] = None
+
+
 def is_configured() -> bool:
-    return bool(settings.github_pat)
+    return bool(resolve_pat())
 
 
 @asynccontextmanager
 async def _session():
-    headers = {"Authorization": f"Bearer {settings.github_pat}"}
+    headers = {"Authorization": f"Bearer {resolve_pat()}"}
     async with streamablehttp_client(settings.github_mcp_url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()

@@ -11,7 +11,7 @@ from .model_gateway import embed_query, embed_texts, list_providers, stream_agen
 from .connectors import feishu, github_mcp
 from . import tools as agent_tools
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Message
-from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest, KnowledgeIndexRequest, KnowledgeSearchRequest
+from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest, KnowledgeIndexRequest, KnowledgeSearchRequest
 from .services.rag import delete_collection, index_documents, retrieve
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.2.0")
@@ -186,7 +186,29 @@ def _deny(text: str) -> bool:
 
 @app.get("/api/connectors")
 async def list_connectors(db: Session = Depends(get_db)):
-    return {"connectors": [feishu.get_status(db), await github_mcp.get_status()]}
+    return {"connectors": [await feishu.get_status(db), await github_mcp.get_status()]}
+
+
+@app.post("/api/connectors/feishu/config")
+async def feishu_config(payload: FeishuConfigRequest, db: Session = Depends(get_db)):
+    feishu.save_config(db, payload.app_id.strip(), payload.app_secret.strip())
+    return await feishu.get_status(db)  # 立刻校验凭证
+
+
+@app.delete("/api/connectors/feishu/config", status_code=204)
+def feishu_config_clear(db: Session = Depends(get_db)):
+    feishu.clear_config(db)
+
+
+@app.post("/api/connectors/github/config")
+async def github_config(payload: GithubConfigRequest, db: Session = Depends(get_db)):
+    github_mcp.save_pat(db, payload.pat.strip())
+    return await github_mcp.get_status()  # 立刻验证：返回连接状态+工具数
+
+
+@app.delete("/api/connectors/github", status_code=204)
+def github_disconnect(db: Session = Depends(get_db)):
+    github_mcp.clear(db)
 
 
 @app.get("/api/connectors/feishu/login")
@@ -253,7 +275,9 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
         return StreamingResponse(confirm_events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     agent = db.get(Agent, payload.agent_id) if payload.agent_id else None
-    knowledge_base_id = payload.knowledge_base_id or (agent.knowledge_base_id if agent else None)
+    # 以前端选择为准：选智能体时前端会自动把它的库填进下拉框；选「不使用知识库」即真的不用，
+    # 不再用 agent.knowledge_base_id 偷偷回退（否则「不使用知识库」会被智能体绑定库覆盖）。
+    knowledge_base_id = payload.knowledge_base_id
     query_vector = await embed_query(payload.content) if knowledge_base_id else None
     sources = search_chunks(db, knowledge_base_id, payload.content, query_vector) if knowledge_base_id else []
     user_message = Message(conversation_id=conversation_id, role="user", content=payload.content)

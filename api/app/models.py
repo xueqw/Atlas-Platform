@@ -69,6 +69,14 @@ class Document(Base):
     chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
 
 
+class ConnectorConfig(Base):
+    """连接器的应用级配置（公司统一）。如飞书的 app_id / app_secret，管理员配一次全公司用。"""
+    __tablename__ = "connector_configs"
+    provider: Mapped[str] = mapped_column(String(40), primary_key=True)
+    data: Mapped[str] = mapped_column(Text, default="{}")  # JSON：{app_id, app_secret, ...}
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
 class ConnectorToken(Base):
     """连接器(飞书等)的 OAuth 令牌。demo 单用户：每个 provider 存一条。"""
     __tablename__ = "connector_tokens"

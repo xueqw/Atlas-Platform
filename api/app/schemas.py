@@ -41,6 +41,15 @@ class ModelTestRequest(BaseModel):
     model: str = Field(min_length=1, max_length=120)
 
 
+class GithubConfigRequest(BaseModel):
+    pat: str = Field(min_length=1, max_length=255)
+
+
+class FeishuConfigRequest(BaseModel):
+    app_id: str = Field(min_length=1, max_length=120)
+    app_secret: str = Field(min_length=1, max_length=255)
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
