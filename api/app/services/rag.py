@@ -3,12 +3,11 @@ RAG knowledge base service — Chroma + sentence-transformers.
 Zero external server dependency: Chroma runs embedded, model auto-downloads.
 """
 
+from __future__ import annotations  # 注解延迟求值，未装 chromadb/sentence-transformers 也能导入本模块
+
 import logging
 from collections.abc import Sequence
 from pathlib import Path
-
-import chromadb
-from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +23,7 @@ _client: "chromadb.PersistentClient | None" = None
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
+        from sentence_transformers import SentenceTransformer  # 懒加载，缺依赖时只在调用时报错
         logger.info("Loading embedding model %s …", _EMBED_MODEL_NAME)
         _embedder = SentenceTransformer(_EMBED_MODEL_NAME)
     return _embedder
@@ -32,6 +32,7 @@ def _get_embedder() -> SentenceTransformer:
 def _get_client() -> chromadb.PersistentClient:
     global _client
     if _client is None:
+        import chromadb  # 懒加载
         _DB_DIR.mkdir(parents=True, exist_ok=True)
         _client = chromadb.PersistentClient(path=str(_DB_DIR))
     return _client
