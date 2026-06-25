@@ -9,6 +9,3 @@ pypdf==5.6.0
 python-docx==1.2.0
 mcp==1.28.0
 starlette==0.46.2
-chromadb>=1.2
-sentence-transformers>=4.1
-llama-cpp-python>=0.3
