@@ -32,3 +32,25 @@
 .skill-card-foot button{border:1px solid #d8dee8;background:#fff;border-radius:7px;padding:5px 12px;font-size:12px;cursor:pointer}
 .skill-card-foot .danger-link{border:0;color:#d04949;background:none}
 .skill-dialog textarea{min-height:60px;resize:vertical}
+
+/* Skill Hub composer dropdown (mirrors .connector-select) */
+.skill-select{position:relative}.skill-select>summary{list-style:none;cursor:pointer}.skill-select>summary::-webkit-details-marker{display:none}.skill-select[open]>summary{border-color:#9faff0;color:var(--blue);background:#f5f8ff}
+.skill-menu{position:absolute;bottom:38px;left:0;width:280px;background:#fff;border:1px solid #dce2ec;border-radius:12px;box-shadow:0 10px 30px #17233a1f;padding:6px;z-index:30}
+.skill-search{width:100%;box-sizing:border-box;border:1px solid #dce2ec;border-radius:8px;padding:6px 9px;font-size:12px;margin-bottom:6px;outline:none}
+.skill-search:focus{border-color:#9faff0}
+.skill-list{max-height:240px;overflow-y:auto}
+.skill-opt{display:flex;align-items:flex-start;gap:9px;padding:8px 9px;border-radius:8px;cursor:pointer}
+.skill-opt:hover{background:#f5f8ff}.skill-opt.on{background:#eef3ff}
+.skill-opt input{width:15px;height:15px;margin-top:2px;accent-color:var(--blue)}
+.skill-opt span{display:flex;flex-direction:column;min-width:0}
+.skill-opt b{font-size:12px;display:flex;align-items:center;gap:5px}
+.skill-builtin{font-style:normal;font-size:9px;color:var(--muted);border:1px solid #dce2ec;border-radius:6px;padding:0 4px}
+.skill-opt small{color:var(--muted);font-size:10px;margin-top:2px;line-height:1.35}
+.skill-manage{width:100%;margin-top:6px;border:none;border-top:1px solid #eef1f6;background:none;color:var(--blue);font-size:12px;padding:8px 0 4px;cursor:pointer;text-align:center}
+.skill-manage:hover{color:#2347d6}
+/* applied-skill chips in the plan card */
+.plan-skills{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.skill-chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;border-radius:9px;padding:2px 8px;border:1px solid #dce2ec;color:#3a4660}
+.skill-chip i{font-style:normal;font-size:9px;border-radius:6px;padding:0 5px}
+.skill-chip.skill-manual{background:#eef3ff;border-color:#c7d4ff}.skill-chip.skill-manual i{background:var(--blue);color:#fff}
+.skill-chip.skill-auto{background:#f1f7f0;border-color:#cfe6cb}.skill-chip.skill-auto i{background:#3a9d5d;color:#fff}
