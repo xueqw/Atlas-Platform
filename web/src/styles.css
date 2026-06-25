@@ -54,3 +54,12 @@
 .skill-chip i{font-style:normal;font-size:9px;border-radius:6px;padding:0 5px}
 .skill-chip.skill-manual{background:#eef3ff;border-color:#c7d4ff}.skill-chip.skill-manual i{background:var(--blue);color:#fff}
 .skill-chip.skill-auto{background:#f1f7f0;border-color:#cfe6cb}.skill-chip.skill-auto i{background:#3a9d5d;color:#fff}
+
+/* M4 tool call rows */
+.run-tools{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.tool-chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;border-radius:9px;padding:2px 8px;border:1px solid #dce2ec;color:#3a4660;background:#fff}
+.tool-chip i{font-style:normal;font-size:9px;border-radius:6px;padding:0 5px}
+.tool-chip b{font-style:normal;font-size:10px}
+.tool-read{background:#f1f7f0;border-color:#cfe6cb}.tool-read i{background:#3a9d5d;color:#fff}
+.tool-write{background:#fef3ef;border-color:#f3c9b8}.tool-write i{background:#d2682f;color:#fff}
+.tool-ok{color:#3a9d5d}.tool-run{color:var(--muted)}
