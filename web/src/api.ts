@@ -1,4 +1,4 @@
-import type{Account,Agent,Connector,Conversation,KnowledgeBase,Me,ModelCatalog,ModelTestResult,Plan,Skill,Source}from'./types'
+import type{Account,Agent,Connector,Conversation,KnowledgeBase,Me,ModelCatalog,ModelTestResult,Plan,Skill,Source,WorkflowRun}from'./types'
 const json=async<T>(url:string,options?:RequestInit):Promise<T>=>{const r=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});if(!r.ok)throw new Error((await r.json()).detail||'请求失败');return r.json()}
 export const getMe=()=>json<Me>('/api/me')
 export const listAccounts=()=>json<Account[]>('/api/auth/accounts')
@@ -7,6 +7,7 @@ export const logout=()=>fetch('/api/auth/logout',{method:'POST',credentials:'inc
 export const listConversations=()=>json<Conversation[]>('/api/conversations')
 export const createConversation=()=>json<Conversation>('/api/conversations',{method:'POST',body:JSON.stringify({title:'新任务'})})
 export const getConversation=(id:string)=>json<Conversation>(`/api/conversations/${id}`)
+export const listRuns=(id:string)=>json<WorkflowRun[]>(`/api/conversations/${id}/runs`)
 export const listKnowledgeBases=()=>json<KnowledgeBase[]>('/api/knowledge-bases')
 export const createKnowledgeBase=(name:string,description:string)=>json<KnowledgeBase>('/api/knowledge-bases',{method:'POST',body:JSON.stringify({name,description})})
 export async function uploadDocument(id:string,file:File){const body=new FormData();body.append('file',file);const r=await fetch(`/api/knowledge-bases/${id}/documents`,{method:'POST',credentials:'include',body});if(!r.ok)throw new Error((await r.json()).detail||'上传失败');return r.json()}

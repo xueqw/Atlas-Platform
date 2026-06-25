@@ -16,3 +16,5 @@ export type PlanStep={id:string;type:string;title:string;executor:string;connect
 export type Plan={goal:string;requires_knowledge:boolean;requires_tools:boolean;steps:PlanStep[];source:string}
 export type Skill={id:string;name:string;description:string;type:string;trigger_phrases:string;content:string;builtin:boolean;status:string;created_at:string;updated_at:string}
 export type SelectedSkill={id:string;name:string;source:string}
+export type WorkflowStep={id:string;index:number;type:string;title:string;executor:string;skill_id:string|null;status:string;input_json:string;output_json:string;error:string;started_at:string|null;ended_at:string|null}
+export type WorkflowRun={id:string;conversation_id:string|null;agent_id:string|null;user_id:string|null;input_text:string;status:string;plan_json:string;output_json:string;error:string;started_at:string|null;ended_at:string|null;created_at:string;steps:WorkflowStep[]}
