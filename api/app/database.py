@@ -36,9 +36,11 @@ def ensure_schema():
                 if tcols and "workspace_id" not in tcols:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN workspace_id VARCHAR(36)"))
             _backfill_default_workspace(conn)
-    # 预置测试账号（幂等，须在建表完成后；用 ORM 会话）
+    # 预置测试账号 + 内置 skill（幂等，须在建表完成后；用 ORM 会话）
     from .auth import seed_test_accounts
+    from .skills_seed import seed_builtin_skills
     seed_test_accounts()
+    seed_builtin_skills()
 
 
 def _drop_stale_auth_tables() -> None:
