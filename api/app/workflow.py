@@ -7,6 +7,8 @@
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy import func, select
+
 from .database import SessionLocal
 from .models import WorkflowRun, WorkflowStep
 
@@ -80,3 +82,9 @@ def finish_run(run_id: str, status: str, output: dict | None = None, error: str 
         if error:
             run.error = error
         db.commit()
+
+
+def next_index(run_id: str) -> int:
+    """该 run 已有多少 step——确认写操作的审计路径用它续号（脱离 events() 的局部 next_idx）。"""
+    with SessionLocal() as db:
+        return db.scalar(select(func.count()).select_from(WorkflowStep).where(WorkflowStep.run_id == run_id)) or 0
