@@ -312,10 +312,25 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         db.add(Message(conversation_id=conversation_id, role="user", content=payload.content)); db.commit()
 
         async def confirm_events():
+            pend_run = pending.get("run_id")
             if approved:
+                connector = agent_tools.TOOLS.get(pending["name"], {}).get("connector", "github")
+                step_id = None
+                if pend_run:
+                    idx = wf.next_index(pend_run)
+                    step_id = wf.add_step(pend_run, idx, "tool", f"调用工具：{pending['name']}", connector,
+                                          input_data={"args": json.dumps(pending["args"], ensure_ascii=False),
+                                                      "access": pending.get("access", "write")})
+                    yield f"data: {json.dumps({'type': 'step_started', 'step_id': step_id, 'index': idx, 'step_type': 'tool', 'title': '调用工具：' + pending['name']}, ensure_ascii=False)}\n\n"
                 result = await execute_tool(pending["name"], json.dumps(pending["args"], ensure_ascii=False))
+                if pend_run and step_id:
+                    wf.finish_step(step_id, "succeeded", output={"result": (result or "")[:500]})
+                    wf.finish_run(pend_run, "succeeded", output={"answer": result})
+                    yield f"data: {json.dumps({'type': 'step_completed', 'step_id': step_id, 'status': 'succeeded'}, ensure_ascii=False)}\n\n"
             else:
                 result = "好的，已取消，未执行。"
+                if pend_run:
+                    wf.finish_run(pend_run, "cancelled")
             save_assistant(result)
             for ch in result:
                 yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
