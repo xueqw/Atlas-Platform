@@ -64,6 +64,7 @@ class ChatRequest(BaseModel):
     agent_id: str | None = None
     model: str | None = None
     connectors: list[str] = []  # 本次对话启用的连接器（其工具才提供给模型）
+    skill_ids: list[str] = []  # 本次对话手动勾选（强制启用）的 skill
     attachment_name: str | None = None
     attachment_text: str | None = Field(default=None, max_length=40000)
 
@@ -164,3 +165,30 @@ class WorkflowRunOut(BaseModel):
     ended_at: datetime | None = None
     created_at: datetime
     steps: list[WorkflowStepOut] = []
+
+
+# === Skill Hub（M3） ===
+
+class SkillCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=2000)
+    content: str = Field(default="", max_length=12000)
+    trigger_phrases: str = Field(default="", max_length=1000)
+
+
+class SkillUpdate(SkillCreate):
+    status: str = Field(default="active", max_length=30)
+
+
+class SkillOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    description: str
+    type: str
+    trigger_phrases: str
+    content: str
+    builtin: bool
+    status: str
+    created_at: datetime
+    updated_at: datetime

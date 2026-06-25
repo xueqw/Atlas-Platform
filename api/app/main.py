@@ -15,8 +15,8 @@ from .knowledge import extract_pages, search_chunks, split_pages
 from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
 from .connectors import feishu, github_mcp
 from . import tools as agent_tools
-from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, User, WorkflowRun
-from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, MeOut, ModelTestRequest, WorkflowRunOut
+from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, Skill, User, WorkflowRun
+from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -458,4 +458,50 @@ def get_workflow_run(run_id: str, ws: str = Depends(current_workspace_id), db: S
     if not run:
         raise HTTPException(404, "运行记录不存在")
     return run
+
+
+# ============ Skill Hub（PRD §9.2，M3） ============
+
+@app.get("/api/skills", response_model=list[SkillOut])
+def list_skills(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    return db.scalars(select(Skill).where(Skill.workspace_id == ws).order_by(Skill.builtin.desc(), Skill.created_at)).all()
+
+
+@app.post("/api/skills", response_model=SkillOut, status_code=201)
+def create_skill(payload: SkillCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    skill = Skill(workspace_id=ws, type="instruction", builtin=False, **payload.model_dump())
+    db.add(skill); db.commit(); db.refresh(skill)
+    return skill
+
+
+def _get_owned_skill(skill_id: str, ws: str, db: Session) -> Skill:
+    skill = db.scalar(select(Skill).where(Skill.id == skill_id, Skill.workspace_id == ws))
+    if not skill:
+        raise HTTPException(404, "技能不存在")
+    return skill
+
+
+@app.get("/api/skills/{skill_id}", response_model=SkillOut)
+def get_skill(skill_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    return _get_owned_skill(skill_id, ws, db)
+
+
+@app.put("/api/skills/{skill_id}", response_model=SkillOut)
+def update_skill(skill_id: str, payload: SkillUpdate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    skill = _get_owned_skill(skill_id, ws, db)
+    if skill.builtin:
+        raise HTTPException(403, "内置技能只读")
+    for k, v in payload.model_dump().items():
+        setattr(skill, k, v)
+    db.commit(); db.refresh(skill)
+    return skill
+
+
+@app.delete("/api/skills/{skill_id}")
+def delete_skill(skill_id: str, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    skill = _get_owned_skill(skill_id, ws, db)
+    if skill.builtin:
+        raise HTTPException(403, "内置技能只读")
+    db.delete(skill); db.commit()
+    return {"ok": True}
 
