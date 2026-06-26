@@ -43,9 +43,17 @@ def _user_prompt(input_text: str, has_kb: bool, connectors: list[str], agent_pro
     if agent_prompt:
         lines.append(f"智能体身份与规则：{agent_prompt[:300]}")
     if skill_catalog:
-        lines.append("可用技能（id — 名称：描述）：")
+        # 方案 B：综合 名称 + 描述 + 内容要点 判断，描述写烂/留空也能靠内容/名字命中
+        lines.append("可用技能（综合 名称 / 描述 / 内容要点 判断是否选用）：")
         for s in skill_catalog:
-            lines.append(f"- {s['id']} — {s['name']}：{s['description']}")
+            desc = (s.get("description") or "").strip()
+            gist = " ".join((s.get("content") or "").split())[:120]
+            line = f"- {s['id']} — {s['name']}"
+            if desc:
+                line += f"：{desc}"
+            if gist:
+                line += f"｜内容要点：{gist}"
+            lines.append(line)
     lines.append("请输出 JSON 计划。")
     return "\n".join(lines)
 
