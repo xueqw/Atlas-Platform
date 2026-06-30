@@ -1,0 +1,130 @@
+.webide-page {
+  padding: 28px;
+  height: 100%;
+  box-sizing: border-box;
+}
+
+.webide-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.webide-title h1 {
+  margin: 6px 0;
+}
+
+.webide-title p {
+  margin: 0;
+  color: #667085;
+}
+
+.webide-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.webide-name-row {
+  margin-bottom: 16px;
+}
+
+.webide-name-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 360px;
+  font-size: 13px;
+  color: #475467;
+}
+
+.webide-name-row input {
+  border: 1px solid #d0d5dd;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.webide-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(420px, 1fr) 320px;
+  gap: 16px;
+  min-height: 620px;
+}
+
+.webide-files,
+.webide-editor,
+.webide-preview {
+  background: #ffffff;
+  border: 1px solid #e4e7ec;
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.webide-files {
+  padding: 16px;
+}
+
+.webide-files h3,
+.webide-preview h3 {
+  margin: 0 0 12px;
+}
+
+.webide-files button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.webide-files button.active {
+  background: #eef4ff;
+  color: #175cd3;
+  font-weight: 600;
+}
+
+.editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid #e4e7ec;
+}
+
+.editor-head small {
+  color: #667085;
+}
+
+.webide-editor textarea {
+  width: 100%;
+  height: 560px;
+  border: 0;
+  resize: none;
+  outline: none;
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  box-sizing: border-box;
+}
+
+.webide-preview {
+  padding: 16px;
+}
+
+.webide-preview pre {
+  background: #101828;
+  color: #f2f4f7;
+  border-radius: 12px;
+  padding: 14px;
+  min-height: 520px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 13px;
+}
