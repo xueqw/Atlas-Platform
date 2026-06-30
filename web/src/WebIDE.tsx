@@ -57,7 +57,7 @@ export default function WebIDE({ notice }: { notice: (text: string) => void }) {
       <div className="webide-title">
         <div>
           <span className="section-code">APP DEVELOPMENT / WEB IDE</span>
-          <h1>应用开发 Web IDE</h1>
+          <h1>Web IDE</h1>
           <p>编辑 Agent App 文件、manifest 配置，并在沙箱中运行预览。</p>
         </div>
 
