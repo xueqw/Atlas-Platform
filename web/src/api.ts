@@ -21,3 +21,52 @@ export const updateAgent=(agent:Agent)=>json<Agent>(`/api/agents/${agent.id}`,{m
 export const deleteAgent=(id:string)=>fetch(`/api/agents/${id}`,{method:'DELETE'}).then(r=>{if(!r.ok)throw new Error('删除失败')})
 export async function uploadAttachment(file:File):Promise<{name:string;text:string}>{const body=new FormData();body.append('file',file);const r=await fetch('/api/attachments',{method:'POST',body});if(!r.ok)throw new Error((await r.json()).detail||'文件解析失败');return r.json()}
 export async function streamMessage(id:string,content:string,knowledgeBaseId:string|undefined,onToken:(token:string)=>void,onSources:(sources:Source[])=>void,agentId?:string,model?:string,attachment?:{name:string;text:string},connectors?:string[]){const r=await fetch(`/api/conversations/${id}/messages/stream`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,knowledge_base_id:knowledgeBaseId||null,agent_id:agentId||null,model:model||null,connectors:connectors||[],attachment_name:attachment?.name||null,attachment_text:attachment?.text||null})});if(!r.ok)throw new Error((await r.json()).detail||'发送失败');const reader=r.body?.getReader();if(!reader)return;const decoder=new TextDecoder();let buffer='';while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const blocks=buffer.split('\n\n');buffer=blocks.pop()||'';for(const block of blocks){const line=block.split('\n').find(v=>v.startsWith('data: '));if(!line)continue;const data=JSON.parse(line.slice(6));if(data.type==='token')onToken(data.content);if(data.type==='sources')onSources(data.sources);if(data.type==='error')throw new Error(data.message)}}}
+export type AppDraft = {
+  id: string
+  name: string
+  status: string
+  created_at?: string
+  updated_at?: string
+}
+
+export type AppFile = {
+  path: string
+  name: string
+  type: 'file' | 'directory'
+}
+
+export type DraftFileContent = {
+  path: string
+  content: string
+}
+
+export type RunPreviewResult = {
+  ok: boolean
+  logs: string
+  error?: string
+}
+
+export const createAppDraft = (name: string) =>
+  json<AppDraft>('/api/apps/drafts', {
+    method: 'POST',
+    body: JSON.stringify({ name })
+  })
+
+export const listDraftFiles = (draftId: string) =>
+  json<AppFile[]>(`/api/apps/drafts/${draftId}/files`)
+
+export const getDraftFile = (draftId: string, path: string) =>
+  json<DraftFileContent>(
+    `/api/apps/drafts/${draftId}/files/content?path=${encodeURIComponent(path)}`
+  )
+
+export const saveDraftFile = (draftId: string, path: string, content: string) =>
+  json<{ ok: boolean }>(`/api/apps/drafts/${draftId}/files/content`, {
+    method: 'PUT',
+    body: JSON.stringify({ path, content })
+  })
+
+export const runDraftApp = (draftId: string) =>
+  json<RunPreviewResult>(`/api/apps/drafts/${draftId}/run`, {
+    method: 'POST'
+  })
