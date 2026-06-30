@@ -1,3 +1,38 @@
+.builder-page {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.builder-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 28px 0;
+  border-bottom: 1px solid #e4e7ec;
+  background: #ffffff;
+}
+
+.builder-tabs button {
+  border: 0;
+  background: transparent;
+  padding: 12px 14px;
+  border-radius: 10px 10px 0 0;
+  cursor: pointer;
+  color: #667085;
+  font-weight: 600;
+}
+
+.builder-tabs button.active {
+  background: #eef4ff;
+  color: #175cd3;
+}
+
+.builder-content {
+  flex: 1;
+  min-height: 0;
+}
+
 .webide-page {
   padding: 28px;
   height: 100%;
