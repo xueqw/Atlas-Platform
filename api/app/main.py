@@ -12,10 +12,12 @@ from .connectors import feishu, github_mcp
 from . import tools as agent_tools
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Message
 from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest
+from .apps import router as apps_router
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+app.include_router(apps_router)
 
 @app.on_event("startup")
 def startup():
