@@ -163,3 +163,31 @@
   white-space: pre-wrap;
   font-size: 13px;
 }
+
+.webide-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid #e4e7ec;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.webide-status span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.webide-status span.online {
+  color: #067647;
+}
+
+.webide-status span.offline {
+  color: #b42318;
+}
+
+.webide-status small {
+  color: #667085;
+}
