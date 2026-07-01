@@ -1,4 +1,4 @@
-import type{Agent,Connector,Conversation,KnowledgeBase,ModelCatalog,ModelTestResult,Source}from'./types'
+﻿import type{Agent,Connector,Conversation,KnowledgeBase,ModelCatalog,ModelTestResult,Source}from'./types'
 const json=async<T>(url:string,options?:RequestInit):Promise<T>=>{const r=await fetch(url,{headers:{'Content-Type':'application/json'},...options});if(!r.ok)throw new Error((await r.json()).detail||'请求失败');return r.json()}
 export const listConversations=()=>json<Conversation[]>('/api/conversations')
 export const createConversation=()=>json<Conversation>('/api/conversations',{method:'POST',body:JSON.stringify({title:'新任务'})})
@@ -40,11 +40,63 @@ export type DraftFileContent = {
   content: string
 }
 
+export type ManifestValidation = {
+  ok: boolean
+  manifest: Record<string, unknown>
+  errors: string[]
+  warnings: string[]
+}
+
 export type RunPreviewResult = {
   ok: boolean
   logs: string
   error?: string
+  warnings?: string[]
+  elapsed_ms?: number
 }
+
+export type EvaluationCase = {
+  name: string
+  input: string
+  expected: string
+}
+
+export type EvaluationResult = {
+  ok: boolean
+  passed: number
+  total: number
+  pass_rate: number
+  results: Array<{
+    name: string
+    input: string
+    expected: string
+    ok: boolean
+    output: string
+    logs: string
+    elapsed_ms: number
+  }>
+}
+
+
+export type GeneratedAgentApp = {
+  draft: AppDraft
+  reply: string
+  blueprint: {
+    name: string
+    domain: string
+    prompt: string
+    skills: string[]
+    connectors: string[]
+    sample_input: string
+  }
+  files: string[]
+}
+
+export const generateAgentApp = (message: string, projectName = '') =>
+  json<GeneratedAgentApp>('/api/apps/generate', {
+    method: 'POST',
+    body: JSON.stringify({ message, project_name: projectName })
+  })
 
 export const createAppDraft = (name: string) =>
   json<AppDraft>('/api/apps/drafts', {
@@ -54,6 +106,12 @@ export const createAppDraft = (name: string) =>
 
 export const listDraftFiles = (draftId: string) =>
   json<AppFile[]>(`/api/apps/drafts/${draftId}/files`)
+
+export const createDraftFile = (draftId: string, path: string, content = '') =>
+  json<{ ok: boolean; path: string }>(`/api/apps/drafts/${draftId}/files`, {
+    method: 'POST',
+    body: JSON.stringify({ path, content })
+  })
 
 export const getDraftFile = (draftId: string, path: string) =>
   json<DraftFileContent>(
@@ -66,7 +124,32 @@ export const saveDraftFile = (draftId: string, path: string, content: string) =>
     body: JSON.stringify({ path, content })
   })
 
-export const runDraftApp = (draftId: string) =>
-  json<RunPreviewResult>(`/api/apps/drafts/${draftId}/run`, {
-    method: 'POST'
+export const renameDraftFile = (draftId: string, oldPath: string, newPath: string) =>
+  json<{ ok: boolean; path: string }>(`/api/apps/drafts/${draftId}/files/rename`, {
+    method: 'PUT',
+    body: JSON.stringify({ old_path: oldPath, new_path: newPath })
   })
+
+export const deleteDraftFile = (draftId: string, path: string) =>
+  fetch(`/api/apps/drafts/${draftId}/files?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE'
+  }).then(r => {
+    if (!r.ok) throw new Error('删除失败')
+    return r.json()
+  })
+
+export const validateDraftManifest = (draftId: string) =>
+  json<ManifestValidation>(`/api/apps/drafts/${draftId}/manifest/validate`)
+
+export const runDraftApp = (draftId: string, inputText: string) =>
+  json<RunPreviewResult>(`/api/apps/drafts/${draftId}/run`, {
+    method: 'POST',
+    body: JSON.stringify({ input_text: inputText })
+  })
+
+export const evaluateDraftApp = (draftId: string, cases: EvaluationCase[]) =>
+  json<EvaluationResult>(`/api/apps/drafts/${draftId}/evaluate`, {
+    method: 'POST',
+    body: JSON.stringify({ cases })
+  })
+
