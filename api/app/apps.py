@@ -1,12 +1,16 @@
 ﻿from pathlib import Path
 from uuid import uuid4
 import json
+import re
 import subprocess
 import sys
 import time
+import httpx
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from .model_gateway import resolve_provider
 
 
 router = APIRouter(prefix="/api/apps", tags=["apps"])
@@ -186,6 +190,84 @@ def validate_manifest(draft_dir: Path) -> tuple[dict, list[str], list[str]]:
     return data, errors, warnings
 
 
+async def run_model_entry(draft_dir: Path, input_text: str) -> dict | None:
+    manifest, errors, warnings = validate_manifest(draft_dir)
+    if errors:
+        return None
+
+    model = str(manifest.get("model") or "")
+    prompt = str(manifest.get("prompt") or "")
+    name = str(manifest.get("name") or "Atlas Agent")
+    description = str(manifest.get("description") or "")
+    skills = manifest.get("skills") if isinstance(manifest.get("skills"), list) else []
+
+    base_url, api_key, real_model = resolve_provider(model)
+    if not api_key:
+        return None
+
+    system_prompt = "\n".join([
+        prompt,
+        "",
+        zh("\u4f60\u73b0\u5728\u662f\u5df2\u7ecf\u521b\u5efa\u597d\u7684\u53ef\u7528 Agent\uff1a") + name + zh("\u3002"),
+        f"应用描述：{description}",
+        zh("\u5df2\u542f\u7528\u80fd\u529b\uff1a") + (", ".join(str(item) for item in skills) or zh("\u57fa\u7840\u4efb\u52a1\u5904\u7406")),
+        '请直接回答用户问题，不要复述你是草稿，也不要只给通用执行路径。',
+        '回答要结构化、可操作；如果问题需要实时数据或外部系统，而当前没有工具结果，请明确说明限制，并给出下一步需要用户补充的信息。',
+        '涉及投资、医疗、法律等高风险主题时，必须提示风险，不要承诺确定收益或替用户做最终决策。',
+    ])
+    payload = {
+        "model": real_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": input_text},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 1200,
+    }
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=90, trust_env=False) as client:
+            response = await client.post(
+                base_url.rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+        data = response.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if not content:
+            return None
+        return {
+            "ok": True,
+            "logs": "\n".join([
+                f"> model: {real_model}",
+                f"> provider: {base_url}",
+                f"> input: {input_text}",
+                f"> elapsed: {elapsed_ms} ms",
+                "",
+                content,
+                "",
+                "> exit code: 0",
+            ]),
+            "error": None,
+            "warnings": warnings,
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "logs": "\n".join([
+                "> 大模型调用失败，已保留本地沙箱回退能力",
+                f"> ERROR: {error}",
+            ]),
+            "error": str(error),
+            "warnings": [*warnings, "大模型调用失败，请检查 API Key、Base URL、模型名或网络"],
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+
 def run_python_entry(draft_dir: Path, input_text: str, timeout: int = 10) -> dict:
     manifest, errors, warnings = validate_manifest(draft_dir)
 
@@ -276,98 +358,208 @@ def run_python_entry(draft_dir: Path, input_text: str, timeout: int = 10) -> dic
 
 
 def zh(value: str) -> str:
-    return value.encode("ascii").decode("unicode_escape")
+    try:
+        return value.encode("ascii").decode("unicode_escape")
+    except UnicodeEncodeError:
+        return value
+
+
+def clean_agent_name(value: str) -> str:
+    value = value.strip()
+    for mark in [" ", "\t", "\n", ",", ".", "!", "?", ";", ":", zh("\uff0c"), zh("\u3002"), zh("\uff01"), zh("\uff1f"), zh("\uff1b"), zh("\uff1a"), zh("\u3001")]:
+        value = value.strip(mark)
+    for prefix in [zh("\u4e00\u4e2a"), zh("\u4e00\u6b3e"), zh("\u53ef\u4ee5"), zh("\u80fd\u591f"), zh("\u80fd")]:
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+    value = value.replace("agent", "Agent").replace("AGENT", "Agent")
+    if not value:
+        return zh("\u81ea\u5b9a\u4e49 Agent")
+    suffixes = ["Agent", zh("\u52a9\u624b"), zh("\u5de5\u5177"), zh("\u673a\u5668\u4eba"), zh("\u5e94\u7528"), zh("\u4e13\u5bb6"), zh("\u5206\u6790\u5e08"), zh("\u751f\u6210\u5668")]
+    if not any(value.endswith(suffix) for suffix in suffixes):
+        value += zh("\u52a9\u624b")
+    return value[:28]
+
+
+def extract_agent_name(message: str) -> str:
+    starters = [
+        zh("\u5e2e\u6211\u5236\u4f5c\u4e00\u4e2a"),
+        zh("\u5e2e\u6211\u521b\u5efa\u4e00\u4e2a"),
+        zh("\u5e2e\u6211\u505a\u4e00\u4e2a"),
+        zh("\u5236\u4f5c\u4e00\u4e2a"),
+        zh("\u521b\u5efa\u4e00\u4e2a"),
+        zh("\u751f\u6210\u4e00\u4e2a"),
+        zh("\u642d\u5efa\u4e00\u4e2a"),
+        zh("\u505a\u4e00\u4e2a"),
+        zh("\u5236\u4f5c"),
+        zh("\u521b\u5efa"),
+        zh("\u751f\u6210"),
+        zh("\u642d\u5efa"),
+        zh("\u505a"),
+    ]
+    stops = [zh("\u80fd"), zh("\u53ef\u4ee5"), zh("\u7528\u4e8e"), zh("\u5e2e"), zh("\u4e13\u95e8"), zh("\u4e3b\u8981"), zh("\u652f\u6301"), zh("\uff0c"), zh("\u3002"), ",", ".", ";"]
+    lowered = message.lower()
+    for starter in starters:
+        index = lowered.find(starter.lower())
+        if index < 0:
+            continue
+        candidate = message[index + len(starter):]
+        stop_positions = [candidate.find(stop) for stop in stops if candidate.find(stop) > 0]
+        if stop_positions:
+            candidate = candidate[:min(stop_positions)]
+        return clean_agent_name(candidate)
+    suffixes = ["Agent", "agent", zh("\u52a9\u624b"), zh("\u5de5\u5177"), zh("\u673a\u5668\u4eba"), zh("\u5e94\u7528"), zh("\u4e13\u5bb6"), zh("\u5206\u6790\u5e08"), zh("\u751f\u6210\u5668")]
+    for suffix in suffixes:
+        pos = message.find(suffix)
+        if pos > 0:
+            start_pos = max(0, pos - 12)
+            candidate = message[start_pos:pos + len(suffix)]
+            return clean_agent_name(candidate)
+    return zh("\u81ea\u5b9a\u4e49 Agent")
+
+def slug_skill(value: str) -> str:
+    mapping = {
+        zh("\u77e5\u8bc6\u5e93"): "knowledge-base-qa",
+        zh("\u95ee\u7b54"): "question-answering",
+        zh("\u6587\u6863"): "document-search",
+        zh("\u5ba2\u670d"): "customer-service",
+        zh("\u552e\u540e"): "after-sales-support",
+        zh("\u5de5\u5355"): "ticket-summary",
+        zh("\u9500\u552e"): "sales-assistant",
+        zh("\u7ebf\u7d22"): "lead-qualification",
+        zh("\u5ba2\u6237"): "customer-summary",
+        zh("\u6d41\u7a0b"): "workflow-guidance",
+        zh("\u5ba1\u6279"): "approval-checklist",
+        zh("\u5236\u5ea6"): "policy-search",
+        zh("\u62a5\u9500"): "reimbursement-guidance",
+        zh("\u5165\u804c"): "onboarding-guidance",
+        zh("\u7b80\u5386"): "resume-screening",
+        zh("\u62db\u8058"): "recruiting-assistant",
+        zh("\u9762\u8bd5"): "interview-questioning",
+        zh("PPT"): "ppt-generation",
+        zh("\u6f14\u793a"): "presentation-outline",
+        zh("\u5199\u4f5c"): "copywriting",
+        zh("\u6587\u6848"): "content-writing",
+        zh("Excel"): "spreadsheet-analysis",
+        zh("\u8868\u683c"): "spreadsheet-processing",
+        zh("\u7f51\u9875"): "web-page-generation",
+        zh("\u56fe\u8868"): "chart-generation",
+        zh("\u6570\u636e"): "data-analysis",
+        zh("\u8bdd\u9898"): "topic-tracking",
+        zh("\u64ad\u5ba2"): "podcast-script",
+        zh("\u8bbe\u8ba1"): "design-generation",
+        zh("\u80a1"): "stock-analysis",
+        zh("\u884c\u60c5"): "market-monitoring",
+        zh("\u8d22\u62a5"): "financial-report-analysis",
+        zh("\u516c\u544a"): "announcement-tracking",
+        zh("\u98ce\u9669"): "risk-check",
+    }
+    return mapping.get(value, "task-planning")
 
 
 def infer_agent_blueprint(message: str, project_name: str = "") -> dict:
-    text = message.strip()
+    text = message.strip() or zh("\u505a\u4e00\u4e2a\u4f01\u4e1a\u4efb\u52a1 Agent")
     lowered = text.lower()
-    customer_words = [zh("\\u5ba2\\u670d"), zh("\\u552e\\u540e"), zh("\\u5de5\\u5355")]
-    process_words = [zh("\\u6d41\\u7a0b"), zh("\\u5ba1\\u6279"), zh("\\u5236\\u5ea6"), zh("\\u62a5\\u9500"), zh("\\u5165\\u804c")]
-    sales_words = [zh("\\u9500\\u552e"), zh("\\u7ebf\\u7d22"), zh("\\u5ba2\\u6237")]
-    knowledge_words = [zh("\\u77e5\\u8bc6\\u5e93"), zh("\\u95ee\\u7b54"), zh("\\u6587\\u6863"), zh("\\u5236\\u5ea6")]
+    old_default = {zh("Atlas \u4f01\u4e1a\u52a9\u624b\u9879\u76ee"), zh("\u6263\u5b50\u7684\u65b0\u9879\u76ee"), "demo-agent-app"}
+    name = project_name.strip() if project_name.strip() and project_name.strip() not in old_default else extract_agent_name(text)
 
-    if project_name.strip() and project_name.strip() != zh("\\u6263\\u5b50\\u7684\\u65b0\\u9879\\u76ee"):
-        name = project_name.strip()
-    elif any(word in text for word in customer_words):
-        name = zh("\\u4f01\\u4e1a\\u5ba2\\u670d\\u52a9\\u624b")
-    elif any(word in text for word in process_words):
-        name = zh("\\u6d41\\u7a0b\\u529e\\u7406\\u52a9\\u624b")
-    elif any(word in text for word in sales_words):
-        name = zh("\\u9500\\u552e\\u7ebf\\u7d22\\u52a9\\u624b")
-    elif any(word in text for word in knowledge_words):
-        name = zh("\\u77e5\\u8bc6\\u5e93\\u95ee\\u7b54\\u52a9\\u624b")
+    keyword_groups = [
+        (zh("\u5ba2\u670d"), zh("\u5ba2\u6237\u670d\u52a1\u4e0e\u552e\u540e\u5de5\u5355"), [zh("\u5ba2\u670d"), zh("\u552e\u540e"), zh("\u5de5\u5355"), zh("\u77e5\u8bc6\u5e93")], ["feishu"]),
+        (zh("\u6d41\u7a0b"), zh("\u5185\u90e8\u6d41\u7a0b\u4e0e\u5236\u5ea6\u529e\u7406"), [zh("\u6d41\u7a0b"), zh("\u5236\u5ea6"), zh("\u5ba1\u6279"), zh("\u62a5\u9500"), zh("\u5165\u804c")], ["feishu"]),
+        (zh("\u9500\u552e"), zh("\u9500\u552e\u7ebf\u7d22\u8ddf\u8fdb\u4e0e\u5ba2\u6237\u6458\u8981"), [zh("\u9500\u552e"), zh("\u7ebf\u7d22"), zh("\u5ba2\u6237")], ["feishu"]),
+        (zh("\u77e5\u8bc6\u5e93"), zh("\u4f01\u4e1a\u77e5\u8bc6\u5e93\u95ee\u7b54"), [zh("\u77e5\u8bc6\u5e93"), zh("\u95ee\u7b54"), zh("\u6587\u6863")], []),
+        (zh("\u62db\u8058"), zh("\u62db\u8058\u7b5b\u9009\u4e0e\u9762\u8bd5\u8f85\u52a9"), [zh("\u62db\u8058"), zh("\u7b80\u5386"), zh("\u9762\u8bd5")], []),
+        (zh("PPT"), zh("\u6f14\u793a\u6587\u7a3f\u4e0e PPT \u751f\u6210"), [zh("PPT"), zh("\u6f14\u793a"), zh("\u5199\u4f5c")], []),
+        (zh("\u5199\u4f5c"), zh("\u6587\u7ae0\u4e0e\u8425\u9500\u6587\u6848\u751f\u6210"), [zh("\u5199\u4f5c"), zh("\u6587\u6848"), zh("\u8bdd\u9898")], []),
+        (zh("Excel"), zh("\u8868\u683c\u5904\u7406\u4e0e\u6570\u636e\u5206\u6790"), [zh("Excel"), zh("\u8868\u683c"), zh("\u6570\u636e"), zh("\u56fe\u8868")], []),
+        (zh("\u7f51\u9875"), zh("\u7f51\u9875\u751f\u6210\u4e0e\u5185\u5bb9\u7f16\u6392"), [zh("\u7f51\u9875"), zh("\u8bbe\u8ba1"), zh("\u6587\u6848")], []),
+        (zh("\u80a1\u7968"), zh("\u80a1\u7968\u5206\u6790\u4e0e\u98ce\u9669\u63d0\u9192"), [zh("\u80a1"), zh("\u884c\u60c5"), zh("\u8d22\u62a5"), zh("\u516c\u544a"), zh("\u98ce\u9669")], []),
+    ]
+
+    matched = None
+    best_score = 0
+    for _, domain_value, words, connector_list in keyword_groups:
+        score = sum(1 for word in words if word.lower() in lowered or word in text)
+        if score > best_score:
+            best_score = score
+            matched = (domain_value, words, connector_list)
+
+    if matched:
+        domain, words, connectors = matched
     else:
-        name = zh("\\u4f01\\u4e1a\\u4efb\\u52a1\\u52a9\\u624b")
-
-    if any(word in text for word in customer_words):
-        domain = zh("\\u5ba2\\u6237\\u670d\\u52a1\\u4e0e\\u552e\\u540e\\u5de5\\u5355")
-        skills = ["faq-answering", "ticket-summary", "handoff-to-human"]
-        connectors = ["feishu"]
-        prompt = zh("\\u4f60\\u662f\\u4f01\\u4e1a\\u5ba2\\u670d\\u52a9\\u624b\\u3002\\u4f60\\u9700\\u8981\\u4f18\\u5148\\u4f9d\\u636e\\u77e5\\u8bc6\\u5e93\\u56de\\u7b54\\uff0c\\u7ed9\\u51fa\\u5904\\u7406\\u6b65\\u9aa4\\uff1b\\u5f53\\u4fe1\\u606f\\u4e0d\\u8db3\\u6216\\u6d89\\u53ca\\u6295\\u8bc9\\u5347\\u7ea7\\u65f6\\uff0c\\u660e\\u786e\\u5efa\\u8bae\\u8f6c\\u4eba\\u5de5\\u5904\\u7406\\u3002")
-        sample_input = zh("\\u5ba2\\u6237\\u53cd\\u9988\\u8ba2\\u5355\\u5ef6\\u8fdf\\uff0c\\u8bf7\\u751f\\u6210\\u5904\\u7406\\u5efa\\u8bae\\u548c\\u56de\\u590d\\u8bdd\\u672f\\u3002")
-    elif any(word in text for word in process_words):
-        domain = zh("\\u5185\\u90e8\\u6d41\\u7a0b\\u4e0e\\u5236\\u5ea6\\u529e\\u7406")
-        skills = ["policy-search", "workflow-checklist", "form-guidance"]
-        connectors = ["feishu"]
-        prompt = zh("\\u4f60\\u662f\\u4f01\\u4e1a\\u6d41\\u7a0b\\u529e\\u7406\\u52a9\\u624b\\u3002\\u4f60\\u9700\\u8981\\u6839\\u636e\\u5236\\u5ea6\\u548c\\u6d41\\u7a0b\\u8bf4\\u660e\\uff0c\\u5e2e\\u52a9\\u7528\\u6237\\u5224\\u65ad\\u529e\\u7406\\u8def\\u5f84\\u3001\\u6750\\u6599\\u6e05\\u5355\\u3001\\u5ba1\\u6279\\u8282\\u70b9\\u548c\\u6ce8\\u610f\\u4e8b\\u9879\\u3002")
-        sample_input = zh("\\u6211\\u60f3\\u7533\\u8bf7\\u51fa\\u5dee\\u62a5\\u9500\\uff0c\\u9700\\u8981\\u51c6\\u5907\\u54ea\\u4e9b\\u6750\\u6599\\uff1f")
-    elif any(word in text for word in sales_words):
-        domain = zh("\\u9500\\u552e\\u7ebf\\u7d22\\u8ddf\\u8fdb\\u4e0e\\u5ba2\\u6237\\u6458\\u8981")
-        skills = ["lead-qualification", "customer-summary", "follow-up-plan"]
-        connectors = ["feishu"]
-        prompt = zh("\\u4f60\\u662f\\u9500\\u552e\\u7ebf\\u7d22\\u52a9\\u624b\\u3002\\u4f60\\u9700\\u8981\\u603b\\u7ed3\\u5ba2\\u6237\\u80cc\\u666f\\u3001\\u8bc6\\u522b\\u8ddf\\u8fdb\\u4f18\\u5148\\u7ea7\\u3001\\u751f\\u6210\\u4e0b\\u4e00\\u6b65\\u884c\\u52a8\\u5efa\\u8bae\\uff0c\\u5e76\\u4fdd\\u6301\\u4fe1\\u606f\\u51c6\\u786e\\u53ef\\u8ffd\\u6eaf\\u3002")
-        sample_input = zh("\\u5e2e\\u6211\\u6574\\u7406\\u8fd9\\u4e2a\\u5ba2\\u6237\\u7684\\u8ddf\\u8fdb\\u8ba1\\u5212\\u3002")
-    elif any(word in text for word in knowledge_words):
-        domain = zh("\\u4f01\\u4e1a\\u77e5\\u8bc6\\u5e93\\u95ee\\u7b54")
-        skills = ["document-search", "answer-with-citation", "gap-detection"]
+        domain = text[:40] if len(text) <= 40 else text[:40] + "..."
+        words = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]{2,8}", text)[:4] or [zh("\u4efb\u52a1"), zh("\u8ba1\u5212")]
         connectors = []
-        prompt = zh("\\u4f60\\u662f\\u4f01\\u4e1a\\u77e5\\u8bc6\\u5e93\\u95ee\\u7b54\\u52a9\\u624b\\u3002\\u4f60\\u5fc5\\u987b\\u4f18\\u5148\\u57fa\\u4e8e\\u77e5\\u8bc6\\u5e93\\u56de\\u7b54\\uff0c\\u7ed9\\u51fa\\u7b80\\u6d01\\u7ed3\\u8bba\\u548c\\u5f15\\u7528\\u4f9d\\u636e\\uff1b\\u5982\\u679c\\u8d44\\u6599\\u4e0d\\u8db3\\uff0c\\u9700\\u8981\\u8bf4\\u660e\\u7f3a\\u53e3\\u3002")
-        sample_input = zh("\\u8bf7\\u6839\\u636e\\u77e5\\u8bc6\\u5e93\\u8bf4\\u660e\\u8fd9\\u9879\\u670d\\u52a1\\u7684\\u5f00\\u901a\\u6d41\\u7a0b\\u3002")
-    else:
-        domain = zh("\\u901a\\u7528\\u4f01\\u4e1a\\u4efb\\u52a1\\u6267\\u884c")
-        skills = ["task-planning", "document-summary", "quality-check"]
-        connectors = []
-        prompt = zh("\\u4f60\\u662f\\u901a\\u7528\\u4f01\\u4e1a\\u4efb\\u52a1\\u52a9\\u624b\\u3002\\u4f60\\u9700\\u8981\\u5148\\u7406\\u89e3\\u7528\\u6237\\u76ee\\u6807\\uff0c\\u518d\\u62c6\\u89e3\\u6b65\\u9aa4\\uff0c\\u6700\\u540e\\u7ed9\\u51fa\\u6e05\\u6670\\u3001\\u53ef\\u6267\\u884c\\u3001\\u53ef\\u5ba1\\u8ba1\\u7684\\u7ed3\\u679c\\u3002")
-        sample_input = text or zh("\\u5e2e\\u6211\\u5b8c\\u6210\\u4e00\\u4e2a\\u4f01\\u4e1a\\u5185\\u90e8\\u4efb\\u52a1\\u3002")
 
-    if "agent" in lowered and name == zh("\\u4f01\\u4e1a\\u4efb\\u52a1\\u52a9\\u624b"):
-        domain = zh("\\u81ea\\u5b9a\\u4e49 Agent \\u5e94\\u7528")
+    skills = []
+    for word in words:
+        skill = slug_skill(word)
+        if skill not in skills:
+            skills.append(skill)
+    if "task-planning" not in skills:
+        skills.append("task-planning")
+    if "quality-check" not in skills:
+        skills.append("quality-check")
+    skills = skills[:5]
+
+    role = zh("\u4f60\u662f") + name + zh("\u3002")
+    prompt = (
+        role
+        + zh("\u4f60\u9700\u8981\u6839\u636e\u7528\u6237\u76ee\u6807\u6267\u884c\u4efb\u52a1\uff0c\u5e94\u7528\u573a\u666f\u662f\uff1a") + domain + zh("\u3002")
+        + zh("\u4f60\u5fc5\u987b\u5148\u7406\u89e3\u9700\u6c42\uff0c\u518d\u7ed9\u51fa\u7ed3\u6784\u5316\u7ed3\u679c\u3001\u4e0b\u4e00\u6b65\u5efa\u8bae\u548c\u98ce\u9669\u63d0\u9192\u3002")
+        + zh("\u5982\u679c\u4fe1\u606f\u4e0d\u8db3\uff0c\u8981\u4e3b\u52a8\u8bf4\u660e\u7f3a\u53e3\uff0c\u4e0d\u80fd\u7f16\u9020\u4e8b\u5b9e\u3002")
+    )
+    sample_input = text
     return {"name": name, "domain": domain, "prompt": prompt, "skills": skills, "connectors": connectors, "sample_input": sample_input}
 
-
-def generated_main(agent_name: str, prompt: str) -> str:
-    received = zh("\\u5df2\\u6536\\u5230\\u4f60\\u7684\\u9700\\u6c42\\uff0c\\u6211\\u4f1a\\u6309\\u4f01\\u4e1a\\u53ef\\u6295\\u653e\\u6807\\u51c6\\u8f93\\u51fa\\u7ed3\\u679c\\u3002")
-    task_label = zh("\\u4efb\\u52a1\\u7406\\u89e3\\uff1a")
-    plan_title = zh("\\u6267\\u884c\\u8def\\u5f84\\uff1a")
-    step_1 = zh("1. \\u5148\\u660e\\u786e\\u76ee\\u6807\\u3001\\u8fb9\\u754c\\u548c\\u9700\\u8981\\u7684\\u4fe1\\u606f\\u3002")
-    step_2 = zh("2. \\u6309 Skill \\u80fd\\u529b\\u62c6\\u89e3\\u4efb\\u52a1\\uff0c\\u7ed9\\u51fa\\u53ef\\u64cd\\u4f5c\\u7684\\u56de\\u7b54\\u3002")
-    step_3 = zh("3. \\u5bf9\\u4e0d\\u786e\\u5b9a\\u4fe1\\u606f\\u6807\\u6ce8\\u98ce\\u9669\\uff0c\\u5fc5\\u8981\\u65f6\\u5efa\\u8bae\\u4eba\\u5de5\\u590d\\u6838\\u3002")
-    ending = zh("\\u8fd9\\u662f\\u521d\\u59cb\\u7248\\u8fd0\\u884c\\u7ed3\\u679c\\uff0c\\u53ef\\u5728 Web IDE \\u4e2d\\u7ee7\\u7eed\\u63a5\\u5165\\u77e5\\u8bc6\\u5e93\\u3001\\u5de5\\u5177\\u548c\\u6a21\\u578b\\u3002")
-    demo_input = zh("\\u8bf7\\u5e2e\\u6211\\u5904\\u7406\\u4e00\\u4e2a\\u4f01\\u4e1a\\u4efb\\u52a1")
+def generated_main(agent_name: str, prompt: str, domain: str, skills: list[str]) -> str:
     return f'''SYSTEM_PROMPT = {prompt!r}
+AGENT_NAME = {agent_name!r}
+DOMAIN = {domain!r}
+SKILLS = {skills!r}
+
+
+def has_any(text: str, words: list[str]):
+    lowered = text.lower()
+    return any(word.lower() in lowered for word in words)
 
 
 def main(input_text: str):
-    lines = [
-        {f"{agent_name} {received}"!r},
-        "",
-        {task_label!r} + input_text,
-        "",
-        {plan_title!r},
-        {step_1!r},
-        {step_2!r},
-        {step_3!r},
-        "",
-        {ending!r},
-    ]
-    return "\\n".join(lines)
+    context = " ".join(SKILLS).lower() + " " + DOMAIN.lower() + " " + input_text.lower()
+    if has_any(context, ["stock", "market", "financial", "risk"]):
+        return "\\n".join([
+            AGENT_NAME + " local fallback: stock analysis mode.",
+            "Question: " + input_text,
+            "",
+            "I cannot provide an unsupported buy recommendation, but I can provide a screening framework:",
+            "1. Define holding period and risk tolerance.",
+            "2. Exclude companies with major financial, regulatory, or announcement risks.",
+            "3. Compare revenue growth, cash flow, valuation, debt, and industry trend.",
+            "4. Provide stock codes or a watchlist for deeper comparison.",
+            "",
+            "Risk notice: this is analytical support, not investment advice.",
+        ])
+    if has_any(context, ["ppt", "presentation"]):
+        return "\\n".join([
+            AGENT_NAME + " local fallback: presentation mode.",
+            "Topic: " + input_text,
+            "Suggested pages: cover, background, goals, solution, value, next steps.",
+        ])
+    if has_any(context, ["customer", "ticket", "service"]):
+        return "\\n".join([
+            AGENT_NAME + " local fallback: customer service mode.",
+            "Issue: " + input_text,
+            "Suggested flow: confirm facts, match policy, provide next step, escalate sensitive cases.",
+        ])
+    return "\\n".join([
+        AGENT_NAME + " local fallback response.",
+        "Task: " + input_text,
+        "Next: provide more data or constraints for a more specific answer.",
+    ])
 
 
 if __name__ == "__main__":
-    print(main({demo_input!r}))
+    print(main("test task"))
 '''
-
 
 def generated_skill(agent_name: str, domain: str, skills: list[str]) -> str:
     skill_lines = "\n".join(f"- {item}" for item in skills)
@@ -413,7 +605,7 @@ def generate_agent_app(payload: GenerateAgentRequest):
         "permissions": {"network": bool(blueprint["connectors"]), "secrets": [], "filesystem": "sandbox"},
     }
     (draft_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    (draft_dir / "main.py").write_text(generated_main(blueprint["name"], blueprint["prompt"]), encoding="utf-8")
+    (draft_dir / "main.py").write_text(generated_main(blueprint["name"], blueprint["prompt"], blueprint["domain"], blueprint["skills"]), encoding="utf-8")
     (draft_dir / "SKILL.md").write_text(generated_skill(blueprint["name"], blueprint["domain"], blueprint["skills"]), encoding="utf-8")
     test_name = zh("\\u57fa\\u7840\\u8fd0\\u884c\\u9a8c\\u8bc1")
     (draft_dir / "tests.json").write_text(json.dumps([{"name": test_name, "input": blueprint["sample_input"], "expected": blueprint["name"]}], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -538,11 +730,19 @@ def validate_draft_manifest(draft_id: str):
 
 
 @router.post("/drafts/{draft_id}/run")
-def run_draft_app(draft_id: str, payload: RunDraftRequest | None = None):
+async def run_draft_app(draft_id: str, payload: RunDraftRequest | None = None):
     draft_dir = draft_dir_or_404(draft_id)
     input_text = payload.input_text if payload else "test input"
 
-    return run_python_entry(draft_dir, input_text)
+    model_result = await run_model_entry(draft_dir, input_text)
+    if model_result and model_result.get("ok"):
+        return model_result
+
+    fallback = run_python_entry(draft_dir, input_text)
+    if model_result and model_result.get("error"):
+        fallback["warnings"] = [*(fallback.get("warnings") or []), *(model_result.get("warnings") or [])]
+        f"已启用能力：{', '.join(str(item) for item in skills) or '基础任务处理'}",
+    return fallback
 
 
 @router.post("/drafts/{draft_id}/evaluate")
