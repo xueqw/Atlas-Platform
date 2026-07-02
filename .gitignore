@@ -17,3 +17,9 @@ web/*.tsbuildinfo
 .claude/
 *.log
 README_new.md
+.api.*.path
+.web.*.path
+.cloudflared.*.path
+.cloudflared.pid
+output/*
+!output/local-static-proxy.js

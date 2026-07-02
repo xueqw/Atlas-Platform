@@ -1,5 +1,7 @@
 import json
+import asyncio
 import secrets
+import re
 from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -14,13 +16,16 @@ from .config import settings
 from .database import SessionLocal, ensure_schema, get_db
 from .knowledge import extract_pages, search_chunks, split_pages
 from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
-from .connectors import feishu, github_mcp
+from .connectors import feishu, github_mcp, remote_mcp
 from . import tools as agent_tools
+from .apps import router as apps_router
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, Skill, User, WorkflowRun
-from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut
+from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(apps_router)
 
 
 @app.on_event("startup")
@@ -33,11 +38,20 @@ def health():
     return {"status": "ok", "service": "atlas-api", "version": "0.3.0"}
 
 
+_URL_RE = re.compile(r"https?://[^\s，。；、）)]+", re.I)
+_WEB_FETCH_WORDS = ("抓取", "爬取", "提取页面", "网页", "所有链接", "正文要点", "scrape", "fetch", "links")
+
+
+def _looks_like_web_fetch(text: str) -> bool:
+    lowered = text.lower()
+    return bool(_URL_RE.search(text)) and any(word in lowered for word in _WEB_FETCH_WORDS)
+
+
 # ============ 认证：账号密码 + httpOnly cookie 会话 ============
 
 def _set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
-        auth.COOKIE_NAME, token, httponly=True, samesite="lax", secure=False,
+        auth.COOKIE_NAME, token, httponly=True, samesite=settings.cookie_samesite, secure=settings.cookie_secure,
         max_age=settings.session_ttl_hours * 3600, path="/",
     )
 
@@ -233,9 +247,96 @@ def _deny(text: str) -> bool:
     return text.strip().lower() in _DENY
 
 
+def _excel_rows_from_text(text: str) -> list[list[str]]:
+    lines = [line.strip(" \t-•|") for line in text.splitlines()]
+    rows = [["序号", "内容"]]
+    for line in lines:
+        if not line:
+            continue
+        if len(line) < 2:
+            continue
+        rows.append([str(len(rows)), line])
+    return rows if len(rows) > 1 else []
+
+
+async def _maybe_fill_excel_after_structure_change(pending: dict, result: str) -> str:
+    if pending.get("provider") != "excel":
+        return result
+    if pending.get("name") not in {"create_workbook", "create_worksheet"}:
+        return result
+    rows = _excel_rows_from_text(pending.get("source_text", ""))
+    if not rows:
+        return result
+    args = dict(pending.get("args") or {})
+    filepath = args.get("filepath") or args.get("file_path") or args.get("path") or args.get("filename") or "workbook.xlsx"
+    sheet_name = args.get("sheet_name") if pending.get("name") == "create_worksheet" else None
+    sheet_name = sheet_name or "Sheet"
+    write_args = {
+        "filepath": filepath,
+        "sheet_name": sheet_name,
+        "data": rows,
+        "start_cell": "A1",
+    }
+    write_result = await remote_mcp.call_tool("excel", "write_data_to_excel", json.dumps(write_args, ensure_ascii=False))
+    if write_result.lower().startswith("error:"):
+        return f"{result}\n{write_result}\n提示：如果这个 Excel 文件正在被 Excel 打开，请先关闭后再重试，打开中的文件可能会被 Windows 锁住。"
+    try:
+        await remote_mcp.call_tool("excel", "format_range", json.dumps({
+            "filepath": filepath,
+            "sheet_name": sheet_name,
+            "start_cell": "A1",
+            "end_cell": "B1",
+            "bold": True,
+            "bg_color": "4472C4",
+            "font_color": "FFFFFF",
+            "alignment": "center",
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+    return f"{result}\n{write_result}\n已把本次输入内容写入表格：{sheet_name}。"
+
+
 @app.get("/api/connectors")
 async def list_connectors(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return {"connectors": [await feishu.get_status(db), await github_mcp.get_status()]}
+    async def safe_status(provider: str, name: str, coro, timeout: int = 12):
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except Exception as exc:
+            return {
+                "provider": provider,
+                "name": name,
+                "description": "",
+                "configured": False,
+                "connected": False,
+                "account_name": f"Connection timed out: {exc}"[:80],
+                "actions": [],
+            }
+
+    statuses = await asyncio.gather(
+        safe_status("feishu", "Feishu", feishu.get_status(db)),
+        safe_status("github", "GitHub", github_mcp.get_status()),
+        *[
+            safe_status(provider, remote_mcp.REGISTRY[provider]["name"], remote_mcp.get_status(provider), timeout=30)
+            for provider in remote_mcp.providers()
+        ],
+    )
+    return {"connectors": statuses}
+
+
+@app.post("/api/connectors/mcp/{provider}/config")
+async def mcp_config(provider: str, payload: McpKeyRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """通用远程 MCP 连接器配置 key（高德等）。"""
+    if not remote_mcp.is_known(provider):
+        raise HTTPException(404, "未知的 MCP 连接器")
+    remote_mcp.save_key(db, provider, payload.key.strip())
+    return await remote_mcp.get_status(provider)  # 立刻验证：返回连接状态+工具数
+
+
+@app.delete("/api/connectors/mcp/{provider}", status_code=204)
+def mcp_disconnect(provider: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if not remote_mcp.is_known(provider):
+        raise HTTPException(404, "未知的 MCP 连接器")
+    remote_mcp.clear(db, provider)
 
 
 @app.post("/api/connectors/feishu/config")
@@ -290,9 +391,17 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     if not conversation:
         raise HTTPException(404, "任务不存在")
 
-    async def execute_tool(name: str, arguments: str) -> str:
+    mcp_owner: dict[str, str] = {}  # 工具名 -> 所属连接器（github / amap / ...），路由 tools/call
+
+    async def execute_tool(name: str, arguments: str, owner: str | None = None) -> str:
+        prov = owner or mcp_owner.get(name)
+        if prov == "github":
+            return await github_mcp.call_tool(name, arguments)
+        if prov and remote_mcp.is_known(prov):
+            return await remote_mcp.call_tool(prov, name, arguments)
+        # 兜底：非静态工具 + GitHub 已配 = GitHub MCP（保确认路径等旧行为）
         if name not in agent_tools.TOOLS and github_mcp.is_configured():
-            return await github_mcp.call_tool(name, arguments)  # 非静态工具 = GitHub MCP 工具
+            return await github_mcp.call_tool(name, arguments)
         with SessionLocal() as tool_db:
             return await agent_tools.dispatch(tool_db, name, arguments)
 
@@ -314,7 +423,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         async def confirm_events():
             pend_run = pending.get("run_id")
             if approved:
-                connector = agent_tools.TOOLS.get(pending["name"], {}).get("connector", "github")
+                connector = pending.get("provider") or agent_tools.TOOLS.get(pending["name"], {}).get("connector", "github")
                 step_id = None
                 if pend_run:
                     idx = wf.next_index(pend_run)
@@ -322,7 +431,8 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                                           input_data={"args": json.dumps(pending["args"], ensure_ascii=False),
                                                       "access": pending.get("access", "write")})
                     yield f"data: {json.dumps({'type': 'step_started', 'step_id': step_id, 'index': idx, 'step_type': 'tool', 'title': '调用工具：' + pending['name']}, ensure_ascii=False)}\n\n"
-                result = await execute_tool(pending["name"], json.dumps(pending["args"], ensure_ascii=False))
+                result = await execute_tool(pending["name"], json.dumps(pending["args"], ensure_ascii=False), owner=pending.get("provider"))
+                result = await _maybe_fill_excel_after_structure_change(pending, result)
                 if pend_run and step_id:
                     wf.finish_step(step_id, "succeeded", output={"result": (result or "")[:500]})
                     wf.finish_run(pend_run, "succeeded", output={"answer": result})
@@ -358,22 +468,41 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     user_turn = {"role": "user", "content": payload.content}
     model = payload.model
     has_kb = bool(knowledge_base_id)
+    enabled_connectors = list(dict.fromkeys(payload.connectors or []))
+    is_web_fetch = _looks_like_web_fetch(payload.content)
+    if is_web_fetch and remote_mcp.is_configured("fetcher") and "fetcher" not in enabled_connectors:
+        enabled_connectors.insert(0, "fetcher")
 
-    # 组装本次可用工具：静态连接器（飞书）+ 动态 MCP 连接器（GitHub）
-    tool_specs = agent_tools.specs(payload.connectors)
+    # 组装本次可用工具：静态连接器（飞书）+ 动态 MCP 连接器（GitHub + 通用远程 MCP）
+    tool_specs = agent_tools.specs(enabled_connectors)
     mcp_write_names: set[str] = set()
-    if "github" in payload.connectors and github_mcp.is_configured():
+    if "github" in enabled_connectors and github_mcp.is_configured():
         try:
-            gh_specs, mcp_write_names = await github_mcp.tool_specs()
+            gh_specs, gh_writes = await github_mcp.tool_specs()
             tool_specs = tool_specs + gh_specs
+            mcp_write_names |= gh_writes
+            for s in gh_specs:
+                mcp_owner[s["function"]["name"]] = "github"
         except Exception:
             pass  # GitHub MCP 拉取失败就跳过其工具，不影响整体对话
+    # 通用远程 MCP（高德等）：勾选且已配 key 才拉工具
+    for prov in remote_mcp.providers():
+        if prov in enabled_connectors and remote_mcp.is_configured(prov):
+            try:
+                sp, wr = await remote_mcp.tool_specs(prov)
+                tool_specs = tool_specs + sp
+                mcp_write_names |= wr
+                for s in sp:
+                    mcp_owner[s["function"]["name"]] = prov
+            except Exception:
+                pass  # 某个 MCP 拉取失败不影响整体对话
 
-    # M4：MCP Strategy Agent 的输入——写操作名集合 + 静态工具的连接器归属
+    # M4：MCP Strategy Agent 的输入——写操作名集合 + 工具的连接器归属（静态 + MCP）
     static_write_names = {s["function"]["name"] for s in tool_specs
                           if agent_tools.is_write(s["function"]["name"])}
     write_names = static_write_names | mcp_write_names
     connector_of = {name: t["connector"] for name, t in agent_tools.TOOLS.items()}
+    connector_of.update(mcp_owner)  # MCP 工具归属其连接器，供策略/审计正确标注
 
     # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
     # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
@@ -401,7 +530,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             yield sse({"type": "planning_started", "run_id": run_id})
             plan = await strategy.plan(
                 input_text=payload.content, has_knowledge_base=has_kb,
-                enabled_connectors=payload.connectors,
+                enabled_connectors=enabled_connectors,
                 agent_prompt=agent.system_prompt if agent else None, model=model,
                 skill_catalog=skill_catalog,
             )
@@ -439,6 +568,68 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             skill_text = build_skill_instructions(selected_skills)
             if skill_text:
                 history.append({"role": "system", "content": skill_text})
+            if is_web_fetch and "fetcher" in enabled_connectors:
+                history.append({
+                    "role": "system",
+                    "content": (
+                        "Web fetch rule: the user asked to fetch/extract a URL. "
+                        "You must call the Fetcher MCP tool fetch_url before answering. "
+                        "Do not say you cannot browse unless the fetch_url tool itself returns an error. "
+                        "After the tool result, summarize the page title, main text points, and only key links in Chinese. "
+                        "Do not expand long query URLs; omit noisy or repetitive search/result links."
+                    ),
+                })
+            if "excel" in enabled_connectors:
+                history.append({
+                    "role": "system",
+                    "content": (
+                        "Excel connector rule: when the user asks to create an Excel file from any table, "
+                        "plan, list, schedule, or structured content, do not stop after create_workbook. "
+                        "Call create_workbook first if the file does not exist, then call write_data_to_excel "
+                        "with headers and rows, and optionally format_range/create_table. Use relative filenames "
+                        "such as next_week_plan.xlsx; the platform will save them in the writable output/excel folder."
+                    ),
+                })
+
+            direct_web_fetch_done = False
+            if is_web_fetch and "fetcher" in enabled_connectors:
+                url_match = _URL_RE.search(payload.content)
+                if url_match:
+                    fetch_args = {"url": url_match.group(0), "maxLength": 1800}
+                    web_step_id = wf.add_step(
+                        run_id,
+                        next_idx,
+                        "tool",
+                        "调用工具：fetch_url",
+                        "fetcher",
+                        input_data={"args": json.dumps(fetch_args, ensure_ascii=False), "access": "read"},
+                    )
+                    yield sse({
+                        "type": "step_started",
+                        "step_id": web_step_id,
+                        "index": next_idx,
+                        "step_type": "tool",
+                        "title": "调用工具：fetch_url",
+                    })
+                    next_idx += 1
+                    yield sse({"type": "tool_call", "name": "fetch_url", "args": json.dumps(fetch_args, ensure_ascii=False), "access": "read"})
+                    try:
+                        fetch_result = await remote_mcp.call_tool("fetcher", "fetch_url", json.dumps(fetch_args, ensure_ascii=False))
+                    except Exception as exc:
+                        fetch_result = f"网页抓取失败：{exc}"
+                    wf.finish_step(web_step_id, "succeeded", output={"result": fetch_result[:500]})
+                    yield sse({"type": "step_completed", "step_id": web_step_id, "status": "succeeded"})
+                    yield sse({"type": "tool_result", "name": "fetch_url"})
+                    history.append({
+                        "role": "system",
+                        "content": (
+                            "Fetched page result. Use only this content to answer. "
+                            "Keep the answer concise; show the title, 3-6 main points, and at most 8 key links. "
+                            "Do not include long query URLs.\n\n"
+                            + fetch_result
+                        ),
+                    })
+                    direct_web_fetch_done = True
 
             history.append(user_turn)
 
@@ -446,13 +637,18 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             respond_step_id = wf.add_step(run_id, next_idx, "respond", "生成回答", "llm")
             yield sse({"type": "step_started", "step_id": respond_step_id, "index": next_idx, "step_type": "respond", "title": "生成回答"})
             tool_step_id: str | None = None
-            async for ev in stream_agent(history, model, tool_specs, execute_tool,
-                                         needs_confirm=lambda name: name in tool_policy["write_tools"]):
+            response_tool_specs = [] if direct_web_fetch_done else tool_specs
+            forced_tool = None if direct_web_fetch_done else ("fetch_url" if is_web_fetch and any(s["function"]["name"] == "fetch_url" for s in tool_specs) else None)
+            async for ev in stream_agent(history, model, response_tool_specs, execute_tool,
+                                         needs_confirm=lambda name: name in tool_policy["write_tools"],
+                                         force_tool_name=forced_tool):
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
                     access = "write" if ev["name"] in tool_policy["write_tools"] else "read"
                     _pending_actions[conversation_id] = {"name": ev["name"], "args": args,
-                                                         "run_id": run_id, "access": access}
+                                                         "run_id": run_id, "access": access,
+                                                         "provider": mcp_owner.get(ev["name"]),
+                                                         "source_text": payload.content}
                     prompt = agent_tools.describe_call(ev["name"], args) + "\n\n确认请回复「确认」，取消请回复「取消」。"
                     parts.append(prompt)
                     awaiting_confirm = True
@@ -473,7 +669,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                         wf.finish_step(tool_step_id, "succeeded", output={"result": (ev.get("content") or "")[:500]})
                         yield sse({"type": "step_completed", "step_id": tool_step_id, "status": "succeeded"})
                         tool_step_id = None
-                    yield sse(ev)
+                    yield sse({"type": "tool_result", "name": ev["name"]})
                     continue
                 if ev["type"] == "token":
                     parts.append(ev["content"])
@@ -568,3 +764,13 @@ def delete_skill(skill_id: str, ws: str = Depends(current_workspace_id), db: Ses
     db.delete(skill); db.commit()
     return {"ok": True}
 
+
+
+# ============ 单端口部署：FastAPI 直接端出打包后的前端 SPA ============
+# 必须在所有 @app 路由注册之后挂载——/api/* 等已注册路由优先匹配，这里只兜未匹配路径。
+from pathlib import Path as _Path
+from fastapi.staticfiles import StaticFiles
+
+_WEB_DIST = _Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+if _WEB_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(_WEB_DIST), html=True), name="web")

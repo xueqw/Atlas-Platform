@@ -4,7 +4,17 @@ import time
 import httpx
 from .config import settings
 
-SYSTEM_PROMPT = "你是一名严谨、清晰的企业智能助手。优先依据知识库回答，并明确指出资料不足之处。"
+SYSTEM_PROMPT = (
+    "你是一名严谨、清晰的企业智能助手，通过调用工具获取实时数据来完成用户请求。\n\n"
+    "## 工具调用铁律（最高优先级——违反则回答无效）\n"
+    "1. 当系统提供了工具（函数调用），涉及搜索、查询、获取网页/地图/论文/小红书/外部数据时，"
+    "必须调用对应工具获取真实结果。严禁使用训练数据编造回答。\n"
+    "2. 工具返回的内容是唯一可信来源。如实转述结果；结果为空或出错时如实告知，不自编内容填补。\n"
+    "3. 即使用户问题很简单，只要有匹配的工具可用就必须先调用——不得跳过工具直接生成答案。\n"
+    "4. 调用工具时使用中文关键词/参数，确保搜索结果准确。\n\n"
+    "## 知识库规则\n"
+    "仅在无对应工具可用时，才退而参考知识库资料。资料不足时明确指出。"
+)
 
 DEFAULT_MODEL = "glm-4-flash"
 
@@ -144,7 +154,7 @@ async def embed_query(text: str) -> list[float] | None:
     return vectors[0] if vectors else None
 
 
-async def stream_agent(messages: list[dict], model: str | None, tool_specs: list[dict], execute_tool, needs_confirm=None, max_rounds: int = 4):
+async def stream_agent(messages: list[dict], model: str | None, tool_specs: list[dict], execute_tool, needs_confirm=None, max_rounds: int = 4, force_tool_name: str | None = None):
     """带工具调用的对话循环。yield 事件 dict：
     {type:token, content} / {type:tool_call, name, args} / {type:tool_result, name, content}
     / {type:confirm_required, name, args}（写操作，停下等用户确认）。
@@ -164,6 +174,8 @@ async def stream_agent(messages: list[dict], model: str | None, tool_specs: list
         payload = {"model": real_model, "stream": True, "messages": convo}
         if tool_specs:  # 没有启用任何连接器时就当普通对话，不带 tools 字段
             payload["tools"] = tool_specs
+            if force_tool_name and _ == 0:
+                payload["tool_choice"] = {"type": "function", "function": {"name": force_tool_name}}
         tool_calls: dict[int, dict] = {}
         finish = None
         async with httpx.AsyncClient(timeout=90, trust_env=False) as client:

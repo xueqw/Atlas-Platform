@@ -82,6 +82,10 @@ class FeishuConfigRequest(BaseModel):
     app_secret: str = Field(min_length=1, max_length=255)
 
 
+class McpKeyRequest(BaseModel):
+    key: str = Field(min_length=1, max_length=512)
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)

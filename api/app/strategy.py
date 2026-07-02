@@ -24,10 +24,12 @@ PLANNER_SYSTEM = """你是 Atlas 智能体平台的任务规划器（Strategy Ag
 - 顶层字段：goal(字符串，一句话目标)、requires_knowledge(布尔)、requires_tools(布尔)、steps(数组)。
 - requires_knowledge：仅当用户问题确实需要参考企业知识库资料才设为 true；
   闲聊、问候、常识、纯写作、翻译、代码等不需要检索的，一律设为 false。
-- requires_tools：仅当需要调用外部连接器/工具（如发飞书消息、查 GitHub）才为 true。
+- requires_tools：用户请求涉及搜索、查询网页/地图/论文/社交媒体/外部实时数据时，只要有已启用的连接器就必须设为 true。
+  对以下类型请求尤其要设为 true：小红书搜索、网页内容抓取、地图查询、论文检索、Excel 操作。
 - steps 每项含：id、type(取值 retrieve|respond|tool)、title(中文短语)、executor(取值 rag|llm|mcp_tool)。
+- 有 requires_tools=true 时，必须包含至少一个 tool 步骤（放在 respond 之前），
+  tool 步骤的 connector 字段填对应的连接器 ID。
 - 通常以一个 respond 步骤收尾；需要检索时 retrieve 步骤放在最前；需要工具时 tool 步骤放在 respond 前。
-- 没有合适步骤时退化为单个 respond 步骤。
 - skills：从下方「可用技能」列表里选出最适合本次任务的技能 id（0..N 个，可为空数组），
   放进 steps 同级的 "skills" 字段。只填列表中真实存在的 id；不确定就留空数组。
 """
@@ -135,10 +137,12 @@ def _normalize(data: dict, has_kb: bool, connectors: list[str], input_text: str,
 
 
 def fallback_plan(input_text: str, has_kb: bool, connectors: list[str]) -> dict:
-    """无 LLM / 解析失败时的确定性计划：与 M1 行为一致。"""
+    """无 LLM / 解析失败时的确定性计划：有连接器则优先工具调用。"""
     steps: list[dict] = []
     if has_kb:
         steps.append({"id": "step_1", "type": "retrieve", "title": "检索知识库", "executor": "rag"})
+    if connectors:
+        steps.append({"id": f"step_{len(steps) + 1}", "type": "tool", "title": "调用外部工具", "executor": "mcp_tool"})
     steps.append({"id": f"step_{len(steps) + 1}", "type": "respond", "title": "生成回答", "executor": "llm"})
     return {
         "goal": input_text[:60],
