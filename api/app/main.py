@@ -27,7 +27,6 @@ cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(apps_router)
 
-
 @app.on_event("startup")
 def startup():
     ensure_schema()
