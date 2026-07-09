@@ -17,14 +17,15 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_run(conversation_id: str, agent_id: str | None, user_id: str | None,
-               workspace_id: str, input_text: str) -> str:
-    """开一个 run（status=planning），返回 run_id。规划完成后调 save_plan 转 running。"""
+def create_run(conversation_id: str | None, agent_id: str | None, user_id: str | None,
+               workspace_id: str, input_text: str, source: str = "chat") -> str:
+    """开一个 run（status=planning），返回 run_id。规划完成后调 save_plan 转 running。
+    source=chat（工作台对话，默认）| api（外部 API Key 调用，见 api_invoke.py）。"""
     with SessionLocal() as db:
         run = WorkflowRun(
             workspace_id=workspace_id, conversation_id=conversation_id,
             agent_id=agent_id, user_id=user_id, input_text=input_text,
-            status="planning", started_at=_now(),
+            source=source, status="planning", started_at=_now(),
         )
         db.add(run)
         db.commit()

@@ -106,8 +106,147 @@ class AgentUpdate(BaseModel):
 class AgentOut(AgentUpdate):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    kind: str = "prompt"
+    version_no: int = 0
+    published_version_no: int | None = None
+    knowledge_base_count: int = 0
+    skills_count: int = 0
+    connector_count: int = 0
+    call_count: int = 0
+    created_by: str | None = None
+    last_eval_ok: bool | None = None
+    has_passed_test: bool = False
+    deploy_config_configured: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+# === Agent 模板（PRD §5.2） ===
+
+class AgentTemplateOut(BaseModel):
+    id: str
+    name: str
+    description: str
+
+
+class CreateFromTemplateRequest(BaseModel):
+    template_id: str = Field(min_length=1, max_length=60)
+
+
+# === Agents + 版本管理 ===
+
+class AgentVersionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    agent_id: str
+    version_no: int
+    kind: str
+    label: str
+    note: str = ""
+    created_at: datetime
+
+
+class AgentVersionDetail(AgentVersionOut):
+    snapshot: dict
+
+
+class VersionFileDiff(BaseModel):
+    path: str
+    status: str  # added | removed | modified
+    diff: str = ""  # unified diff text；added/removed 时为空，前端直接展示整份内容
+
+
+class AgentVersionDiff(BaseModel):
+    from_version: int
+    to_version: int
+    kind: str
+    files: list[VersionFileDiff] = []  # kind=code 时按文件对比
+    fields: list[dict] = []  # kind=prompt 时按字段对比：[{field, old, new}]
+
+
+class SaveVersionRequest(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
+# === 落地配置（PRD §5.7） ===
+
+class DeployConfigOut(BaseModel):
+    visibility: str = "workspace"  # private | shared | workspace | marketplace
+    shared_user_ids: list[str] = []
+    allowed_knowledge_base_ids: list[str] = []
+    allowed_skill_ids: list[str] = []
+    allowed_connectors: list[str] = []
+    write_confirm: bool = True
+    api_access: bool = False  # 占位：需要 API Key 功能完成后才有实际入口消费它
+    call_log_enabled: bool = True
+
+
+class DeployConfigUpdate(DeployConfigOut):
+    pass
+
+
+class CallLogEntryOut(BaseModel):
+    id: str
+    time: datetime
+    source: str = "chat"
+    status: str
+    latency_ms: int | None = None
+    error: str = ""
+
+
+class WorkspaceMemberOut(BaseModel):
+    id: str
+    name: str
+    username: str
+
+
+# === 发布前检查清单（PRD §5.8） ===
+
+class PublishChecklistItem(BaseModel):
+    key: str
+    label: str
+    ok: bool
+    level: str  # blocking | warning
+
+
+class PublishChecklistOut(BaseModel):
+    items: list[PublishChecklistItem]
+    can_publish: bool  # 所有 blocking 项通过；warning 项不影响这个值
+
+
+# === API Key（PRD §6） ===
+
+class ApiKeyUpdate(BaseModel):
+    status: str = Field(default="active", max_length=20)  # active | disabled
+    expires_at: datetime | None = None
+    daily_quota: int | None = Field(default=None, ge=0)
+    allowed_origins: str = Field(default="", max_length=1000)  # 逗号分隔
+
+
+class ApiKeyOut(BaseModel):
+    """元信息，不含明文 key。"""
+    exists: bool
+    key_prefix: str = ""
+    status: str = "active"
+    expires_at: datetime | None = None
+    daily_quota: int | None = None
+    allowed_origins: str = ""
+    created_at: datetime | None = None
+    last_used_at: datetime | None = None
+
+
+class ApiKeyCreateOut(ApiKeyOut):
+    """创建/重置的一次性响应，含明文 key。之后再也拿不到明文。"""
+    key: str
+
+
+class InvokeRequest(BaseModel):
+    input: str = Field(min_length=1, max_length=20000)
+
+
+class InvokeResponse(BaseModel):
+    output: str
+    elapsed_ms: int
 
 
 class KnowledgeBaseCreate(BaseModel):

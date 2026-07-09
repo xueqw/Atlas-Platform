@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
@@ -77,17 +77,71 @@ class Message(Base):
 
 
 class Agent(Base):
+    """智能体。kind=prompt：纯提示词+知识库；kind=code：会话生成的代码项目，工作区落在
+    storage/app_drafts/{id}/（id 与工作区目录名一致）。两种类型共用同一套版本管理。"""
     __tablename__ = "agents"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     workspace_id: Mapped[str | None] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(String(500), default="")
+    kind: Mapped[str] = mapped_column(String(20), default="prompt")  # prompt | code
     system_prompt: Mapped[str] = mapped_column(Text, default="你是一名可靠、严谨的企业智能助手。")
     model: Mapped[str] = mapped_column(String(120), default="gpt-4.1-mini")
     knowledge_base_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="SET NULL"), nullable=True)
-    status: Mapped[str] = mapped_column(String(30), default="draft")
+    status: Mapped[str] = mapped_column(String(30), default="draft")  # draft | published | archived
+    current_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # 正在编辑的草稿版本
+    published_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # 发布后固定，不随草稿变化
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)  # 历史数据为空=工作区内可见，向后兼容
+    deploy_config_json: Mapped[str] = mapped_column(Text, default="{}")  # 落地配置：可见范围/资源权限/写操作确认等，见 deploy_policy.py
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    versions: Mapped[list["AgentVersion"]] = relationship(back_populates="agent", cascade="all, delete-orphan", order_by="AgentVersion.version_no")
+
+
+class AgentVersion(Base):
+    """一次 Agent 配置/代码快照。snapshot_json 对 kind=prompt 是
+    {system_prompt, model, knowledge_base_id}；对 kind=code 是 {manifest, files: {path: content}}。"""
+    __tablename__ = "agent_versions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    kind: Mapped[str] = mapped_column(String(20), default="prompt")
+    label: Mapped[str] = mapped_column(String(30), default="draft")  # draft | published | history
+    note: Mapped[str] = mapped_column(String(200), default="")  # 例如"回滚自 v2"
+    snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    agent: Mapped[Agent] = relationship(back_populates="versions")
+
+
+class AgentEvalRun(Base):
+    """一次测试(run_draft_app)或评测(evaluate_draft_app)的持久化结果。
+    发布前检查清单（PRD §5.8）读取最近一条判断「是否通过基础测试/是否有评测结果」。"""
+    __tablename__ = "agent_eval_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="test")  # test | evaluate
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    passed: Mapped[int] = mapped_column(Integer, default=0)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    pass_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    results_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentApiKey(Base):
+    """Agent 对外发布后的 API Key（PRD §6）。一个 Agent 最多一条活跃记录，重置=作废旧的建新的。
+    只存 hash，明文只在创建/重置的响应里出现一次。"""
+    __tablename__ = "agent_api_keys"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), unique=True, index=True)
+    key_hash: Mapped[str] = mapped_column(String(64))  # sha256 hex
+    key_prefix: Mapped[str] = mapped_column(String(16), default="")  # 列表页脱敏展示用，如 "sk-ab12"
+    status: Mapped[str] = mapped_column(String(20), default="active")  # active | disabled
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None=不限
+    allowed_origins: Mapped[str] = mapped_column(Text, default="")  # 逗号分隔，空=不限制
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class KnowledgeBase(Base):
@@ -157,6 +211,7 @@ class WorkflowRun(Base):
     conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), index=True, nullable=True)
     agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="chat")  # chat（工作台对话）| api（外部 API Key 调用）
     input_text: Mapped[str] = mapped_column(Text, default="")
     # created|planning|running|waiting_confirmation|succeeded|failed|cancelled
     status: Mapped[str] = mapped_column(String(30), default="created", index=True)

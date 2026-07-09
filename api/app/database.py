@@ -36,6 +36,23 @@ def ensure_schema():
                 if tcols and "workspace_id" not in tcols:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN workspace_id VARCHAR(36)"))
             _backfill_default_workspace(conn)
+            # Agents + 版本管理迁移：老库补 kind/current_version_id/published_version_id
+            acols = {row[1] for row in conn.execute(text("PRAGMA table_info(agents)"))}
+            if acols and "kind" not in acols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN kind VARCHAR(20) DEFAULT 'prompt'"))
+            if acols and "current_version_id" not in acols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN current_version_id VARCHAR(36)"))
+            if acols and "published_version_id" not in acols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN published_version_id VARCHAR(36)"))
+            # 落地配置迁移：老库补 created_by/deploy_config_json
+            if acols and "created_by" not in acols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN created_by VARCHAR(36)"))
+            if acols and "deploy_config_json" not in acols:
+                conn.execute(text("ALTER TABLE agents ADD COLUMN deploy_config_json TEXT DEFAULT '{}'"))
+            # API Key 迁移：老库 workflow_runs 补 source 列，历史记录都视为来自工作台对话
+            wcols = {row[1] for row in conn.execute(text("PRAGMA table_info(workflow_runs)"))}
+            if wcols and "source" not in wcols:
+                conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN source VARCHAR(20) DEFAULT 'chat'"))
     # 预置测试账号 + 内置 skill（幂等，须在建表完成后；用 ORM 会话）
     from .auth import seed_test_accounts
     from .skills_seed import seed_builtin_skills

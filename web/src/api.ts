@@ -1,16 +1,26 @@
 import type {
   Account,
   Agent,
+  AgentTemplate,
+  AgentVersion,
+  AgentVersionDetail,
+  AgentVersionDiff,
+  ApiKey,
+  ApiKeyCreated,
+  CallLogEntry,
   Connector,
   Conversation,
+  DeployConfig,
   KnowledgeBase,
   Me,
   ModelCatalog,
   ModelTestResult,
   Plan,
+  PublishChecklist,
   Skill,
   Source,
   WorkflowRun,
+  WorkspaceMember,
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
@@ -224,11 +234,20 @@ export type EvaluationCase = {
   expected: string
 }
 
+export type EvaluationSummary = {
+  recommendation: 'publish' | 'optimize' | 'hold'
+  recommendation_label: string
+  avg_elapsed_ms: number
+  declared_skills: string[]
+  declared_connectors: string[]
+}
+
 export type EvaluationResult = {
   ok: boolean
   passed: number
   total: number
   pass_rate: number
+  summary: EvaluationSummary
   results: Array<{
     name: string
     input: string
@@ -237,6 +256,8 @@ export type EvaluationResult = {
     output: string
     logs: string
     elapsed_ms: number
+    failure_reason: string
+    suggestion: string
   }>
 }
 
@@ -312,3 +333,79 @@ export const evaluateDraftApp = (draftId: string, cases: EvaluationCase[]) =>
     method: 'POST',
     body: JSON.stringify({ cases }),
   })
+
+export const listAgentVersions = (agentId: string) =>
+  json<AgentVersion[]>(`/api/agents/${agentId}/versions`)
+
+export const getAgentVersion = (agentId: string, versionId: string) =>
+  json<AgentVersionDetail>(`/api/agents/${agentId}/versions/${versionId}`)
+
+export const diffAgentVersions = (agentId: string, from: number, to: number) =>
+  json<AgentVersionDiff>(`/api/agents/${agentId}/versions/diff?from=${from}&to=${to}`)
+
+export const saveAgentVersion = (agentId: string, note = '') =>
+  json<AgentVersion>(`/api/agents/${agentId}/versions`, {
+    method: 'POST',
+    body: JSON.stringify({ note }),
+  })
+
+export const rollbackAgentVersion = (agentId: string, versionId: string) =>
+  json<AgentVersion>(`/api/agents/${agentId}/versions/${versionId}/rollback`, { method: 'POST' })
+
+export const publishAgent = (agentId: string) =>
+  json<AgentVersion>(`/api/agents/${agentId}/publish`, { method: 'POST' })
+
+export const archiveAgent = (agentId: string) =>
+  json<Agent>(`/api/agents/${agentId}/archive`, { method: 'POST' })
+
+export const unarchiveAgent = (agentId: string) =>
+  json<Agent>(`/api/agents/${agentId}/unarchive`, { method: 'POST' })
+
+export const getDeployConfig = (agentId: string) =>
+  json<DeployConfig>(`/api/agents/${agentId}/deploy-config`)
+
+export const updateDeployConfig = (agentId: string, config: DeployConfig) =>
+  json<DeployConfig>(`/api/agents/${agentId}/deploy-config`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  })
+
+export const listAgentCallLogs = (agentId: string) =>
+  json<CallLogEntry[]>(`/api/agents/${agentId}/call-logs`)
+
+export const listWorkspaceMembers = () =>
+  json<WorkspaceMember[]>('/api/workspace/members')
+
+export const getPublishChecklist = (agentId: string) =>
+  json<PublishChecklist>(`/api/agents/${agentId}/publish-checklist`)
+
+export const getApiKey = (agentId: string) =>
+  json<ApiKey>(`/api/agents/${agentId}/api-key`)
+
+export const createOrResetApiKey = (agentId: string) =>
+  json<ApiKeyCreated>(`/api/agents/${agentId}/api-key`, { method: 'POST' })
+
+export const updateApiKey = (
+  agentId: string,
+  patch: { status: string; expires_at: string | null; daily_quota: number | null; allowed_origins: string },
+) =>
+  json<ApiKey>(`/api/agents/${agentId}/api-key`, {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+
+export const deleteApiKey = (agentId: string) =>
+  fetch(apiUrl(`/api/agents/${agentId}/api-key`), { method: 'DELETE', credentials: 'include' }).then((response) => {
+    if (!response.ok) throw new Error('删除失败')
+  })
+
+export const listAgentTemplates = () => json<AgentTemplate[]>('/api/agents/templates')
+
+export const createAgentFromTemplate = (templateId: string) =>
+  json<Agent>('/api/agents/from-template', {
+    method: 'POST',
+    body: JSON.stringify({ template_id: templateId }),
+  })
+
+export const copyAgent = (agentId: string) =>
+  json<Agent>(`/api/agents/${agentId}/copy`, { method: 'POST' })

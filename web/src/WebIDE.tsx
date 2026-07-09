@@ -129,7 +129,15 @@ function statusText(validation: ManifestValidation | null, serverMode: boolean) 
   return validation.ok ? '校验通过' : '需要修复'
 }
 
-export default function WebIDE({ notice, initialDraft }: { notice: (text: string) => void; initialDraft?: AppDraft | null }) {
+export default function WebIDE({
+  notice,
+  initialDraft,
+  onRequestFix,
+}: {
+  notice: (text: string) => void
+  initialDraft?: AppDraft | null
+  onRequestFix?: (context: string) => void
+}) {
   const [panel, setPanel] = useState<Panel>('overview')
   const [advancedMode, setAdvancedMode] = useState(false)
   const [appName, setAppName] = useState('demo-agent-app')
@@ -139,6 +147,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
   const [saving, setSaving] = useState(false)
   const [running, setRunning] = useState(false)
   const [evaluating, setEvaluating] = useState(false)
+  const [lastRunError, setLastRunError] = useState<string | null>(null)
 
   const [fileTree, setFileTree] = useState<AppFile[]>(fallbackFileTree)
   const [files, setFiles] = useState<FileMap>(fallbackFiles)
@@ -386,6 +395,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
   async function runPreview() {
     setRunning(true)
     setLogs('正在保存草稿并启动沙箱预览...')
+    setLastRunError(null)
 
     try {
       if (selectedFile) await saveFile(selectedFile, currentContent)
@@ -395,15 +405,23 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         const result = await runDraftApp(draftId, inputText)
         setLogs(result.logs || '运行结束，但没有返回日志。')
         notice(result.ok ? '运行预览完成' : '运行失败，请查看日志')
+        if (!result.ok) setLastRunError(result.error || '运行失败，未返回具体错误信息。')
       } else {
         setLogs(`Mock run\n> input: ${inputText}\nHello Atlas: ${inputText}`)
       }
     } catch (error) {
-      setLogs(error instanceof Error ? error.message : '运行失败')
+      const message = error instanceof Error ? error.message : '运行失败'
+      setLogs(message)
+      setLastRunError(message)
       notice('运行失败')
     } finally {
       setRunning(false)
     }
+  }
+
+  function requestFixFor(context: string) {
+    onRequestFix?.(context)
+    notice('已跳转到项目对话，确认发送即可让 Coding Agent 修复')
   }
 
   async function runEvaluation() {
@@ -424,7 +442,14 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
           passed: testCases.length,
           total: testCases.length,
           pass_rate: 1,
-          results: testCases.map(item => ({ ...item, ok: true, output: `Hello Atlas: ${item.input}`, logs: 'Mock evaluation', elapsed_ms: 0 }))
+          summary: {
+            recommendation: 'publish',
+            recommendation_label: '可以发布',
+            avg_elapsed_ms: 0,
+            declared_skills: manifest.skills,
+            declared_connectors: manifest.connectors,
+          },
+          results: testCases.map(item => ({ ...item, ok: true, output: `Hello Atlas: ${item.input}`, logs: 'Mock evaluation', elapsed_ms: 0, failure_reason: '', suggestion: '' }))
         })
       }
     } finally {
@@ -600,6 +625,8 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
   }
 
   function renderTests() {
+    const failedCases = evaluation ? evaluation.results.filter(item => !item.ok) : []
+
     return (
       <div className="webide-panel tests-panel">
         <div className="panel-title row-title">
@@ -625,11 +652,39 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
 
         {evaluation && (
           <div className="evaluation-box">
-            <strong>通过率 {(evaluation.pass_rate * 100).toFixed(0)}%</strong>
-            <span>{evaluation.passed}/{evaluation.total} 通过</span>
-            {evaluation.results.map(item => (
-              <p key={item.name} className={item.ok ? 'pass' : 'fail'}>{item.ok ? '通过' : '失败'} - {item.name} - {item.elapsed_ms}ms</p>
-            ))}
+            <div className={`eval-recommendation ${evaluation.summary.recommendation}`}>
+              {evaluation.summary.recommendation_label}
+            </div>
+
+            <div className="metrics-row">
+              <div><strong>{(evaluation.pass_rate * 100).toFixed(0)}%</strong><span>通过率</span></div>
+              <div><strong>{evaluation.passed}/{evaluation.total}</strong><span>通过样例</span></div>
+              <div><strong>{evaluation.summary.avg_elapsed_ms}ms</strong><span>平均耗时</span></div>
+              <div><strong>{evaluation.summary.declared_skills.length}</strong><span>已声明 Skills</span></div>
+              <div><strong>{evaluation.summary.declared_connectors.length}</strong><span>已声明连接器</span></div>
+            </div>
+
+            {failedCases.length > 0 && (
+              <div className="failure-case-list">
+                {failedCases.map(item => (
+                  <div className="failure-case-card" key={item.name}>
+                    <header>
+                      <strong>{item.name}</strong>
+                      <button type="button" onClick={() => requestFixFor(`评测样例「${item.name}」失败。输入：${item.input}；期望结果：${item.expected || '（无）'}；实际结果：${item.output || '（无输出）'}；失败原因：${item.failure_reason}；建议：${item.suggestion}\n\n请帮我修复这个问题。`)}>
+                        用 Coding Agent 修复
+                      </button>
+                    </header>
+                    <dl>
+                      <dt>测试问题</dt><dd>{item.input}</dd>
+                      <dt>期望结果</dt><dd>{item.expected || '（未设置）'}</dd>
+                      <dt>实际结果</dt><dd>{item.output || '（无输出）'}</dd>
+                      <dt>失败原因</dt><dd>{item.failure_reason}</dd>
+                      <dt>建议修复方式</dt><dd>{item.suggestion}</dd>
+                    </dl>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -671,6 +726,12 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
   function renderAgentUse() {
     const visibleLogs = logs.replace(/^> .*\n/gm, '').trim()
     const ready = serverMode && draftId && validation?.ok !== false
+    const usedModel = logs.includes('> provider:')
+    const runStage: 'idle' | 'validate' | 'execute' | 'done' = running
+      ? 'execute'
+      : logs.includes('exit code') || logs.includes('> elapsed')
+        ? 'done'
+        : 'idle'
 
     return (
       <div className="agent-use-shell">
@@ -712,12 +773,33 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
               <button onClick={() => setInputText('请帮我总结这个需求，并给出下一步处理建议。')}>试用示例</button>
             </div>
 
+            <div className="run-mini-steps">
+              <div className={runStage !== 'idle' ? 'active' : ''}><i>1</i>校验 manifest</div>
+              <div className={runStage === 'execute' || runStage === 'done' ? 'active' : ''}><i>2</i>{usedModel ? '调用模型' : '沙箱执行'}</div>
+              <div className={runStage === 'done' ? 'active' : ''}><i>3</i>输出结果</div>
+            </div>
+
             <div className="agent-answer-card">
               <div className="answer-title">
                 <span>Agent 输出</span>
                 <b>{running ? '运行中' : logs.includes('exit code') ? '已完成' : '等待输入'}</b>
               </div>
               <pre>{visibleLogs || '运行后这里会直接显示 Agent 的回答，不需要先调整配置。'}</pre>
+            </div>
+
+            {lastRunError && (
+              <div className="run-failure-block">
+                <strong>运行失败</strong>
+                <p>{lastRunError}</p>
+                <button type="button" onClick={() => requestFixFor(`单次运行失败。输入：${inputText}；错误信息：${lastRunError}\n\n请帮我修复这个问题。`)}>
+                  用 Coding Agent 修复
+                </button>
+              </div>
+            )}
+
+            <div className="run-declared-tags">
+              <span>已声明 Skills：{manifest.skills.length ? manifest.skills.join('、') : '无'}</span>
+              <span>已声明连接器：{manifest.connectors.length ? manifest.connectors.join('、') : '无'}</span>
             </div>
           </div>
         </section>

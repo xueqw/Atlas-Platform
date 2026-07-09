@@ -18,14 +18,18 @@ from .knowledge import extract_pages, search_chunks, split_pages
 from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
 from .connectors import feishu, github_mcp, remote_mcp
 from . import tools as agent_tools
-from .apps import router as apps_router
+from .apps import agents_router, create_version, next_version_no, snapshot_prompt_agent, router as apps_router
+from .api_invoke import invoke_router
+from .deploy_policy import apply_resource_permissions, check_visibility, parse_deploy_config
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, Skill, User, WorkflowRun
-from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut
+from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut, WorkspaceMemberOut
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.3.0")
 cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 app.include_router(apps_router)
+app.include_router(agents_router)
+app.include_router(invoke_router)
 
 @app.on_event("startup")
 def startup():
@@ -125,16 +129,24 @@ async def post_model_test(payload: ModelTestRequest, user: User = Depends(curren
     return await test_model(payload.model)
 
 
+def _agent_out(agent: Agent, db: Session) -> AgentOut:
+    from .apps import agent_out_fields
+    return AgentOut.model_validate(agent).model_copy(update=agent_out_fields(agent, db))
+
+
 @app.get("/api/agents", response_model=list[AgentOut])
 def list_agents(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
-    return db.scalars(select(Agent).where(Agent.workspace_id == ws).order_by(Agent.updated_at.desc())).all()
+    items = db.scalars(select(Agent).where(Agent.workspace_id == ws).order_by(Agent.updated_at.desc())).all()
+    return [_agent_out(item, db) for item in items]
 
 
 @app.post("/api/agents", response_model=AgentOut, status_code=201)
-def create_agent(payload: AgentCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
-    item = Agent(**payload.model_dump(), workspace_id=ws)
-    db.add(item); db.commit(); db.refresh(item)
-    return item
+def create_agent(payload: AgentCreate, user: User = Depends(current_user), ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    item = Agent(**payload.model_dump(), workspace_id=ws, kind="prompt", created_by=user.id)
+    db.add(item); db.flush()
+    create_version(db, item, snapshot_prompt_agent(item), label="draft")
+    db.commit(); db.refresh(item)
+    return _agent_out(item, db)
 
 
 @app.put("/api/agents/{agent_id}", response_model=AgentOut)
@@ -144,8 +156,10 @@ def update_agent(agent_id: str, payload: AgentUpdate, ws: str = Depends(current_
         raise HTTPException(404, "智能体不存在")
     for key, value in payload.model_dump().items():
         setattr(item, key, value)
+    # 普通保存只改 Agent 行本身（当前工作态），不动任何 AgentVersion 快照——
+    # 版本永远不可变，显式点「保存版本」才新增一行（见 /api/agents/{id}/versions）
     db.commit(); db.refresh(item)
-    return item
+    return _agent_out(item, db)
 
 
 @app.delete("/api/agents/{agent_id}", status_code=204)
@@ -154,6 +168,16 @@ def delete_agent(agent_id: str, ws: str = Depends(current_workspace_id), db: Ses
     if not item:
         raise HTTPException(404, "智能体不存在")
     db.delete(item); db.commit()
+
+
+@app.get("/api/workspace/members", response_model=list[WorkspaceMemberOut])
+def list_workspace_members(ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    """落地配置「指定用户」可见范围用：列出当前工作区成员，供选人。"""
+    rows = db.execute(
+        select(User.id, User.name, User.username).join(Membership, Membership.user_id == User.id)
+        .where(Membership.workspace_id == ws)
+    ).all()
+    return [WorkspaceMemberOut(id=r.id, name=r.name, username=r.username) for r in rows]
 
 
 @app.get("/api/knowledge-bases", response_model=list[KnowledgeBaseOut])
@@ -448,6 +472,11 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         return StreamingResponse(confirm_events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     agent = db.scalar(select(Agent).where(Agent.id == payload.agent_id, Agent.workspace_id == ws)) if payload.agent_id else None
+    if agent and agent.status == "archived":
+        raise HTTPException(403, "该智能体已下架")
+    deploy_config = parse_deploy_config(agent.deploy_config_json) if agent else None
+    if agent and not check_visibility(agent.created_by, deploy_config, user.id):
+        raise HTTPException(403, "该智能体不可用")
     # 以前端选择为准：选智能体时前端会自动把它的库填进下拉框；选「不使用知识库」即真的不用，
     # 不再用 agent.knowledge_base_id 偷偷回退（否则「不使用知识库」会被智能体绑定库覆盖）。
     # 跨租户防护：只接受属于当前工作区的知识库，否则忽略，绝不检索别家资料。
@@ -466,11 +495,24 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         base_history.append({"role": "system", "content": f"用户上传的文件「{payload.attachment_name or '附件'}」内容：\n{payload.attachment_text[:8000]}"})
     user_turn = {"role": "user", "content": payload.content}
     model = payload.model
-    has_kb = bool(knowledge_base_id)
     enabled_connectors = list(dict.fromkeys(payload.connectors or []))
     is_web_fetch = _looks_like_web_fetch(payload.content)
     if is_web_fetch and remote_mcp.is_configured("fetcher") and "fetcher" not in enabled_connectors:
         enabled_connectors.insert(0, "fetcher")
+
+    # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
+    # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
+    skill_rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
+    skill_catalog = [{"id": s.id, "name": s.name, "description": s.description,
+                      "trigger_phrases": s.trigger_phrases, "content": s.content} for s in skill_rows]
+
+    # 落地配置：按该 Agent 的资源权限收窄本次实际可用的连接器/Skill/知识库（允许列表为空=不限制）
+    if deploy_config:
+        enabled_connectors, skill_catalog, knowledge_base_id = apply_resource_permissions(
+            deploy_config, enabled_connectors, skill_catalog, knowledge_base_id)
+
+    manual_skill_ids = [sid for sid in (payload.skill_ids or []) if any(s["id"] == sid for s in skill_catalog)]
+    has_kb = bool(knowledge_base_id)
 
     # 组装本次可用工具：静态连接器（飞书）+ 动态 MCP 连接器（GitHub + 通用远程 MCP）
     tool_specs = agent_tools.specs(enabled_connectors)
@@ -502,13 +544,6 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     write_names = static_write_names | mcp_write_names
     connector_of = {name: t["connector"] for name, t in agent_tools.TOOLS.items()}
     connector_of.update(mcp_owner)  # MCP 工具归属其连接器，供策略/审计正确标注
-
-    # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
-    # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
-    skill_rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
-    skill_catalog = [{"id": s.id, "name": s.name, "description": s.description,
-                      "trigger_phrases": s.trigger_phrases, "content": s.content} for s in skill_rows]
-    manual_skill_ids = [sid for sid in (payload.skill_ids or []) if any(s["id"] == sid for s in skill_catalog)]
 
     # === Agent Runtime Pipeline（M1+M2+M3）：本次执行登记为一个 run，由 Strategy Agent 规划 ===
     run_id = wf.create_run(conversation_id, agent.id if agent else None, user.id, ws, payload.content)
@@ -638,8 +673,9 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             tool_step_id: str | None = None
             response_tool_specs = [] if direct_web_fetch_done else tool_specs
             forced_tool = None if direct_web_fetch_done else ("fetch_url" if is_web_fetch and any(s["function"]["name"] == "fetch_url" for s in tool_specs) else None)
+            write_confirm_enabled = deploy_config.get("write_confirm", True) if deploy_config else True
             async for ev in stream_agent(history, model, response_tool_specs, execute_tool,
-                                         needs_confirm=lambda name: name in tool_policy["write_tools"],
+                                         needs_confirm=lambda name: write_confirm_enabled and name in tool_policy["write_tools"],
                                          force_tool_name=forced_tool):
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
