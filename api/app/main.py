@@ -5,7 +5,7 @@ import re
 from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 from . import auth
 from . import strategy
@@ -21,6 +21,10 @@ from . import tools as agent_tools
 from .apps import agents_router, create_version, execute_agent_runtime, next_version_no, snapshot_prompt_agent, router as apps_router
 from .api_invoke import invoke_router
 from .evaluation import router as evaluation_router
+from .memory import router as memory_router
+from .object_storage import knowledge_object_key, object_storage
+from .state_store import state_store
+from .code_runner import runner_health
 from .deploy_policy import apply_resource_permissions, check_visibility, parse_deploy_config
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, Skill, User, WorkflowRun
 from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelProviderConfigRequest, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut, WorkspaceMemberOut
@@ -32,15 +36,36 @@ app.include_router(apps_router)
 app.include_router(agents_router)
 app.include_router(invoke_router)
 app.include_router(evaluation_router)
+app.include_router(memory_router)
 
 @app.on_event("startup")
 def startup():
+    if settings.environment == "production" and not settings.secret_encryption_key:
+        raise RuntimeError("SECRET_ENCRYPTION_KEY_FILE is required in production")
     ensure_schema()
+    if settings.object_storage_required and not object_storage.ping():
+        raise RuntimeError("Required object storage is unavailable")
+    if settings.redis_required and not state_store.ping():
+        raise RuntimeError("Required Redis is unavailable")
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "atlas-api", "version": "0.3.0"}
+    dependencies = {"database": False, "redis": state_store.ping(), "object_storage": object_storage.ping(), "code_runner": runner_health()}
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+        dependencies["database"] = True
+    except Exception:
+        pass
+    required = [dependencies["database"]]
+    if settings.redis_required:
+        required.append(dependencies["redis"])
+    if settings.object_storage_required:
+        required.append(dependencies["object_storage"])
+    if settings.code_runner_required:
+        required.append(dependencies["code_runner"])
+    return {"status": "ok" if all(required) else "degraded", "service": "atlas-api", "version": "0.4.0", "dependencies": dependencies}
 
 
 _URL_RE = re.compile(r"https?://[^\s，。；、）)]+", re.I)
@@ -226,6 +251,14 @@ async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), 
         raise HTTPException(400, "文档中没有可索引的文本")
     document = Document(knowledge_base_id=knowledge_base_id, name=file.filename or "未命名文档", content_type=file.content_type or "application/octet-stream", size=len(raw), chunk_count=len(pieces))
     db.add(document); db.flush()
+    object_key = knowledge_object_key(ws, knowledge_base_id, document.id, document.name)
+    try:
+        object_storage.put(object_key, raw, document.content_type)
+        document.object_key = object_key
+    except Exception:
+        if settings.object_storage_required:
+            db.rollback()
+            raise HTTPException(503, "知识原文件存储不可用")
     try:
         vectors = await embed_texts([content for _, content in pieces])
     except Exception:
@@ -263,11 +296,10 @@ def delete_document(document_id: str, ws: str = Depends(current_workspace_id), d
     )
     if not item:
         raise HTTPException(404, "文档不存在")
+    object_storage.delete(item.object_key)
     db.delete(item); db.commit()
 
 
-_oauth_states: set[str] = set()  # demo 级 CSRF state 暂存；生产应放带过期的存储
-_pending_actions: dict[str, dict] = {}  # conversation_id -> 待确认的写操作 {name, args}
 _AFFIRM = {"确认", "确定", "是", "好", "好的", "发送", "可以", "行", "嗯", "yes", "y", "ok"}
 _DENY = {"取消", "不", "不要", "否", "算了", "no", "n"}
 
@@ -399,15 +431,14 @@ def feishu_login():
     if not feishu.is_configured():
         raise HTTPException(400, "飞书未配置（缺 App ID / App Secret）")
     state = secrets.token_urlsafe(16)
-    _oauth_states.add(state)
+    state_store.set("oauth", state, True, 600)
     return RedirectResponse(feishu.build_authorize_url(state))
 
 
 @app.get("/api/connectors/feishu/callback")
 async def feishu_callback(code: str = "", state: str = "", db: Session = Depends(get_db)):
-    if not code or state not in _oauth_states:
+    if not code or not state_store.get("oauth", state, consume=True):
         return HTMLResponse("<h3>授权失败：参数缺失或 state 不匹配</h3>", status_code=400)
-    _oauth_states.discard(state)
     try:
         token = await feishu.exchange_code(code)
         info = await feishu.fetch_user_info(token["access_token"])
@@ -448,7 +479,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
             wdb.commit()
 
     # === 待确认的写操作：把本条消息当作「确认/取消」处理，不走模型 ===
-    pending = _pending_actions.pop(conversation_id, None)
+    pending = state_store.get("pending-action", conversation_id, consume=True)
     if pending and (_affirm(payload.content) or _deny(payload.content)):
         approved = _affirm(payload.content)
         db.add(Message(conversation_id=conversation_id, role="user", content=payload.content)); db.commit()
@@ -534,14 +565,14 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                     args = json.loads(pending.get("arguments") or "{}") if isinstance(pending.get("arguments"), str) else pending.get("arguments") or {}
                 except json.JSONDecodeError:
                     args = {}
-                _pending_actions[conversation_id] = {
+                state_store.set("pending-action", conversation_id, {
                     "name": pending.get("tool"),
                     "args": args,
                     "run_id": result.get("run_id"),
                     "access": "write",
                     "provider": pending.get("provider"),
                     "source_text": payload.content,
-                }
+                }, 900)
             save_assistant(answer, json.dumps(result.get("sources") or [], ensure_ascii=False))
             for ch in answer:
                 yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
@@ -741,10 +772,10 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
                     access = "write" if ev["name"] in tool_policy["write_tools"] else "read"
-                    _pending_actions[conversation_id] = {"name": ev["name"], "args": args,
+                    state_store.set("pending-action", conversation_id, {"name": ev["name"], "args": args,
                                                          "run_id": run_id, "access": access,
                                                          "provider": mcp_owner.get(ev["name"]),
-                                                         "source_text": payload.content}
+                                                         "source_text": payload.content}, 900)
                     prompt = agent_tools.describe_call(ev["name"], args) + "\n\n确认请回复「确认」，取消请回复「取消」。"
                     parts.append(prompt)
                     awaiting_confirm = True

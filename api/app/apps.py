@@ -6,7 +6,6 @@ import difflib
 import json
 import re
 import subprocess
-import sys
 import time
 import httpx
 
@@ -29,12 +28,15 @@ from .skills_engine import build_skill_instructions
 from .connectors import github_mcp, remote_mcp
 from . import tools as agent_tools
 from . import workflow as wf
+from .code_runner import run_python
+from .config import settings
+from .object_storage import agent_archive_key, object_storage
 
 
 router = APIRouter(prefix="/api/apps", tags=["apps"])
 
 BASE_DIR = Path(__file__).resolve().parent
-DRAFT_ROOT = BASE_DIR / "storage" / "app_drafts"
+DRAFT_ROOT = Path(settings.agent_code_root).resolve()
 
 
 class CreateDraftRequest(BaseModel):
@@ -231,6 +233,15 @@ def create_version(db: Session, agent: Agent, snapshot: dict, label: str = "draf
     db.add(version)
     db.flush()
     agent.current_version_id = version.id
+    try:
+        object_storage.put(
+            agent_archive_key(agent.workspace_id or "legacy", agent.id, version.version_no),
+            json.dumps(snapshot, ensure_ascii=False).encode("utf-8"),
+            "application/json",
+        )
+    except Exception:
+        if settings.object_storage_required:
+            raise
     return version
 
 
@@ -531,18 +542,19 @@ def run_python_entry(draft_dir: Path, input_text: str, timeout: int = 10) -> dic
     )
 
     try:
-        result = subprocess.run(
-            [sys.executable, str(runner_file)],
-            cwd=str(draft_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        result = run_python(draft_dir, min(timeout, settings.code_runner_timeout_seconds))
     except subprocess.TimeoutExpired:
         return {
             "ok": False,
             "logs": "> 沙箱运行超时：超过 10 秒",
             "error": "timeout",
+            "warnings": warnings,
+        }
+    except (OSError, RuntimeError) as exc:
+        return {
+            "ok": False,
+            "logs": f"> 隔离运行器不可用：{exc}",
+            "error": "runner_unavailable",
             "warnings": warnings,
         }
     finally:
@@ -1380,6 +1392,18 @@ def generated_preview(agent_name: str, domain: str) -> str:
 </html>'''
 
 
+def secure_preview_html(html: str) -> str:
+    policy = (
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; "
+        "base-uri 'none'; frame-src 'none'; object-src 'none'"
+    )
+    meta = f'<meta http-equiv="Content-Security-Policy" content="{policy}">'
+    if re.search(r"<head[^>]*>", html, flags=re.I):
+        return re.sub(r"(<head[^>]*>)", lambda match: match.group(1) + meta, html, count=1, flags=re.I)
+    return meta + html
+
+
 def scaffold_agent_files(agent_name: str, prompt: str, domain: str, skills: list[str], connectors: list[str], sample_input: str, needs_preview: bool = False) -> dict[str, str]:
     file_names = [*FRAMEWORK_FILES, *(["preview.html"] if needs_preview else [])]
     files = {
@@ -1464,7 +1488,7 @@ def fallback_refinement(files: dict[str, str], message: str) -> tuple[dict[str, 
     if agent_code and "system_prompt =" in agent_code:
         files["agent.py"] = re.sub(
             r"^\s*system_prompt\s*=.*$",
-            f"    system_prompt = {manifest['prompt']!r}",
+            lambda _match: f"    system_prompt = {manifest['prompt']!r}",
             agent_code,
             count=1,
             flags=re.M,
@@ -1633,7 +1657,7 @@ def get_draft_preview(draft_id: str, ws: str = Depends(current_workspace_id), db
     return {
         "exists": preview.exists(),
         "path": "preview.html" if preview.exists() else "",
-        "html": preview.read_text(encoding="utf-8") if preview.exists() else "",
+        "html": secure_preview_html(preview.read_text(encoding="utf-8")) if preview.exists() else "",
     }
 
 

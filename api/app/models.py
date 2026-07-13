@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime, timezone
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 from .database import Base
+from .encrypted_type import EncryptedText
 
 
 def uid() -> str:
@@ -193,6 +195,7 @@ class Document(Base):
     size: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30), default="ready")
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    object_key: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     knowledge_base: Mapped[KnowledgeBase] = relationship(back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
@@ -202,7 +205,7 @@ class ConnectorConfig(Base):
     """连接器的应用级配置（公司统一）。如飞书的 app_id / app_secret，管理员配一次全公司用。"""
     __tablename__ = "connector_configs"
     provider: Mapped[str] = mapped_column(String(40), primary_key=True)
-    data: Mapped[str] = mapped_column(Text, default="{}")  # JSON：{app_id, app_secret, ...}
+    data: Mapped[str] = mapped_column(EncryptedText(), default="{}")  # encrypted JSON
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
@@ -211,8 +214,8 @@ class ConnectorToken(Base):
     __tablename__ = "connector_tokens"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     provider: Mapped[str] = mapped_column(String(40), index=True)  # 如 "feishu"
-    access_token: Mapped[str] = mapped_column(Text)
-    refresh_token: Mapped[str] = mapped_column(Text, default="")
+    access_token: Mapped[str] = mapped_column(EncryptedText())
+    refresh_token: Mapped[str] = mapped_column(EncryptedText(), default="")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     account_name: Mapped[str] = mapped_column(String(120), default="")  # 已连接账号显示名
     open_id: Mapped[str] = mapped_column(String(120), default="")  # 发消息收件人定位
@@ -229,6 +232,21 @@ class DocumentChunk(Base):
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 向量，空则该块未建索引
     document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class AgentMemory(Base):
+    """Explicit long-term memory. Private rows are always scoped to their owner."""
+    __tablename__ = "agent_memories"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    category: Mapped[str] = mapped_column(String(40), default="preference")
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float] | str | None] = mapped_column(Vector(1024).with_variant(Text(), "sqlite"), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
 # === Agent Runtime Pipeline（PRD M1）：一次执行=一个 run，拆成若干 step ===

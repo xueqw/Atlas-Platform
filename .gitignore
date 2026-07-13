@@ -3,6 +3,9 @@ api/data/
 **/__pycache__/
 *.py[cod]
 api/.env
+.env
+secrets/
+/atlas-deploy-*.tar.gz
 data/
 web/node_modules/
 web/dist/

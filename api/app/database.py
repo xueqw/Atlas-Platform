@@ -21,12 +21,18 @@ def ensure_schema():
     """建表 + 轻量迁移：补列、给历史资源回填 workspace_id、预置测试账号（多租户地基）。"""
     if engine.dialect.name == "sqlite":
         _drop_stale_auth_tables()  # 须在 create_all 之前
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
     if engine.dialect.name == "sqlite":
         with engine.begin() as conn:
             cols = {row[1] for row in conn.execute(text("PRAGMA table_info(document_chunks)"))}
             if "embedding" not in cols:
                 conn.execute(text("ALTER TABLE document_chunks ADD COLUMN embedding TEXT"))
+            dcols = {row[1] for row in conn.execute(text("PRAGMA table_info(documents)"))}
+            if dcols and "object_key" not in dcols:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN object_key TEXT DEFAULT ''"))
             tcols = {row[1] for row in conn.execute(text("PRAGMA table_info(connector_tokens)"))}
             if tcols and "open_id" not in tcols:
                 conn.execute(text("ALTER TABLE connector_tokens ADD COLUMN open_id VARCHAR(120) DEFAULT ''"))
@@ -61,6 +67,7 @@ def ensure_schema():
                 conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN agent_version_id VARCHAR(36)"))
             if ecols and "summary_json" not in ecols:
                 conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN summary_json TEXT DEFAULT '{}'"))
+    _encrypt_legacy_connector_secrets()
     # 预置测试账号 + 内置 skill（幂等，须在建表完成后；用 ORM 会话）
     from .auth import seed_test_accounts
     from .skills_seed import seed_builtin_skills
@@ -103,6 +110,33 @@ def _backfill_default_workspace(conn) -> None:
         )
     for t in ("conversations", "agents", "knowledge_bases"):
         conn.execute(text(f"UPDATE {t} SET workspace_id = :ws WHERE workspace_id IS NULL"), {"ws": ws_id})
+
+
+def _encrypt_legacy_connector_secrets() -> None:
+    """One-way startup migration for connector credentials written before encryption-at-rest."""
+    from .encrypted_type import encrypt_text
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT provider, data FROM connector_configs")).all()
+        for provider, value in rows:
+            if value and not value.startswith("enc:v1:"):
+                conn.execute(
+                    text("UPDATE connector_configs SET data = :value WHERE provider = :provider"),
+                    {"provider": provider, "value": encrypt_text(value)},
+                )
+        rows = conn.execute(text("SELECT id, access_token, refresh_token FROM connector_tokens")).all()
+        for token_id, access_token, refresh_token in rows:
+            updates = {}
+            if access_token and not access_token.startswith("enc:v1:"):
+                updates["access_token"] = encrypt_text(access_token)
+            if refresh_token and not refresh_token.startswith("enc:v1:"):
+                updates["refresh_token"] = encrypt_text(refresh_token)
+            if updates:
+                conn.execute(
+                    text("UPDATE connector_tokens SET access_token = COALESCE(:access_token, access_token), "
+                         "refresh_token = COALESCE(:refresh_token, refresh_token) WHERE id = :id"),
+                    {"id": token_id, "access_token": updates.get("access_token"), "refresh_token": updates.get("refresh_token")},
+                )
 
 
 def get_db():

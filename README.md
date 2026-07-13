@@ -57,4 +57,16 @@ cd E:/codex/ai-agent-platform-demo
 
 ## 技术栈
 
-React - TypeScript - FastAPI - SQLAlchemy - MCP - bge-m3
+React - TypeScript - FastAPI - SQLAlchemy - PostgreSQL/pgvector - Redis - MinIO - Docker - MCP - bge-m3
+
+## 生产架构
+
+- PostgreSQL 保存业务数据，pgvector 保存长期记忆向量。
+- MinIO 保存知识库原文件和 Agent 不可变版本归档。
+- Redis 保存 OAuth state、待确认操作和带 TTL 的短期记忆。
+- 代码型 Agent 在禁网、只读、限 CPU/内存/PID 的一次性 Docker 容器中运行。
+- HTML 预览使用无同源权限的 sandbox iframe，并注入限制性 CSP。
+- 连接器凭据加密入库，平台密钥支持通过 `*_FILE` 挂载注入。
+- `scripts/backup.sh` 提供 PostgreSQL、MinIO、Redis 和 Agent 代码的每日备份。
+
+完整准备、迁移、上线、回滚和离线镜像步骤见 [生产部署手册](docs/deployment/production.md)。

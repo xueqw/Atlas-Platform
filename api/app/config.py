@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import quote
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -6,7 +7,33 @@ _ENV_FILE = Path(__file__).parent.parent / ".env"
 
 
 class Settings(BaseSettings):
+    environment: str = "development"
     database_url: str = "sqlite:///./data/atlas.db"
+    database_password_file: str = ""
+    redis_url: str = "redis://localhost:6379/0"
+    redis_password_file: str = ""
+    redis_required: bool = False
+    object_storage_backend: str = "local"
+    object_storage_required: bool = False
+    object_storage_endpoint: str = "localhost:9000"
+    object_storage_access_key: str = ""
+    object_storage_secret_key: str = ""
+    object_storage_secure: bool = False
+    object_storage_bucket: str = "atlas"
+    local_storage_root: str = "./data/objects"
+    agent_code_root: str = "./data/agent-code"
+
+    code_runner_backend: str = "local"
+    code_runner_required: bool = False
+    code_runner_image: str = "atlas-agent-runner:py311"
+    code_runner_timeout_seconds: int = 10
+    code_runner_memory: str = "256m"
+    code_runner_cpus: float = 0.5
+    code_runner_pids_limit: int = 64
+
+    short_memory_ttl_seconds: int = 86400
+    long_memory_default_ttl_days: int = 365
+    backup_retention_days: int = 14
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4.1-mini"
@@ -45,7 +72,34 @@ class Settings(BaseSettings):
 
     app_port: int = 8000
 
+    # Docker/systemd secrets can be mounted as files instead of appearing in
+    # process definitions. A non-empty *_FILE value takes precedence.
+    openai_api_key_file: str = ""
+    zhipu_api_key_file: str = ""
+    siliconflow_api_key_file: str = ""
+    github_pat_file: str = ""
+    feishu_app_secret_file: str = ""
+    object_storage_secret_key_file: str = ""
+    secret_encryption_key: str = ""
+    secret_encryption_key_file: str = ""
+
     model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
+
+    def model_post_init(self, __context) -> None:
+        for url_name, password_file in (
+            ("database_url", self.database_password_file),
+            ("redis_url", self.redis_password_file),
+        ):
+            if password_file:
+                password = Path(password_file).read_text(encoding="utf-8").strip()
+                setattr(self, url_name, getattr(self, url_name).replace("{password}", quote(password, safe="")))
+        for name in (
+            "openai_api_key", "zhipu_api_key", "siliconflow_api_key",
+            "github_pat", "feishu_app_secret", "object_storage_secret_key", "secret_encryption_key",
+        ):
+            path = getattr(self, f"{name}_file", "")
+            if path:
+                setattr(self, name, Path(path).read_text(encoding="utf-8").strip())
 
 
 settings = Settings()
