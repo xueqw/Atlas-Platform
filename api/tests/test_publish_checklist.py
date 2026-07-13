@@ -68,8 +68,8 @@ def test_publish_blocked_with_missing_items_listed(auth_client):
     assert r.status_code == 403, r.text
     detail = r.json()["detail"]
     assert "已通过基础测试" in detail
-    assert "已有评测结果" in detail
     assert "已配置落地权限" in detail
+    assert "已有评测结果" not in detail
 
 
 def test_publish_succeeds_once_all_blocking_items_pass(auth_client):
@@ -92,7 +92,7 @@ def test_publish_succeeds_once_all_blocking_items_pass(auth_client):
     assert r.status_code == 200, r.text
 
 
-def test_high_risk_connector_warns_but_does_not_block(auth_client):
+def test_high_risk_connector_requires_owner_approval(auth_client):
     draft_id = auth_client.post("/api/apps/generate", json={"message": "客服助手", "project_name": ""}).json()["draft"]["id"]
 
     auth_client.post(f"/api/apps/drafts/{draft_id}/run", json={"input_text": "hi"})
@@ -107,10 +107,21 @@ def test_high_risk_connector_warns_but_does_not_block(auth_client):
 
     checklist = _checklist_of(auth_client, draft_id)
     assert _item(checklist, "no_high_risk_connector")["ok"] is False
-    assert checklist["can_publish"] is True  # warning 不阻断
+    assert _item(checklist, "high_risk_approval")["ok"] is False
+    assert checklist["can_publish"] is False
 
     r = auth_client.post(f"/api/agents/{draft_id}/publish")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 403, r.text
+
+    auth_client.put(f"/api/agents/{draft_id}/deploy-config", json={
+        "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
+        "allowed_skill_ids": [], "allowed_connectors": ["feishu"], "write_confirm": True,
+        "api_access": False, "call_log_enabled": True, "high_risk_approved": True,
+    })
+    checklist = _checklist_of(auth_client, draft_id)
+    assert _item(checklist, "high_risk_approval")["ok"] is True
+    assert checklist["can_publish"] is True
+    assert auth_client.post(f"/api/agents/{draft_id}/publish").status_code == 200
 
 
 def test_prompt_agent_does_not_need_test_or_eval_to_publish(auth_client):
@@ -172,7 +183,7 @@ def test_build_publish_checklist_code_requires_test_and_eval():
 def test_build_publish_checklist_warning_never_blocks():
     result = build_publish_checklist(
         kind="prompt", has_current_version=True, has_passed_test=True,
-        last_eval_ok=True, deploy_config_configured=True, allowed_connectors=["feishu"],
+        last_eval_ok=True, deploy_config_configured=True, allowed_connectors=["feishu"], high_risk_approved=True,
     )
     assert result["can_publish"] is True
     warning_items = [i for i in result["items"] if i["level"] == "warning"]

@@ -12,13 +12,20 @@ def _published_agent_with_key(auth_client, name, api_access=True, **key_override
     auth_client.put(f"/api/agents/{agent['id']}/deploy-config", json={
         "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
         "allowed_skill_ids": [], "allowed_connectors": [], "write_confirm": True,
-        "api_access": api_access, "call_log_enabled": True,
+        "api_access": True, "call_log_enabled": True,
     })
     r = auth_client.post(f"/api/agents/{agent['id']}/publish")
     assert r.status_code == 200, r.text
 
     key_resp = auth_client.post(f"/api/agents/{agent['id']}/api-key").json()
     plaintext = key_resp["key"]
+
+    if not api_access:
+        auth_client.put(f"/api/agents/{agent['id']}/deploy-config", json={
+            "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
+            "allowed_skill_ids": [], "allowed_connectors": [], "write_confirm": True,
+            "api_access": False, "call_log_enabled": True,
+        })
 
     if key_overrides:
         auth_client.put(f"/api/agents/{agent['id']}/api-key", json={
@@ -92,20 +99,16 @@ def test_invoke_api_access_disabled_rejected(auth_client):
     assert r.status_code == 403, r.text
 
 
-def test_invoke_unpublished_agent_rejected(auth_client):
+def test_api_key_creation_unpublished_agent_rejected(auth_client):
     agent = auth_client.post("/api/agents", json={"name": "H"}).json()
     auth_client.put(f"/api/agents/{agent['id']}/deploy-config", json={
         "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
         "allowed_skill_ids": [], "allowed_connectors": [], "write_confirm": True,
         "api_access": True, "call_log_enabled": True,
     })
-    key = auth_client.post(f"/api/agents/{agent['id']}/api-key").json()["key"]
-
-    r = auth_client.post(
-        f"/api/agents/{agent['id']}/invoke", json={"input": "hi"},
-        headers={"Authorization": f"Bearer {key}"},
-    )
-    assert r.status_code == 403, r.text
+    r = auth_client.post(f"/api/agents/{agent['id']}/api-key")
+    assert r.status_code == 400, r.text
+    assert "先发布" in r.json()["detail"]
 
 
 def test_invoke_quota_exceeded_rejected(auth_client):

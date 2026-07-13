@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 import httpx
 from .config import settings
 
@@ -40,6 +41,13 @@ PROVIDERS = [
     },
 ]
 
+PROVIDER_ENV = {
+    "zhipu": {"api_key": "ZHIPU_API_KEY", "base_url": "ZHIPU_BASE_URL", "settings_key": "zhipu_api_key", "settings_base_url": "zhipu_base_url"},
+    "aliyun": {"api_key": "OPENAI_API_KEY", "base_url": "OPENAI_BASE_URL", "settings_key": "openai_api_key", "settings_base_url": "openai_base_url"},
+}
+
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
 
 def resolve_provider(model: str | None) -> tuple[str, str, str]:
     """根据模型名路由到对应供应商，返回 (base_url, api_key, model)。"""
@@ -65,6 +73,43 @@ def list_providers() -> dict:
             for p in PROVIDERS
         ],
     }
+
+
+def _write_env_value(path: Path, key: str, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    prefix = f"{key}="
+    rendered = f'{key}="{value.replace(chr(34), chr(92) + chr(34))}"'
+    updated = False
+    next_lines = []
+    for line in lines:
+        if line.startswith(prefix):
+            next_lines.append(rendered)
+            updated = True
+        else:
+            next_lines.append(line)
+    if not updated:
+        next_lines.append(rendered)
+    path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+
+
+def configure_provider(provider_id: str, api_key: str, base_url: str | None = None) -> dict:
+    meta = PROVIDER_ENV.get(provider_id)
+    provider = next((item for item in PROVIDERS if item["id"] == provider_id), None)
+    if not meta or not provider:
+        raise ValueError("未知模型供应商")
+    cleaned_key = api_key.strip()
+    if not cleaned_key:
+        raise ValueError("API Key 不能为空")
+    _write_env_value(ENV_FILE, meta["api_key"], cleaned_key)
+    setattr(settings, meta["settings_key"], cleaned_key)
+    provider["api_key"] = cleaned_key
+    if base_url and base_url.strip():
+        cleaned_url = base_url.strip().rstrip("/")
+        _write_env_value(ENV_FILE, meta["base_url"], cleaned_url)
+        setattr(settings, meta["settings_base_url"], cleaned_url)
+        provider["base_url"] = cleaned_url
+    return list_providers()
 
 
 async def test_model(model: str) -> dict:

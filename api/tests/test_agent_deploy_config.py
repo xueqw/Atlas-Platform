@@ -64,6 +64,21 @@ def test_workspace_members_endpoint(auth_client):
     assert "alice" in usernames  # 预置测试账号同工作区
 
 
+def test_regular_member_cannot_approve_high_risk_connectors():
+    with TestClient(app) as admin_client:
+        assert admin_client.post("/api/auth/login", json={"username": "admin", "password": "atlas123"}).status_code == 200
+        agent = admin_client.post("/api/agents", json={"name": "Approval Agent"}).json()
+
+    with TestClient(app) as alice_client:
+        assert alice_client.post("/api/auth/login", json={"username": "alice", "password": "atlas123"}).status_code == 200
+        r = alice_client.put(f"/api/agents/{agent['id']}/deploy-config", json={
+            "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
+            "allowed_skill_ids": [], "allowed_connectors": ["feishu"], "write_confirm": True,
+            "api_access": False, "call_log_enabled": True, "high_risk_approved": True,
+        })
+        assert r.status_code == 403, r.text
+
+
 def test_cross_user_private_agent_blocked():
     """两个不同账号（同工作区）：private 可见范围下，非创建者调用被拒。"""
     with TestClient(app) as admin_client:

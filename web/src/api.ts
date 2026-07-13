@@ -11,6 +11,8 @@ import type {
   Connector,
   Conversation,
   DeployConfig,
+  EvaluationRunV2,
+  EvaluationSuite,
   KnowledgeBase,
   Me,
   ModelCatalog,
@@ -98,6 +100,11 @@ export const disconnectMcp = (provider: string) =>
   })
 export const testModel = (model: string) =>
   json<ModelTestResult>('/api/models/test', { method: 'POST', body: JSON.stringify({ model }) })
+export const configureModelProvider = (provider_id: string, api_key: string, base_url?: string) =>
+  json<ModelCatalog>('/api/models/config', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id, api_key, base_url: base_url || null }),
+  })
 export const listSkills = () => json<Skill[]>('/api/skills')
 export const createSkill = (s: { name: string; description: string; content: string; trigger_phrases: string }) =>
   json<Skill>('/api/skills', { method: 'POST', body: JSON.stringify(s) })
@@ -222,10 +229,19 @@ export type ManifestValidation = {
 
 export type RunPreviewResult = {
   ok: boolean
+  answer: string
+  content?: string
   logs: string
   error?: string
   warnings?: string[]
   elapsed_ms?: number
+  sources: Array<{ document: string; page: number; quote: string; score: number; knowledge_base_id?: string }>
+  trace: Array<{ type: string; title: string; status: string; executor: string; output?: Record<string, unknown>; error?: string }>
+  tool_calls: Array<{ name: string; status: string; provider: string }>
+  requires_confirmation?: { tool: string; arguments: string; provider: string } | null
+  version_no?: number | null
+  version_label?: string
+  run_id?: string | null
 }
 
 export type EvaluationCase = {
@@ -240,6 +256,8 @@ export type EvaluationSummary = {
   avg_elapsed_ms: number
   declared_skills: string[]
   declared_connectors: string[]
+  metrics?: Record<string, number | null>
+  metric_notes?: Record<string, string>
 }
 
 export type EvaluationResult = {
@@ -258,8 +276,63 @@ export type EvaluationResult = {
     elapsed_ms: number
     failure_reason: string
     suggestion: string
+    sources?: RunPreviewResult['sources']
+    trace?: RunPreviewResult['trace']
+    tool_calls?: RunPreviewResult['tool_calls']
   }>
 }
+
+export type BuilderMessage = {
+  id: string
+  role: 'assistant' | 'user'
+  content: string
+  created_at: string
+  changed_files?: string[]
+  version_no?: number
+  warnings?: string[]
+}
+
+export type DraftProductState = {
+  agent: Agent
+  draft_dirty: boolean
+  latest_test: null | {
+    id: string
+    kind: string
+    ok: boolean
+    passed: number
+    total: number
+    pass_rate: number
+    avg_elapsed_ms: number
+    results: RunPreviewResult[]
+    created_at: string
+  }
+  latest_evaluation: null | {
+    id: string
+    kind: string
+    ok: boolean
+    passed: number
+    total: number
+    pass_rate: number
+    avg_elapsed_ms: number
+    results: EvaluationResult['results']
+    summary: EvaluationSummary
+    created_at: string
+  }
+  deploy_config: DeployConfig
+  publish_checklist: PublishChecklist
+  builder_messages: BuilderMessage[]
+  preview_available: boolean
+}
+
+export type RefineAgentResult = {
+  reply: string
+  changed_files: string[]
+  version_no: number
+  warnings: string[]
+  draft: AppDraft
+}
+
+export type DraftPreview = { exists: boolean; path: string; html: string }
 
 export type GeneratedAgentApp = {
   draft: AppDraft
@@ -271,6 +344,7 @@ export type GeneratedAgentApp = {
     skills: string[]
     connectors: string[]
     sample_input: string
+    needs_preview?: boolean
   }
   files: string[]
 }
@@ -280,6 +354,18 @@ export const generateAgentApp = (message: string, projectName = '') =>
     method: 'POST',
     body: JSON.stringify({ message, project_name: projectName }),
   })
+
+export const refineAgentApp = (draftId: string, message: string) =>
+  json<RefineAgentResult>(`/api/apps/drafts/${draftId}/refine`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  })
+
+export const getDraftProductState = (draftId: string) =>
+  json<DraftProductState>(`/api/apps/drafts/${draftId}/product-state`)
+
+export const getDraftPreview = (draftId: string) =>
+  json<DraftPreview>(`/api/apps/drafts/${draftId}/preview`)
 
 export const createAppDraft = (name: string) =>
   json<AppDraft>('/api/apps/drafts', {
@@ -322,10 +408,10 @@ export const deleteDraftFile = (draftId: string, path: string) =>
 export const validateDraftManifest = (draftId: string) =>
   json<ManifestValidation>(`/api/apps/drafts/${draftId}/manifest/validate`)
 
-export const runDraftApp = (draftId: string, inputText: string) =>
+export const runDraftApp = (draftId: string, inputText: string, confirmedTools: string[] = []) =>
   json<RunPreviewResult>(`/api/apps/drafts/${draftId}/run`, {
     method: 'POST',
-    body: JSON.stringify({ input_text: inputText }),
+    body: JSON.stringify({ input_text: inputText, confirmed_tools: confirmedTools }),
   })
 
 export const evaluateDraftApp = (draftId: string, cases: EvaluationCase[]) =>
@@ -333,6 +419,12 @@ export const evaluateDraftApp = (draftId: string, cases: EvaluationCase[]) =>
     method: 'POST',
     body: JSON.stringify({ cases }),
   })
+
+export const listEvaluationSuites = (agentId: string) => json<EvaluationSuite[]>(`/api/agents/${agentId}/evaluation-suites`)
+export const createEvaluationSuite = (agentId: string, payload: {name:string;description?:string;pass_threshold?:number;is_release_gate?:boolean}) => json<EvaluationSuite>(`/api/agents/${agentId}/evaluation-suites`, {method:'POST',body:JSON.stringify(payload)})
+export const createEvaluationCase = (agentId: string, suiteId: string, payload: {name:string;input_text:string;expected_text?:string;scorers?:Record<string,unknown>;is_key?:boolean}) => json(`/api/agents/${agentId}/evaluation-suites/${suiteId}/cases`, {method:'POST',body:JSON.stringify(payload)})
+export const deleteEvaluationCase = (agentId: string, suiteId: string, caseId: string) => json<{ok:boolean}>(`/api/agents/${agentId}/evaluation-suites/${suiteId}/cases/${caseId}`, {method:'DELETE'})
+export const runEvaluationSuite = (agentId: string, suiteId: string) => json<EvaluationRunV2>(`/api/agents/${agentId}/evaluation-suites/${suiteId}/run`, {method:'POST'})
 
 export const listAgentVersions = (agentId: string) =>
   json<AgentVersion[]>(`/api/agents/${agentId}/versions`)

@@ -1130,6 +1130,96 @@ textarea:focus {
   width: min(680px, 100%);
 }
 
+.agent-config-card {
+  width: min(620px, 100%);
+  border: 1px solid #f3c668;
+  border-radius: 12px;
+  background: #fffaf0;
+  padding: 14px;
+  box-sizing: border-box;
+  color: #172033;
+}
+
+.config-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.config-card-head span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #111827;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.config-card-head strong {
+  font-size: 16px;
+}
+
+.agent-config-card p {
+  margin: 0 0 12px;
+  color: #5b6475;
+  line-height: 1.65;
+}
+
+.agent-config-card label {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 12px;
+  font-weight: 900;
+  color: #344054;
+}
+
+.agent-config-card input {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid #d8dee8;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 9px 11px;
+  box-sizing: border-box;
+  color: #111827;
+  font: inherit;
+}
+
+.agent-config-card input:focus {
+  outline: 2px solid rgba(37, 99, 235, .22);
+  border-color: #2563eb;
+}
+
+.config-card-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.config-card-actions button {
+  border: 1px solid #d8dee8;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 9px 12px;
+  font-weight: 900;
+  color: #172033;
+  cursor: pointer;
+}
+
+.config-card-actions button.primary {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.config-card-actions button:disabled {
+  opacity: .58;
+  cursor: not-allowed;
+}
+
 .result-headline {
   display: flex;
   align-items: center;
@@ -2819,4 +2909,132 @@ textarea:focus {
   color: #9aa4b5;
   font-size: 11px;
   line-height: 1.5;
+}
+
+.agents-list-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 160px 150px auto;
+  align-items: end;
+  gap: 10px;
+  padding: 12px 24px;
+  border-top: 1px solid #e2e7ee;
+  border-bottom: 1px solid #e2e7ee;
+  background: #f7f8fa;
+}
+
+.agents-list-toolbar label {
+  display: grid;
+  gap: 4px;
+}
+
+.agents-list-toolbar label span {
+  color: #6c7789;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.agents-list-toolbar input,
+.agents-list-toolbar select {
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid #cfd7e2;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.agents-list-toolbar > b {
+  padding-bottom: 9px;
+  color: #6c7789;
+  font-size: 11px;
+}
+
+.agent-health-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid #edf0f4;
+  border-bottom: 1px solid #edf0f4;
+  color: #6c7789;
+  font-size: 10px;
+}
+
+.agent-health-strip span:first-child {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #283346;
+  font-weight: 700;
+}
+
+.agent-health-strip i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9aa5b5;
+}
+
+.agent-health-strip.healthy i { background: #16805c; }
+.agent-health-strip.attention i { background: #b56b14; }
+.agent-health-strip.risk i { background: #bd3434; }
+.provider-status.risk { color: #a82d2d; background: #fff0f0; }
+
+.new-agent-dialog {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.new-agent-dialog-head span {
+  color: #2463eb;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.new-agent-dialog-head h2 {
+  margin: 4px 0;
+}
+
+.new-agent-dialog-head p {
+  margin: 0 0 16px;
+  color: #6c7789;
+}
+
+.new-agent-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.new-agent-options button {
+  position: relative;
+  display: grid;
+  gap: 5px;
+  min-height: 92px;
+  padding: 16px;
+  border: 1px solid #d7dee7;
+  border-radius: 6px;
+  background: #fff;
+  text-align: left;
+}
+
+.new-agent-options button:hover {
+  border-color: #8aaaf4;
+  background: #f7f9ff;
+}
+
+.new-agent-options button.recommended {
+  border-color: #96b1ef;
+  box-shadow: inset 3px 0 0 #2463eb;
+}
+
+.new-agent-options button b { color: #172033; }
+.new-agent-options button span { color: #6c7789; font-size: 11px; line-height: 1.5; }
+.new-agent-options button i { position: absolute; top: 9px; right: 9px; color: #2463eb; font-size: 9px; font-style: normal; }
+
+@media (max-width: 720px) {
+  .agents-list-toolbar { grid-template-columns: 1fr 1fr; }
+  .agents-list-toolbar label:first-child { grid-column: 1 / -1; }
+  .new-agent-options { grid-template-columns: 1fr; }
 }

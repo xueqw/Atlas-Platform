@@ -125,6 +125,36 @@ class AgentEvalRun(Base):
     total: Mapped[int] = mapped_column(Integer, default=0)
     pass_rate: Mapped[float] = mapped_column(Float, default=0.0)
     results_json: Mapped[str] = mapped_column(Text, default="[]")
+    suite_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    agent_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class EvaluationSuite(Base):
+    """可复用评测集。属于一个 Agent，发布门禁默认读取 is_release_gate=True 的评测集。"""
+    __tablename__ = "evaluation_suites"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    pass_threshold: Mapped[float] = mapped_column(Float, default=1.0)
+    is_release_gate: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class EvaluationCase(Base):
+    """单条确定性评测样例。scorers_json 控制关键词、JSON Schema、延迟等评分器。"""
+    __tablename__ = "evaluation_cases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    suite_id: Mapped[str] = mapped_column(ForeignKey("evaluation_suites.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    input_text: Mapped[str] = mapped_column(Text)
+    expected_text: Mapped[str] = mapped_column(Text, default="")
+    scorers_json: Mapped[str] = mapped_column(Text, default="{}")
+    is_key: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

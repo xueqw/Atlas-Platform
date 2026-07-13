@@ -73,6 +73,12 @@ class ModelTestRequest(BaseModel):
     model: str = Field(min_length=1, max_length=120)
 
 
+class ModelProviderConfigRequest(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=40)
+    api_key: str = Field(min_length=1, max_length=512)
+    base_url: str | None = Field(default=None, max_length=300)
+
+
 class GithubConfigRequest(BaseModel):
     pat: str = Field(min_length=1, max_length=255)
 
@@ -117,6 +123,10 @@ class AgentOut(AgentUpdate):
     last_eval_ok: bool | None = None
     has_passed_test: bool = False
     deploy_config_configured: bool = False
+    workflow_stage: str = "draft"
+    health_status: str = "unknown"
+    success_rate: float | None = None
+    has_unpublished_changes: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -179,6 +189,7 @@ class DeployConfigOut(BaseModel):
     write_confirm: bool = True
     api_access: bool = False  # 占位：需要 API Key 功能完成后才有实际入口消费它
     call_log_enabled: bool = True
+    high_risk_approved: bool = False
 
 
 class DeployConfigUpdate(DeployConfigOut):
@@ -192,6 +203,9 @@ class CallLogEntryOut(BaseModel):
     status: str
     latency_ms: int | None = None
     error: str = ""
+    request_path: str = ""
+    status_code: int | None = None
+    token_usage: int | None = None
 
 
 class WorkspaceMemberOut(BaseModel):
@@ -247,6 +261,8 @@ class InvokeRequest(BaseModel):
 class InvokeResponse(BaseModel):
     output: str
     elapsed_ms: int
+    version_no: int | None = None
+    run_id: str | None = None
 
 
 class KnowledgeBaseCreate(BaseModel):

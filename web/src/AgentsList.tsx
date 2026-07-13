@@ -3,6 +3,7 @@ import { archiveAgent, copyAgent, createAgent, createAppDraft, deleteAgent, list
 import type { Agent } from './types'
 import AgentApiKeyDialog from './AgentApiKeyDialog'
 import AgentDeployConfig from './AgentDeployConfig'
+import AgentEvaluationPanel from './AgentEvaluationPanel'
 import AgentFlowSteps from './AgentFlowSteps'
 import AgentTemplateDialog from './AgentTemplateDialog'
 import AgentVersionsDrawer from './AgentVersions'
@@ -12,6 +13,24 @@ const statusLabel: Record<string, string> = {
   draft: '草稿中',
   published: '已发布',
   archived: '已下架',
+}
+
+const stageLabel: Record<string, string> = {
+  develop: '开发中',
+  test: '待测试',
+  evaluate: '待评测',
+  deploy: '待配置',
+  publish: '待发布',
+  published: '已发布',
+  archived: '已下架',
+  risk: '有风险',
+}
+
+const healthLabel: Record<string, string> = {
+  healthy: '健康',
+  attention: '需关注',
+  risk: '有风险',
+  unknown: '待验证',
 }
 
 function timeAgo(iso: string) {
@@ -42,9 +61,14 @@ export default function AgentsList({
   const [loading, setLoading] = useState(true)
   const [versionsFor, setVersionsFor] = useState<Agent | null>(null)
   const [deployConfigFor, setDeployConfigFor] = useState<Agent | null>(null)
+  const [evaluationFor, setEvaluationFor] = useState<Agent | null>(null)
   const [publishChecklistFor, setPublishChecklistFor] = useState<Agent | null>(null)
   const [apiKeyFor, setApiKeyFor] = useState<Agent | null>(null)
   const [templateDialogOpen, setTemplateDialogOpen] = useState(false)
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [stageFilter, setStageFilter] = useState('all')
+  const [kindFilter, setKindFilter] = useState('all')
 
   const refresh = () => listAgents().then(setAgents).finally(() => setLoading(false))
 
@@ -56,6 +80,7 @@ export default function AgentsList({
     const item = await createAgent(`新智能体 ${agents.length + 1}`)
     notice('智能体已创建')
     await refresh()
+    setCreateDialogOpen(false)
     onOpenPrompt(item)
   }
 
@@ -63,6 +88,7 @@ export default function AgentsList({
     const item = await createAppDraft(`新应用 ${agents.length + 1}`)
     notice('应用草稿已创建')
     await refresh()
+    setCreateDialogOpen(false)
     onOpenCode({ id: item.id, name: item.name, status: item.status } as Agent)
   }
 
@@ -96,6 +122,13 @@ export default function AgentsList({
     }
   }
 
+  const visibleAgents = agents.filter(agent => {
+    const text = `${agent.name} ${agent.description}`.toLowerCase()
+    return (!query.trim() || text.includes(query.trim().toLowerCase()))
+      && (stageFilter === 'all' || agent.workflow_stage === stageFilter || agent.status === stageFilter)
+      && (kindFilter === 'all' || agent.kind === kindFilter)
+  })
+
   return (
     <section className="agents-list-page">
       <div className="agents-list-title">
@@ -105,11 +138,15 @@ export default function AgentsList({
           <p>查看已创建的智能体，继续开发、查看版本或发布上线。</p>
         </div>
         <div className="agents-list-actions">
-          <button className="solid" onClick={newPromptAgent}>+ 纯提示词</button>
-          <button className="solid" onClick={newCodeAgent}>+ 会话生成代码</button>
-          <button onClick={() => setTemplateDialogOpen(true)}>+ 从模板创建</button>
-          <button onClick={onNewProject}>会话式创建</button>
+          <button className="solid" onClick={() => setCreateDialogOpen(true)}>+ 新建 Agent</button>
         </div>
+      </div>
+
+      <div className="agents-list-toolbar">
+        <label><span>搜索</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="名称或描述" /></label>
+        <label><span>阶段</span><select value={stageFilter} onChange={event => setStageFilter(event.target.value)}><option value="all">全部阶段</option><option value="develop">开发中</option><option value="test">待测试</option><option value="evaluate">待评测</option><option value="deploy">待配置</option><option value="publish">待发布</option><option value="published">已发布</option><option value="risk">有风险</option><option value="archived">已下架</option></select></label>
+        <label><span>类型</span><select value={kindFilter} onChange={event => setKindFilter(event.target.value)}><option value="all">全部类型</option><option value="code">代码型</option><option value="prompt">Prompt 型</option></select></label>
+        <b>{visibleAgents.length} / {agents.length}</b>
       </div>
 
       {loading ? (
@@ -123,7 +160,7 @@ export default function AgentsList({
         </div>
       ) : (
         <div className="connector-grid agents-grid">
-          {agents.map(agent => (
+          {visibleAgents.map(agent => (
             <div className="connector-card agent-card" key={agent.id}>
               <div className="connector-card-head">
                 <div className="connector-mark">{agent.name.slice(0, 1)}</div>
@@ -134,9 +171,9 @@ export default function AgentsList({
                   </strong>
                   <small>{agent.description || '暂无描述'}</small>
                 </div>
-                <span className={`provider-status ${agent.status === 'published' ? 'on' : agent.status === 'archived' ? 'archived' : 'off'}`}>
-                  {agent.status === 'published' ? '● ' : agent.status === 'archived' ? '◌ ' : '○ '}
-                  {statusLabel[agent.status] || agent.status}
+                <span className={`provider-status ${agent.workflow_stage === 'published' ? 'on' : agent.workflow_stage === 'archived' ? 'archived' : agent.workflow_stage === 'risk' ? 'risk' : 'off'}`}>
+                  {agent.workflow_stage === 'published' ? '● ' : agent.workflow_stage === 'archived' ? '◌ ' : '○ '}
+                  {stageLabel[agent.workflow_stage] || statusLabel[agent.status] || agent.status}
                 </span>
               </div>
 
@@ -147,6 +184,11 @@ export default function AgentsList({
                 <span>{agent.connector_count} 连接器</span>
                 <span>调用 {agent.call_count} 次</span>
                 <span>{timeAgo(agent.updated_at)}</span>
+              </div>
+
+              <div className={`agent-health-strip ${agent.health_status}`}>
+                <span><i />{healthLabel[agent.health_status] || '待验证'}</span>
+                <span>{agent.success_rate == null ? '暂无评测数据' : `最近通过率 ${Math.round(agent.success_rate * 100)}%`}</span>
               </div>
 
               <AgentFlowSteps
@@ -161,11 +203,12 @@ export default function AgentsList({
                 <span className="conn-account">{agent.model}</span>
                 <div>
                   <button onClick={() => setVersionsFor(agent)}>版本</button>
+                  <button onClick={() => setEvaluationFor(agent)}>效果评测</button>
                   <button onClick={() => setDeployConfigFor(agent)}>落地配置</button>
-                  <button onClick={() => setApiKeyFor(agent)}>API Key</button>
+                  <button onClick={() => setApiKeyFor(agent)} disabled={agent.status !== 'published'} title={agent.status === 'published' ? '管理 API Key' : '发布后可管理 API Key'}>API Key</button>
                   <button onClick={() => (agent.kind === 'code' ? onOpenCode(agent) : onOpenPrompt(agent))}>继续开发</button>
                   <button className="solid" onClick={() => onInvoke(agent)}>运行</button>
-                  {agent.status === 'draft' && (
+                  {(agent.status === 'draft' || agent.workflow_stage === 'publish') && (
                     <button className="solid" onClick={() => setPublishChecklistFor(agent)}>发布</button>
                   )}
                   {agent.status === 'published' && (
@@ -202,6 +245,14 @@ export default function AgentsList({
         />
       )}
 
+      {evaluationFor && (
+        <AgentEvaluationPanel
+          agent={evaluationFor}
+          onClose={() => setEvaluationFor(null)}
+          notice={notice}
+        />
+      )}
+
       {publishChecklistFor && (
         <PublishChecklistDialog
           agent={publishChecklistFor}
@@ -228,6 +279,21 @@ export default function AgentsList({
           }}
           notice={notice}
         />
+      )}
+
+      {createDialogOpen && (
+        <div className="dialog-backdrop" onMouseDown={() => setCreateDialogOpen(false)}>
+          <div className="dialog new-agent-dialog" onMouseDown={event => event.stopPropagation()}>
+            <div className="new-agent-dialog-head"><span>CREATE AGENT</span><h2>选择创建方式</h2><p>推荐使用会话式开发，平台会创建项目、测试和发布流程。</p></div>
+            <div className="new-agent-options">
+              <button className="recommended" type="button" onClick={() => { setCreateDialogOpen(false); onNewProject() }}><b>会话式开发</b><span>描述需求，持续修改同一个代码型 Agent</span><i>推荐</i></button>
+              <button type="button" onClick={newCodeAgent}><b>空白代码项目</b><span>从标准 Atlas Agent 框架开始</span></button>
+              <button type="button" onClick={() => { setCreateDialogOpen(false); setTemplateDialogOpen(true) }}><b>从模板创建</b><span>使用预置业务模板快速开始</span></button>
+              <button type="button" onClick={newPromptAgent}><b>Prompt Agent</b><span>适合无需项目代码的轻量助手</span></button>
+            </div>
+            <div><button type="button" onClick={() => setCreateDialogOpen(false)}>取消</button></div>
+          </div>
+        </div>
       )}
     </section>
   )

@@ -197,7 +197,16 @@ export default function AgentDeployConfig({
                   onChange={e => update('api_access', e.target.checked)}
                 />
                 允许外部 API 调用
-                <small>占位，需要 API Key 功能完成后生效</small>
+                <small>发布后可创建、停用和限制 API Key</small>
+              </label>
+              <label className="deploy-toggle-line">
+                <input
+                  type="checkbox"
+                  checked={config.high_risk_approved}
+                  onChange={e => update('high_risk_approved', e.target.checked)}
+                />
+                管理员批准高风险连接器
+                <small>仅工作空间所有者可以保存该批准</small>
               </label>
             </section>
 
@@ -209,15 +218,16 @@ export default function AgentDeployConfig({
               <h4>调用日志<small>最近 200 条</small></h4>
               <table className="deploy-log-table">
                 <thead>
-                  <tr><th>时间</th><th>来源</th><th>状态</th><th>耗时</th><th>错误</th></tr>
+                  <tr><th>时间</th><th>来源 / 路径</th><th>状态码</th><th>耗时</th><th>Token</th><th>错误</th></tr>
                 </thead>
                 <tbody>
                   {logs.map(entry => (
                     <tr key={entry.id}>
                       <td>{new Date(entry.time).toLocaleString()}</td>
-                      <td>{entry.source}</td>
-                      <td>{entry.status}</td>
+                      <td>{entry.source}<small>{entry.request_path}</small></td>
+                      <td>{entry.status_code ?? entry.status}</td>
                       <td>{entry.latency_ms != null ? `${entry.latency_ms}ms` : '—'}</td>
+                      <td>{entry.token_usage ?? '—'}</td>
                       <td>{entry.error || '—'}</td>
                     </tr>
                   ))}

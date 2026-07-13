@@ -1,0 +1,6 @@
+30.207.101.17
+mkdir -p ~/atlas
+tar -xzf ~/atlas-deploy-20260713.tar.gz -C ~/atlas
+cd ~/atlas
+chmod +x deploy-linux.sh
+./deploy-linux.sh

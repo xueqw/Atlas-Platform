@@ -102,6 +102,18 @@ def test_code_agent_generate_creates_initial_version(auth_client):
     r = auth_client.post("/api/apps/generate", json={"message": "帮我做一个客服助手", "project_name": ""})
     assert r.status_code == 200, r.text
     draft_id = r.json()["draft"]["id"]
+    assert set(r.json()["files"]) >= {
+        "manifest.json",
+        "main.py",
+        "agent.py",
+        "runtime.py",
+        "skills.py",
+        "knowledge.py",
+        "connectors.py",
+        "SKILL.md",
+        "tests.json",
+        "README.md",
+    }
 
     versions = auth_client.get(f"/api/agents/{draft_id}/versions").json()
     assert len(versions) == 1
@@ -111,6 +123,16 @@ def test_code_agent_generate_creates_initial_version(auth_client):
     listing = auth_client.get("/api/agents").json()
     entry = next(a for a in listing if a["id"] == draft_id)
     assert entry["kind"] == "code"
+
+    file_paths = {f["path"] for f in auth_client.get(f"/api/apps/drafts/{draft_id}/files").json() if f["type"] == "file"}
+    assert {"agent.py", "runtime.py", "skills.py", "knowledge.py", "connectors.py"}.issubset(file_paths)
+
+    main_content = auth_client.get(f"/api/apps/drafts/{draft_id}/files/content", params={"path": "main.py"}).json()["content"]
+    agent_content = auth_client.get(f"/api/apps/drafts/{draft_id}/files/content", params={"path": "agent.py"}).json()["content"]
+    manifest = auth_client.get(f"/api/apps/drafts/{draft_id}/files/content", params={"path": "manifest.json"}).json()["content"]
+    assert "from agent import AtlasAgent" in main_content
+    assert "class AtlasAgent" in agent_content
+    assert '"framework": "atlas-agent-python"' in manifest
 
 
 def test_code_agent_diff_and_rollback_restores_files(auth_client):
@@ -146,6 +168,100 @@ def test_code_agent_publish_pins_version(auth_client):
     entry = next(a for a in listing if a["id"] == draft_id)
     assert entry["status"] == "published"
     assert entry["published_version_no"] == r.json()["version_no"]
+    detail = auth_client.get(f"/api/agents/{draft_id}/versions/{r.json()['id']}").json()
+    assert detail["snapshot"]["evaluation"]["kind"] == "evaluate"
+    assert detail["snapshot"]["deploy_config"]["visibility"] == "workspace"
+
+
+def test_refine_updates_same_project_and_persists_builder_history(auth_client, monkeypatch):
+    from app import apps as apps_module
+
+    async def no_model(*_args, **_kwargs):
+        return ""
+
+    monkeypatch.setattr(apps_module, "complete", no_model)
+    created = auth_client.post("/api/apps/generate", json={"message": "做一个客服助手", "project_name": ""}).json()
+    draft_id = created["draft"]["id"]
+
+    r = auth_client.post(f"/api/apps/drafts/{draft_id}/refine", json={"message": "增加升级人工客服的规则"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["draft"]["id"] == draft_id
+    assert body["version_no"] == 2
+    assert "manifest.json" in body["changed_files"]
+    assert "requirements.md" in body["changed_files"]
+
+    state = auth_client.get(f"/api/apps/drafts/{draft_id}/product-state").json()
+    assert state["agent"]["version_no"] == 2
+    assert [item["role"] for item in state["builder_messages"]][-2:] == ["user", "assistant"]
+    assert "升级人工客服" in state["builder_messages"][-2]["content"]
+
+
+def test_web_request_generates_html_preview(auth_client):
+    created = auth_client.post("/api/apps/generate", json={"message": "做一个带网页界面的报销助手", "project_name": ""}).json()
+    draft_id = created["draft"]["id"]
+    assert "preview.html" in created["files"]
+    preview = auth_client.get(f"/api/apps/drafts/{draft_id}/preview").json()
+    assert preview["exists"] is True
+    assert "<!doctype html>" in preview["html"].lower()
+
+
+def test_publish_auto_saves_dirty_code_workspace(auth_client):
+    draft_id = auth_client.post("/api/apps/generate", json={"message": "做一个流程助手", "project_name": ""}).json()["draft"]["id"]
+    _satisfy_publish_checklist(auth_client, draft_id, kind="code")
+    edited = "def main(input_text):\n    return 'LATEST-WORKSPACE: ' + input_text\n"
+    auth_client.put(f"/api/apps/drafts/{draft_id}/files/content", json={"path": "main.py", "content": edited})
+
+    published = auth_client.post(f"/api/agents/{draft_id}/publish")
+    assert published.status_code == 200, published.text
+    assert published.json()["version_no"] == 3
+    detail = auth_client.get(f"/api/agents/{draft_id}/versions/{published.json()['id']}").json()
+    assert detail["snapshot"]["files"]["main.py"] == edited
+
+
+def test_api_invocation_uses_published_code_snapshot(auth_client, monkeypatch):
+    from app import apps as apps_module
+
+    monkeypatch.setattr(apps_module, "resolve_provider", lambda model: ("", "", model or "qwen-turbo"))
+    created = auth_client.post("/api/apps/generate", json={"message": "做一个知识库问答助手", "project_name": ""}).json()
+    draft_id = created["draft"]["id"]
+    _satisfy_publish_checklist(auth_client, draft_id, kind="code")
+    auth_client.put(f"/api/agents/{draft_id}/deploy-config", json={
+        "visibility": "workspace", "shared_user_ids": [], "allowed_knowledge_base_ids": [],
+        "allowed_skill_ids": [], "allowed_connectors": [], "write_confirm": True,
+        "api_access": True, "call_log_enabled": True,
+    })
+    published = auth_client.post(f"/api/agents/{draft_id}/publish").json()
+    key = auth_client.post(f"/api/agents/{draft_id}/api-key").json()["key"]
+
+    auth_client.put(f"/api/apps/drafts/{draft_id}/files/content", json={
+        "path": "main.py",
+        "content": "def main(input_text):\n    return 'DRAFT-MUTATION'\n",
+    })
+    response = auth_client.post(
+        f"/api/agents/{draft_id}/invoke",
+        json={"input": "hello"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 200, response.text
+    assert "DRAFT-MUTATION" not in response.json()["output"]
+    assert response.json()["version_no"] == published["version_no"]
+
+    listing = auth_client.get("/api/agents").json()
+    changed = next(item for item in listing if item["id"] == draft_id)
+    assert changed["has_unpublished_changes"] is True
+    assert changed["workflow_stage"] == "publish"
+
+    republished = auth_client.post(f"/api/agents/{draft_id}/publish")
+    assert republished.status_code == 200, republished.text
+    response_after_publish = auth_client.post(
+        f"/api/agents/{draft_id}/invoke",
+        json={"input": "hello"},
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response_after_publish.status_code == 200, response_after_publish.text
+    assert response_after_publish.json()["output"] == "DRAFT-MUTATION"
+    assert response_after_publish.json()["version_no"] == republished.json()["version_no"]
 
 
 def test_cross_workspace_draft_access_blocked(client):

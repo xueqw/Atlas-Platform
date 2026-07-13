@@ -15,14 +15,15 @@ from .auth import current_user, current_workspace_id
 from .config import settings
 from .database import SessionLocal, ensure_schema, get_db
 from .knowledge import extract_pages, search_chunks, split_pages
-from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
+from .model_gateway import configure_provider, embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
 from .connectors import feishu, github_mcp, remote_mcp
 from . import tools as agent_tools
-from .apps import agents_router, create_version, next_version_no, snapshot_prompt_agent, router as apps_router
+from .apps import agents_router, create_version, execute_agent_runtime, next_version_no, snapshot_prompt_agent, router as apps_router
 from .api_invoke import invoke_router
+from .evaluation import router as evaluation_router
 from .deploy_policy import apply_resource_permissions, check_visibility, parse_deploy_config
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Membership, Message, Skill, User, WorkflowRun
-from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut, WorkspaceMemberOut
+from .schemas import AccountOut, AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, LoginRequest, McpKeyRequest, MeOut, ModelProviderConfigRequest, ModelTestRequest, SkillCreate, SkillOut, SkillUpdate, WorkflowRunOut, WorkspaceMemberOut
 
 app = FastAPI(title="Atlas Agent Platform API", version="0.3.0")
 cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
@@ -30,6 +31,7 @@ app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials
 app.include_router(apps_router)
 app.include_router(agents_router)
 app.include_router(invoke_router)
+app.include_router(evaluation_router)
 
 @app.on_event("startup")
 def startup():
@@ -127,6 +129,14 @@ def get_models(user: User = Depends(current_user)):
 @app.post("/api/models/test")
 async def post_model_test(payload: ModelTestRequest, user: User = Depends(current_user)):
     return await test_model(payload.model)
+
+
+@app.post("/api/models/config")
+def post_model_config(payload: ModelProviderConfigRequest, user: User = Depends(current_user)):
+    try:
+        return configure_provider(payload.provider_id, payload.api_key, payload.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _agent_out(agent: Agent, db: Session) -> AgentOut:
@@ -487,6 +497,57 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     if not conversation.messages:
         conversation.title = payload.content[:28]
     db.add(user_message); db.commit()
+    if agent:
+        async def selected_agent_events():
+            with SessionLocal() as runtime_db:
+                runtime_agent = runtime_db.get(Agent, agent.id)
+                if not runtime_agent:
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Agent 不存在'}, ensure_ascii=False)}\n\n"
+                    return
+                result = await execute_agent_runtime(
+                    runtime_agent,
+                    payload.content,
+                    runtime_db,
+                    use_published=runtime_agent.status == "published",
+                    source="chat",
+                    conversation_id=conversation_id,
+                    user_id=user.id,
+                )
+            answer = result.get("answer") or result.get("error") or "Agent 未返回内容"
+            plan = {
+                "goal": payload.content,
+                "source": "agent_runtime",
+                "requires_knowledge": bool(result.get("sources")),
+                "requires_tools": bool(result.get("tool_calls")),
+                "steps": [
+                    {"id": str(index), "type": item.get("type", "respond"), "title": item.get("title", "执行步骤"), "executor": item.get("executor", "runtime")}
+                    for index, item in enumerate(result.get("trace") or [])
+                ],
+            }
+            yield f"data: {json.dumps({'type': 'run_started', 'run_id': result.get('run_id')}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'plan_created', 'plan': plan}, ensure_ascii=False)}\n\n"
+            if result.get("sources"):
+                yield f"data: {json.dumps({'type': 'sources', 'sources': result['sources']}, ensure_ascii=False)}\n\n"
+            pending = result.get("requires_confirmation")
+            if pending:
+                try:
+                    args = json.loads(pending.get("arguments") or "{}") if isinstance(pending.get("arguments"), str) else pending.get("arguments") or {}
+                except json.JSONDecodeError:
+                    args = {}
+                _pending_actions[conversation_id] = {
+                    "name": pending.get("tool"),
+                    "args": args,
+                    "run_id": result.get("run_id"),
+                    "access": "write",
+                    "provider": pending.get("provider"),
+                    "source_text": payload.content,
+                }
+            save_assistant(answer, json.dumps(result.get("sources") or [], ensure_ascii=False))
+            for ch in answer:
+                yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(selected_agent_events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     # 基础对话历史（不含知识库上下文）——是否检索交给 Strategy Agent 决定，命中后再注入
     base_history = [{"role": message.role, "content": message.content} for message in conversation.messages]
     if agent:

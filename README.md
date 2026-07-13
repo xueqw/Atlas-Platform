@@ -27,11 +27,27 @@
 - **GitHub**（官方远程 MCP Server）：动态接入 40+ 工具，平台即 MCP 客户端
 - 对话框底部可勾选启用哪些连接器
 
+### Agent 应用开发
+- 统一新建入口：会话式开发、空白代码项目、业务模板和 Prompt Agent
+- 持续 Coding Agent 会话：后续消息修改同一个项目并生成新版本
+- 开发、测试、评测、落地配置、发布五阶段流程，状态服务端持久化
+- Skills、知识库、连接器和模型绑定，运行时返回来源、步骤和工具调用
+- HTML 页面自动预览，代码、日志和运行对话在同一开发工作区
+- 发布自动保存当前工作区，线上固定运行不可变发布版本
+- API Key、额度、来源限制、调用日志、版本对比与回滚
+- 高风险写连接器需要工作空间所有者批准
+
 ## 一键启动
 
 ```powershell
 cd E:/codex/ai-agent-platform-demo
-./start-dev.ps1
+.\start-dev.cmd
+```
+
+代码或后端配置更新后强制重启：
+
+```powershell
+.\start-dev.cmd -Restart
 ```
 
 - React 工作台：<http://localhost:5173>

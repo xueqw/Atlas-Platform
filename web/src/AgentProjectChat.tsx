@@ -1,62 +1,78 @@
-﻿import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  configureModelProvider,
   evaluateDraftApp,
   generateAgentApp,
   getDraftFile,
-  listDraftFiles,
+  getDraftPreview,
+  getDraftProductState,
   listConnectors,
+  listDraftFiles,
+  listModels,
   listSkills,
+  listWorkspaceMembers,
+  publishAgent,
+  refineAgentApp,
   runDraftApp,
   saveDraftFile,
+  updateDeployConfig,
   validateDraftManifest,
   type AppDraft,
   type AppFile,
+  type BuilderMessage,
+  type DraftProductState,
   type EvaluationCase,
   type EvaluationResult,
   type ManifestValidation,
-  type GeneratedAgentApp
+  type RunPreviewResult,
 } from './api'
-import type { Connector, KnowledgeBase, Skill } from './types'
+import type { Connector, DeployConfig, KnowledgeBase, ModelCatalog, ModelProvider, Skill, WorkspaceMember } from './types'
+import './product-builder.css'
 
-type ChatMessage = {
-  id: string
-  role: 'assistant' | 'user'
-  content: string
-  status?: 'thinking' | 'done'
-  kind?: 'text' | 'build' | 'result' | 'error'
-  result?: GeneratedAgentApp
-  retryInput?: string
-}
+type FlowPage = 'develop' | 'test' | 'evaluate' | 'deploy' | 'publish'
+type RightView = 'run' | 'preview' | 'code' | 'logs'
+type UiMessage = BuilderMessage & { kind?: 'message' | 'error' | 'config' }
 
-type BuildStep = {
-  title: string
-  desc: string
-}
-
-type FlowPage = 'chat' | 'resources' | 'test' | 'review' | 'publish'
-
-const starters = [
-  '做一个企业知识库问答助手，能回答制度和流程问题',
-  '做一个客服助手，能根据知识库回答售后问题并生成工单摘要',
-  '做一个销售线索助手，能总结客户信息并生成跟进计划',
-  '做一个流程办理助手，能引导员工完成报销、入职和审批'
+const starterPrompts = [
+  '做一个企业知识库问答助手，回答制度问题并展示引用来源',
+  '做一个客服助手，根据售后知识库回答问题并生成工单摘要',
+  '做一个销售线索助手，总结客户信息并生成下一步跟进计划',
 ]
 
-const buildSteps: BuildStep[] = [
-  { title: '理解场景', desc: '识别业务目标、用户角色和投放边界' },
-  { title: '设计 Agent', desc: '生成名称、提示词、能力范围和连接器' },
-  { title: '编写文件', desc: '自动创建 manifest、主程序、Skill 和测试用例' },
-  { title: '可运行草稿', desc: '在右侧预览运行，在左侧高级编辑' }
-]
+const emptyDeployConfig: DeployConfig = {
+  visibility: 'workspace',
+  shared_user_ids: [],
+  allowed_knowledge_base_ids: [],
+  allowed_skill_ids: [],
+  allowed_connectors: [],
+  write_confirm: true,
+  api_access: false,
+  call_log_enabled: true,
+  high_risk_approved: false,
+}
 
-const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
+const visibilityLabels: Record<DeployConfig['visibility'], string> = {
+  private: '仅自己',
+  shared: '指定成员',
+  workspace: '工作空间',
+  marketplace: '组织应用市场',
+}
+
+function uid() {
+  return crypto.randomUUID()
+}
+
+function metricText(value: number | null | undefined, percent = true) {
+  if (value == null) return '待配置'
+  return percent ? `${Math.round(value * 100)}%` : `${Math.round(value)} ms`
+}
 
 export default function AgentProjectChat({
   onGoToAgentsList,
   knowledgeBases,
   notice,
   initialMessage,
-  initialDraft
+  initialDraft,
 }: {
   onGoToAgentsList: () => void
   knowledgeBases: KnowledgeBase[]
@@ -64,52 +80,70 @@ export default function AgentProjectChat({
   initialMessage?: { text: string; nonce: number } | null
   initialDraft?: AppDraft | null
 }) {
-  const [projectName, setProjectName] = useState('Atlas 企业助手项目')
+  const [activeDraft, setActiveDraft] = useState<AppDraft | null>(initialDraft || null)
+  const [productState, setProductState] = useState<DraftProductState | null>(null)
+  const [projectName, setProjectName] = useState(initialDraft?.name || '新 Agent 项目')
+  const [flowPage, setFlowPage] = useState<FlowPage>('develop')
+  const [rightView, setRightView] = useState<RightView>('run')
+  const [messages, setMessages] = useState<UiMessage[]>([
+    {
+      id: uid(), role: 'assistant', created_at: new Date().toISOString(),
+      content: '描述你要解决的业务问题。我会创建完整 Agent 项目；之后继续对话会修改同一个项目并生成新版本。',
+    },
+  ])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [activeStep, setActiveStep] = useState(0)
-  const [generated, setGenerated] = useState<GeneratedAgentApp | null>(null)
-  const [activeDraft, setActiveDraft] = useState<AppDraft | null>(initialDraft || null)
-  const [editorOpen, setEditorOpen] = useState(false)
-  const [fileTree, setFileTree] = useState<AppFile[]>([])
-  const [selectedFile, setSelectedFile] = useState('')
-  const [fileContent, setFileContent] = useState('')
-  const [savingFile, setSavingFile] = useState(false)
-  const [runInput, setRunInput] = useState('Atlas')
-  const [runLogs, setRunLogs] = useState('等待运行。右侧会显示 Agent 回复、步骤状态和沙箱日志。')
-  const [runBusy, setRunBusy] = useState(false)
-  const [flowPage, setFlowPage] = useState<FlowPage>('chat')
   const [skills, setSkills] = useState<Skill[]>([])
   const [connectors, setConnectors] = useState<Connector[]>([])
+  const [models, setModels] = useState<ModelCatalog | null>(null)
+  const [members, setMembers] = useState<WorkspaceMember[]>([])
   const [selectedKnowledge, setSelectedKnowledge] = useState<string[]>([])
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
   const [selectedConnectors, setSelectedConnectors] = useState<string[]>([])
+  const [selectedModel, setSelectedModel] = useState('qwen-turbo')
   const [savingResources, setSavingResources] = useState(false)
-  const [validation, setValidation] = useState<ManifestValidation | null>(null)
-  const [evaluating, setEvaluating] = useState(false)
-  const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null)
-  const [published, setPublished] = useState(false)
+  const [files, setFiles] = useState<AppFile[]>([])
+  const [selectedFile, setSelectedFile] = useState('')
+  const [fileContent, setFileContent] = useState('')
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [savingFile, setSavingFile] = useState(false)
+  const [previewHtml, setPreviewHtml] = useState('')
+  const [runInput, setRunInput] = useState('请介绍你的能力，并说明当前可以使用哪些资源。')
+  const [runBusy, setRunBusy] = useState(false)
+  const [runResult, setRunResult] = useState<RunPreviewResult | null>(null)
   const [testCases, setTestCases] = useState<EvaluationCase[]>([
-    { name: '基础任务', input: 'Atlas', expected: 'Atlas' }
+    { name: '基础任务', input: '请介绍你的能力', expected: '' },
   ])
+  const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null)
+  const [evaluating, setEvaluating] = useState(false)
+  const [validation, setValidation] = useState<ManifestValidation | null>(null)
+  const [deployConfig, setDeployConfig] = useState<DeployConfig>(emptyDeployConfig)
+  const [savingDeploy, setSavingDeploy] = useState(false)
+  const [publishing, setPublishing] = useState(false)
+  const [configProvider, setConfigProvider] = useState<ModelProvider | null>(null)
+  const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [baseUrlDraft, setBaseUrlDraft] = useState('')
+  const [configBusy, setConfigBusy] = useState(false)
+  const [pendingRun, setPendingRun] = useState('')
   const messagesRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: crypto.randomUUID(),
-      role: 'assistant',
-      kind: 'build',
-      content:
-        '把你想做的 Agent 用一句话告诉我就行。我会自动拆需求、生成应用草稿、创建技能文件和测试样例，不需要你手动配表单。'
-    }
-  ])
+
+  const projectSummary = useMemo(() => ({
+    name: activeDraft?.name || projectName,
+    version: productState?.agent.version_no || 0,
+    publishedVersion: productState?.agent.published_version_no,
+    dirty: productState?.draft_dirty || false,
+  }), [activeDraft, projectName, productState])
 
   useEffect(() => {
-    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' })
-  }, [messages, activeStep])
-
-  useEffect(() => {
-    void loadResources()
+    void Promise.all([listSkills(), listConnectors(), listModels(), listWorkspaceMembers()])
+      .then(([skillItems, connectorItems, catalog, memberItems]) => {
+        setSkills(skillItems)
+        setConnectors(connectorItems)
+        setModels(catalog)
+        setMembers(memberItems)
+      })
+      .catch(() => notice('资源目录加载失败'))
   }, [])
 
   useEffect(() => {
@@ -117,744 +151,526 @@ export default function AgentProjectChat({
   }, [initialMessage?.nonce])
 
   useEffect(() => {
-    if (initialDraft?.id) {
-      setActiveDraft(initialDraft)
-      setGenerated(null)
-      setProjectName(initialDraft.name || 'Agent 草稿')
-      setEditorOpen(true)
-      void loadDraftFiles(initialDraft)
-    }
+    if (initialDraft?.id) void openProject(initialDraft)
   }, [initialDraft?.id])
 
-  const projectSummary = useMemo(() => {
-    if (!generated) {
-      return {
-        name: projectName,
-        agentCount: 0,
-        files: [] as string[],
-        skills: [] as string[],
-        connectors: [] as string[]
-      }
-    }
+  useEffect(() => {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' })
+  }, [messages, busy])
 
-    return {
-      name: generated.draft.name,
-      agentCount: 1,
-      files: generated.files,
-      skills: generated.blueprint.skills,
-      connectors: generated.blueprint.connectors
-    }
-  }, [generated, projectName])
-
-  const flowSteps: Array<{ key: FlowPage; title: string; desc: string }> = [
-    { key: 'chat', title: '1 会话生成', desc: generated || activeDraft ? '草稿已建立' : '描述需求' },
-    { key: 'resources', title: '2 资源配置', desc: `${selectedSkills.length} Skills / ${selectedKnowledge.length} 知识库` },
-    { key: 'test', title: '3 测试运行', desc: evaluation ? `${evaluation.passed}/${evaluation.total} 通过` : '运行样例' },
-    { key: 'review', title: '4 发布检查', desc: validation?.ok ? '校验通过' : '等待校验' },
-    { key: 'publish', title: '5 发布', desc: published ? '已完成' : '确认上线' }
-  ]
-
-  async function loadResources() {
-    try {
-      const [skillItems, connectorItems] = await Promise.all([
-        listSkills(),
-        listConnectors()
-      ])
-      setSkills(skillItems)
-      setConnectors(connectorItems)
-    } catch (error) {
-      notice('资源列表加载失败')
-    }
+  function appendMessage(role: UiMessage['role'], content: string, extra: Partial<UiMessage> = {}) {
+    setMessages(old => [...old, { id: uid(), role, content, created_at: new Date().toISOString(), ...extra }])
   }
 
-  function toggleSelected(value: string, setter: (updater: (old: string[]) => string[]) => void) {
-    setter(old => old.includes(value) ? old.filter(item => item !== value) : [...old, value])
-  }
-
-  function parseManifest(text: string) {
+  function parseManifest(content: string) {
     try {
-      return JSON.parse(text || '{}') as Record<string, unknown>
+      return JSON.parse(content || '{}') as Record<string, unknown>
     } catch {
       return {}
     }
   }
 
-  function hydrateResourceConfig(manifest: Record<string, unknown>) {
-    const knowledge = Array.isArray(manifest.knowledge_bases) ? manifest.knowledge_bases.filter((item): item is string => typeof item === 'string') : []
-    const skillList = Array.isArray(manifest.skills) ? manifest.skills.filter((item): item is string => typeof item === 'string') : []
-    const connectorList = Array.isArray(manifest.connectors) ? manifest.connectors.filter((item): item is string => typeof item === 'string') : []
-    setSelectedKnowledge(knowledge)
-    setSelectedSkills(skillList)
-    setSelectedConnectors(connectorList)
+  function hydrateManifest(manifest: Record<string, unknown>) {
+    setSelectedKnowledge(Array.isArray(manifest.knowledge_bases) ? manifest.knowledge_bases.filter((item): item is string => typeof item === 'string') : [])
+    setSelectedSkills(Array.isArray(manifest.skills) ? manifest.skills.filter((item): item is string => typeof item === 'string') : [])
+    setSelectedConnectors(Array.isArray(manifest.connectors) ? manifest.connectors.filter((item): item is string => typeof item === 'string') : [])
+    if (typeof manifest.model === 'string') setSelectedModel(manifest.model)
   }
 
-  async function readManifestText() {
-    if (!activeDraft?.id) return '{}'
-    if (selectedFile === 'manifest.json') return fileContent || '{}'
-    try {
-      const result = await getDraftFile(activeDraft.id, 'manifest.json')
-      return result.content || '{}'
-    } catch {
-      return '{}'
-    }
+  async function loadFiles(draftId: string) {
+    const tree = await listDraftFiles(draftId)
+    setFiles(tree)
+    const manifestFile = await getDraftFile(draftId, 'manifest.json')
+    hydrateManifest(parseManifest(manifestFile.content))
+    const nextPath = selectedFile && tree.some(item => item.path === selectedFile)
+      ? selectedFile
+      : tree.find(item => item.path === 'manifest.json')?.path || tree[0]?.path || ''
+    if (nextPath) await openFile(draftId, nextPath)
   }
 
-  async function saveResourceConfig() {
-    if (!activeDraft?.id) {
-      notice('请先生成 Agent 草稿')
-      return
+  async function loadPreview(draftId: string) {
+    const preview = await getDraftPreview(draftId)
+    setPreviewHtml(preview.html)
+  }
+
+  async function refreshState(draftId: string, restoreMessages = false) {
+    const state = await getDraftProductState(draftId)
+    setProductState(state)
+    setDeployConfig(state.deploy_config)
+    if (state.latest_evaluation) {
+      setEvaluation({
+        ok: state.latest_evaluation.ok,
+        passed: state.latest_evaluation.passed,
+        total: state.latest_evaluation.total,
+        pass_rate: state.latest_evaluation.pass_rate,
+        results: state.latest_evaluation.results,
+        summary: state.latest_evaluation.summary,
+      })
     }
-    setSavingResources(true)
+    if (restoreMessages && state.builder_messages.length) {
+      setMessages(state.builder_messages.map(item => ({ ...item, kind: 'message' })))
+    }
+    return state
+  }
+
+  async function openProject(draft: AppDraft) {
+    setActiveDraft(draft)
+    setProjectName(draft.name)
+    setEditorOpen(true)
     try {
-      const manifest = parseManifest(await readManifestText())
-      const next = {
-        ...manifest,
-        knowledge_bases: selectedKnowledge,
-        skills: selectedSkills,
-        connectors: selectedConnectors
-      }
-      const content = JSON.stringify(next, null, 2)
-      await saveDraftFile(activeDraft.id, 'manifest.json', content)
-      if (selectedFile === 'manifest.json') setFileContent(content)
-      const result = await validateDraftManifest(activeDraft.id)
-      setValidation(result)
-      notice('资源配置已写入 manifest')
+      await Promise.all([loadFiles(draft.id), loadPreview(draft.id), refreshState(draft.id, true)])
     } catch (error) {
-      notice('资源配置保存失败')
-    } finally {
-      setSavingResources(false)
+      notice(error instanceof Error ? error.message : '项目加载失败')
     }
   }
 
-  async function runEvaluationFlow() {
-    if (!activeDraft?.id) {
-      notice('请先生成 Agent 草稿')
-      return
-    }
-    setEvaluating(true)
-    try {
-      await saveResourceConfig()
-      const result = await evaluateDraftApp(activeDraft.id, testCases)
-      setEvaluation(result)
-      notice(`测试完成：${result.passed}/${result.total}`)
-      setFlowPage('review')
-    } catch (error) {
-      notice('测试失败，请查看运行日志')
-    } finally {
-      setEvaluating(false)
-    }
-  }
-
-  async function runPublishCheck() {
-    if (!activeDraft?.id) {
-      notice('请先生成 Agent 草稿')
-      return
-    }
-    try {
-      await saveResourceConfig()
-      const result = await validateDraftManifest(activeDraft.id)
-      setValidation(result)
-      notice(result.ok ? '发布检查通过' : '发布检查发现阻断项')
-    } catch {
-      notice('发布检查失败')
-    }
-  }
-
-  function updateTestCase(index: number, patch: Partial<EvaluationCase>) {
-    setTestCases(old => old.map((item, i) => i === index ? { ...item, ...patch } : item))
-  }
-
-  async function loadDraftFiles(draft: AppDraft) {
-    try {
-      const tree = await listDraftFiles(draft.id)
-      setFileTree(tree)
-      const firstPath = tree.find(item => item.path === 'manifest.json')?.path || tree[0]?.path || ''
-      if (firstPath) await openDraftFile(draft.id, firstPath)
-      try {
-        const manifest = await getDraftFile(draft.id, 'manifest.json')
-        hydrateResourceConfig(parseManifest(manifest.content))
-      } catch {}
-      notice(`已打开 ${draft.name} 的高级编辑`)
-    } catch (error) {
-      notice('读取草稿文件失败')
-    }
-  }
-
-  async function openDraftFile(draftId: string, path: string) {
-    setSelectedFile(path)
+  async function openFile(draftId: string, path: string) {
     try {
       const result = await getDraftFile(draftId, path)
+      setSelectedFile(path)
       setFileContent(result.content)
-      if (path === 'manifest.json') hydrateResourceConfig(parseManifest(result.content))
-    } catch (error) {
-      setFileContent('')
-      notice('读取文件失败')
+      if (path === 'manifest.json') hydrateManifest(parseManifest(result.content))
+    } catch {
+      notice('文件读取失败')
     }
   }
 
   async function saveCurrentFile() {
-    if (!activeDraft?.id || !selectedFile) return
+    if (!activeDraft || !selectedFile) return
     setSavingFile(true)
     try {
       await saveDraftFile(activeDraft.id, selectedFile, fileContent)
-      notice(`已保存 ${selectedFile}`)
+      if (selectedFile === 'manifest.json') hydrateManifest(parseManifest(fileContent))
+      await Promise.all([refreshState(activeDraft.id), loadPreview(activeDraft.id)])
+      notice(`${selectedFile} 已保存`)
     } catch (error) {
-      notice('保存失败')
+      notice(error instanceof Error ? error.message : '文件保存失败')
     } finally {
       setSavingFile(false)
     }
   }
 
-  async function runActiveDraft() {
-    const text = runInput.trim()
-    if (!text || runBusy) return
-    setRunBusy(true)
-    setRunLogs('正在启动 Agent 运行：校验 manifest -> 组装上下文 -> 执行沙箱。')
-    try {
-      if (activeDraft?.id && selectedFile) await saveCurrentFile()
-      if (activeDraft?.id) {
-        const result = await runDraftApp(activeDraft.id, text)
-        setRunLogs(result.logs || '运行结束，但没有返回日志。')
-        notice(result.ok ? 'Agent 运行完成' : 'Agent 运行失败')
-      } else {
-        setRunLogs(`Mock run\n> input: ${text}\nAgent 已收到任务，生成草稿后即可接入真实运行。`)
-      }
-    } catch (error) {
-      setRunLogs(error instanceof Error ? error.message : '运行失败')
-      notice('Agent 运行失败')
-    } finally {
-      setRunBusy(false)
-    }
+  async function readManifest() {
+    if (!activeDraft) return {}
+    if (selectedFile === 'manifest.json') return parseManifest(fileContent)
+    return parseManifest((await getDraftFile(activeDraft.id, 'manifest.json')).content)
   }
 
-  function appendAssistant(content: string, kind: ChatMessage['kind'] = 'build') {
-    setMessages(old => [
-      ...old,
-      {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content,
-        kind
+  async function saveResourceConfig(showNotice = true) {
+    if (!activeDraft) {
+      if (showNotice) notice('请先创建 Agent 项目')
+      return null
+    }
+    setSavingResources(true)
+    try {
+      const manifest = await readManifest()
+      const next = {
+        ...manifest,
+        model: selectedModel,
+        knowledge_bases: selectedKnowledge,
+        skills: selectedSkills,
+        connectors: selectedConnectors,
       }
-    ])
+      const content = JSON.stringify(next, null, 2)
+      await saveDraftFile(activeDraft.id, 'manifest.json', content)
+      if (selectedFile === 'manifest.json') setFileContent(content)
+      const check = await validateDraftManifest(activeDraft.id)
+      setValidation(check)
+      await refreshState(activeDraft.id)
+      if (showNotice) notice('运行资源已保存')
+      return check
+    } catch (error) {
+      if (showNotice) notice(error instanceof Error ? error.message : '资源保存失败')
+      return null
+    } finally {
+      setSavingResources(false)
+    }
   }
 
   async function submit(event?: FormEvent) {
     event?.preventDefault()
     const content = input.trim()
     if (!content || busy) return
-
-    setMessages(old => [
-      ...old,
-      {
-        id: crypto.randomUUID(),
-        role: 'user',
-        content
-      }
-    ])
     setInput('')
+    appendMessage('user', content)
     setBusy(true)
-    setGenerated(null)
-    setActiveStep(0)
-
     try {
-      appendAssistant('收到，我先把这句话转成可投放的 Agent 需求：明确服务对象、触发场景、输出结果和安全边界。')
-      await sleep(420)
-      setActiveStep(1)
-      appendAssistant('正在设计 Agent 结构：名称、系统提示词、核心 Skill、连接器和需要生成的文件会一起准备好。')
-      await sleep(520)
-      setActiveStep(2)
-      appendAssistant('开始自动创建项目文件：manifest.json、main.py、SKILL.md、tests.json。你不用手写初始代码。')
-
-      const result = await generateAgentApp(content, '')
-      setGenerated(result)
-      setActiveDraft(result.draft)
-      setRunInput(result.blueprint.sample_input || content)
-      setTestCases([{ name: '生成样例', input: result.blueprint.sample_input || content, expected: result.blueprint.domain || result.draft.name }])
-      setProjectName(result.draft.name)
-      setActiveStep(3)
+      if (activeDraft) {
+        const result = await refineAgentApp(activeDraft.id, content)
+        setActiveDraft(result.draft)
+        setProjectName(result.draft.name)
+        appendMessage('assistant', result.reply, { changed_files: result.changed_files, version_no: result.version_no })
+        await Promise.all([loadFiles(activeDraft.id), loadPreview(activeDraft.id), refreshState(activeDraft.id)])
+      } else {
+        const result = await generateAgentApp(content, '')
+        setActiveDraft(result.draft)
+        setProjectName(result.draft.name)
+        setRunInput(result.blueprint.sample_input || content)
+        setTestCases([{ name: '生成样例', input: result.blueprint.sample_input || content, expected: '' }])
+        await Promise.all([loadFiles(result.draft.id), loadPreview(result.draft.id), refreshState(result.draft.id, true)])
+      }
       setEditorOpen(true)
-      setFlowPage('resources')
-      void loadDraftFiles(result.draft)
-      setMessages(old => [
-        ...old,
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          kind: 'result',
-          content: result.reply,
-          result
-        }
-      ])
-      notice('Agent 草稿已自动生成')
+      notice(activeDraft ? 'Agent 已更新并生成新版本' : 'Agent 项目已创建')
     } catch (error) {
-      setMessages(old => [
-        ...old,
-        {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          kind: 'error',
-          content: error instanceof Error ? error.message : '生成失败，请检查后端服务。',
-          retryInput: content
-        }
-      ])
-      notice('生成失败，请检查后端服务')
+      appendMessage('assistant', error instanceof Error ? error.message : 'Coding Agent 执行失败', { kind: 'error' })
     } finally {
       setBusy(false)
     }
   }
 
-  function renderMessage(message: ChatMessage) {
-    if (message.kind === 'result' && message.result) {
-      return (
-        <div className="agent-result-card">
-          <div className="result-headline">
-            <span>已生成可运行 Agent</span>
-            <strong>{message.result.draft.name}</strong>
-          </div>
-          <p>{message.content}</p>
-          <div className="result-grid">
-            <div>
-              <small>应用场景</small>
-              <b>{message.result.blueprint.domain}</b>
-            </div>
-            <div>
-              <small>生成文件</small>
-              <b>{message.result.files.length} 个</b>
-            </div>
-            <div>
-              <small>能力数量</small>
-              <b>{message.result.blueprint.skills.length} 项</b>
-            </div>
-          </div>
-          <div className="file-chips generated-files">
-            {message.result.files.map(file => <b key={file}>{file}</b>)}
-          </div>
-          <button type="button" onClick={() => {
-            setActiveDraft(message.result!.draft)
-            setEditorOpen(true)
-            void loadDraftFiles(message.result!.draft)
-          }}>
-            打开左侧高级编辑
-          </button>
-        </div>
-      )
-    }
-
-    if (message.kind === 'build') {
-      return (
-        <div className="agent-build-bubble">
-          <span className="build-badge">自动构建</span>
-          <p>{message.content}</p>
-        </div>
-      )
-    }
-
-    if (message.kind === 'error') {
-      return (
-        <div className="agent-failure-card">
-          <strong>生成失败</strong>
-          <p>{message.content}</p>
-          <div>
-            <button
-              type="button"
-              onClick={() => {
-                setInput(message.retryInput || '')
-                inputRef.current?.focus()
-              }}
-            >
-              重新生成
-            </button>
-            <button type="button" onClick={onGoToAgentsList}>前往我的 Agents 查看</button>
-          </div>
-        </div>
-      )
-    }
-
-    return <p>{message.content}</p>
+  function providerForModel() {
+    return models?.providers.find(provider => provider.models.includes(selectedModel)) || null
   }
 
-  function renderResourcePickers(compact = false) {
+  function requireProvider(inputText: string) {
+    const provider = providerForModel()
+    if (!provider || provider.configured) return false
+    setConfigProvider(provider)
+    setBaseUrlDraft(provider.base_url || '')
+    setPendingRun(inputText)
+    appendMessage(
+      'assistant',
+      `当前 Agent 使用 ${selectedModel}，需要先配置 ${provider.name} API Key 才能真实运行。你可以在下面保存 Key，我会继续刚才的任务；也可以先使用本地代码回退。`,
+      { kind: 'config' },
+    )
+    setFlowPage('develop')
+    return true
+  }
+
+  async function saveProviderAndContinue() {
+    if (!configProvider || !apiKeyDraft.trim()) return notice('请输入 API Key')
+    setConfigBusy(true)
+    try {
+      const catalog = await configureModelProvider(configProvider.id, apiKeyDraft.trim(), baseUrlDraft.trim())
+      setModels(catalog)
+      setApiKeyDraft('')
+      setConfigProvider(null)
+      appendMessage('assistant', `${configProvider.name} 已配置，继续运行刚才的任务。`)
+      const task = pendingRun
+      setPendingRun('')
+      if (task) await runAgent(task, [], true)
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '模型配置失败')
+    } finally {
+      setConfigBusy(false)
+    }
+  }
+
+  async function runAgent(overrideInput?: string, confirmedTools: string[] = [], skipProviderCheck = false) {
+    if (!activeDraft || runBusy) return
+    const task = (overrideInput ?? runInput).trim()
+    if (!task) return
+    if (!skipProviderCheck && requireProvider(task)) return
+    setRunBusy(true)
+    setRightView('run')
+    try {
+      if (selectedFile) await saveCurrentFile()
+      await saveResourceConfig(false)
+      const result = await runDraftApp(activeDraft.id, task, confirmedTools)
+      setRunResult(result)
+      await refreshState(activeDraft.id)
+      notice(result.ok ? 'Agent 运行完成' : result.error === 'confirmation_required' ? '需要确认写操作' : 'Agent 运行失败')
+    } catch (error) {
+      setRunResult({
+        ok: false, answer: '', logs: error instanceof Error ? error.message : '运行失败',
+        error: error instanceof Error ? error.message : '运行失败', sources: [], trace: [], tool_calls: [],
+      })
+    } finally {
+      setRunBusy(false)
+    }
+  }
+
+  async function runEvaluation() {
+    if (!activeDraft) return
+    setEvaluating(true)
+    try {
+      await saveResourceConfig(false)
+      const result = await evaluateDraftApp(activeDraft.id, testCases)
+      setEvaluation(result)
+      await refreshState(activeDraft.id)
+      notice(`评测完成：${result.passed}/${result.total} 通过`)
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '评测失败')
+    } finally {
+      setEvaluating(false)
+    }
+  }
+
+  function toggleResource(value: string, list: string[], setList: (next: string[]) => void) {
+    setList(list.includes(value) ? list.filter(item => item !== value) : [...list, value])
+  }
+
+  function updateDeploy<K extends keyof DeployConfig>(key: K, value: DeployConfig[K]) {
+    setDeployConfig(old => ({ ...old, [key]: value }))
+  }
+
+  function toggleDeployList(key: 'shared_user_ids' | 'allowed_knowledge_base_ids' | 'allowed_skill_ids' | 'allowed_connectors', value: string) {
+    const list = deployConfig[key]
+    updateDeploy(key, list.includes(value) ? list.filter(item => item !== value) : [...list, value])
+  }
+
+  async function saveDeploy() {
+    if (!activeDraft) return
+    setSavingDeploy(true)
+    try {
+      await updateDeployConfig(activeDraft.id, deployConfig)
+      await refreshState(activeDraft.id)
+      notice('落地配置已保存')
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '落地配置保存失败')
+    } finally {
+      setSavingDeploy(false)
+    }
+  }
+
+  async function refreshPublishCheck() {
+    if (!activeDraft) return
+    await saveResourceConfig(false)
+    const check = await validateDraftManifest(activeDraft.id)
+    setValidation(check)
+    await refreshState(activeDraft.id)
+    notice(check.ok ? '项目文件校验通过' : '项目文件存在阻断项')
+  }
+
+  async function publish() {
+    if (!activeDraft) return
+    setPublishing(true)
+    try {
+      await publishAgent(activeDraft.id)
+      await refreshState(activeDraft.id)
+      notice(`${activeDraft.name} 已发布`)
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '发布失败')
+    } finally {
+      setPublishing(false)
+    }
+  }
+
+  function renderConfigCard() {
+    if (!configProvider) return null
     return (
-      <div className={compact ? 'resource-picker compact' : 'resource-picker'}>
-        <section>
-          <div className="resource-picker-head">
-            <b>Skills</b>
-            <span>{selectedSkills.length}</span>
-          </div>
-          <div className="resource-options">
-            {skills.map(skill => (
-              <label key={skill.id} className={selectedSkills.includes(skill.name) ? 'checked' : ''}>
-                <input
-                  type="checkbox"
-                  checked={selectedSkills.includes(skill.name)}
-                  onChange={() => toggleSelected(skill.name, setSelectedSkills)}
-                />
-                <span>
-                  <strong>{skill.name}</strong>
-                  <small>{skill.description || skill.type}</small>
-                </span>
-              </label>
-            ))}
-            {!skills.length && <p>暂无 Skill，先到资源中心创建。</p>}
-          </div>
-        </section>
-
-        <section>
-          <div className="resource-picker-head">
-            <b>知识库</b>
-            <span>{selectedKnowledge.length}</span>
-          </div>
-          <div className="resource-options">
-            {knowledgeBases.map(kb => (
-              <label key={kb.id} className={selectedKnowledge.includes(kb.id) ? 'checked' : ''}>
-                <input
-                  type="checkbox"
-                  checked={selectedKnowledge.includes(kb.id)}
-                  onChange={() => toggleSelected(kb.id, setSelectedKnowledge)}
-                />
-                <span>
-                  <strong>{kb.name}</strong>
-                  <small>{kb.documents.length} 个文档</small>
-                </span>
-              </label>
-            ))}
-            {!knowledgeBases.length && <p>暂无知识库，先到资源中心创建。</p>}
-          </div>
-        </section>
-
-        <section>
-          <div className="resource-picker-head">
-            <b>连接器</b>
-            <span>{selectedConnectors.length}</span>
-          </div>
-          <div className="resource-options">
-            {connectors.map(connector => (
-              <label key={connector.provider} className={selectedConnectors.includes(connector.provider) ? 'checked' : ''}>
-                <input
-                  type="checkbox"
-                  checked={selectedConnectors.includes(connector.provider)}
-                  onChange={() => toggleSelected(connector.provider, setSelectedConnectors)}
-                />
-                <span>
-                  <strong>{connector.name}</strong>
-                  <small>{connector.connected ? '已连接' : connector.configured ? '待重连' : '未配置'}</small>
-                </span>
-              </label>
-            ))}
-            {!connectors.length && <p>暂无连接器。</p>}
-          </div>
-        </section>
-
-        <button className="resource-save" type="button" onClick={saveResourceConfig} disabled={savingResources || !activeDraft}>
-          {savingResources ? '保存中' : '保存资源配置'}
-        </button>
+      <div className="agent-config-card">
+        <div className="config-card-head"><span>运行依赖</span><strong>{configProvider.name} API Key</strong></div>
+        <p>Key 只用于模型调用。保存后会继续刚才的运行任务。</p>
+        <label><span>Base URL</span><input value={baseUrlDraft} onChange={event => setBaseUrlDraft(event.target.value)} /></label>
+        <label><span>API Key</span><input type="password" value={apiKeyDraft} onChange={event => setApiKeyDraft(event.target.value)} placeholder="sk-..." /></label>
+        <div className="config-card-actions">
+          <button className="primary" type="button" onClick={saveProviderAndContinue} disabled={configBusy || !apiKeyDraft.trim()}>{configBusy ? '保存中' : '保存并继续'}</button>
+          <button type="button" onClick={async () => {
+            const task = pendingRun
+            setConfigProvider(null)
+            setPendingRun('')
+            appendMessage('assistant', '已切换为本地代码回退。此模式用于结构验证，不代表真实模型回答质量。')
+            if (task) await runAgent(task, [], true)
+          }}>使用本地回退</button>
+        </div>
       </div>
     )
   }
 
-  function renderFlowMain() {
-    if (flowPage === 'chat') {
-      return (
-        <>
-          <div className="project-messages" ref={messagesRef}>
-            {messages.map(message => (
-              <div className={`project-message ${message.role}`} key={message.id}>
-                {message.role === 'assistant' && <span className="bot-avatar">A</span>}
-                <div>{renderMessage(message)}</div>
-              </div>
-            ))}
-            {busy && (
-              <div className="project-message assistant">
-                <span className="bot-avatar">A</span>
-                <div className="agent-thinking">
-                  <i className="typing-dot" />
-                  Atlas 正在自动搭建 Agent...
-                </div>
-              </div>
-            )}
-          </div>
-
-          <form className="project-composer auto-composer" onSubmit={submit}>
-            <div className="starter-row">
-              {starters.map(item => (
-                <button type="button" key={item} onClick={() => setInput(item)}>
-                  {item}
-                </button>
-              ))}
-            </div>
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={event => setInput(event.target.value)}
-              placeholder="告诉 Atlas 你想自动创建什么 Agent，例如：做一个客服助手，能根据知识库回答售后问题并生成工单摘要..."
-              onKeyDown={event => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault()
-                  event.currentTarget.form?.requestSubmit()
-                }
-              }}
-            />
-            <div className="project-composer-actions">
-              <span className="composer-hint">Enter 发送，Shift + Enter 换行</span>
-              <button className="send-project" disabled={busy || !input.trim()}>
-                {busy ? '...' : '↑'}
-              </button>
-            </div>
-          </form>
-        </>
-      )
-    }
-
-    if (flowPage === 'resources') {
-      return (
-        <div className="flow-page resource-flow-page">
-          <div className="flow-page-title">
-            <span>CONFIGURE</span>
-            <h2>绑定 Agent 运行资源</h2>
-            <p>这里决定运行时可用的 Skill、知识库和外部工具。保存后会写入草稿的 manifest。</p>
-          </div>
-          {renderResourcePickers()}
-          <div className="flow-page-actions">
-            <button type="button" onClick={() => setFlowPage('chat')}>返回会话</button>
-            <button type="button" className="primary" onClick={async () => { await saveResourceConfig(); setFlowPage('test') }}>进入测试</button>
-          </div>
-        </div>
-      )
-    }
-
-    if (flowPage === 'test') {
-      return (
-        <div className="flow-page">
-          <div className="flow-page-title row">
-            <div>
-              <span>TEST</span>
-              <h2>样例测试</h2>
-              <p>用固定样例测试 Agent 输出稳定性。测试结果会进入发布检查。</p>
-            </div>
-            <button type="button" className="primary" onClick={runEvaluationFlow} disabled={evaluating || !activeDraft}>
-              {evaluating ? '测试中' : '运行全部测试'}
-            </button>
-          </div>
-          <div className="test-case-table">
-            {testCases.map((item, index) => (
-              <div className="test-case-row" key={index}>
-                <input value={item.name} onChange={event => updateTestCase(index, { name: event.target.value })} />
-                <textarea value={item.input} onChange={event => updateTestCase(index, { input: event.target.value })} />
-                <textarea value={item.expected} onChange={event => updateTestCase(index, { expected: event.target.value })} />
-                <button type="button" onClick={() => setTestCases(old => old.filter((_, i) => i !== index))}>删除</button>
-              </div>
-            ))}
-          </div>
-          <button type="button" onClick={() => setTestCases(old => [...old, { name: `样例 ${old.length + 1}`, input: '', expected: '' }])}>添加样例</button>
-          {evaluation && (
-            <div className="flow-result">
-              <b>{evaluation.passed}/{evaluation.total}</b>
-              <span>通过率 {(evaluation.pass_rate * 100).toFixed(0)}%</span>
-              <p>{evaluation.summary.recommendation_label}</p>
-            </div>
-          )}
-        </div>
-      )
-    }
-
-    if (flowPage === 'review') {
-      const blocking = validation?.errors || []
-      const warnings = validation?.warnings || []
-      return (
-        <div className="flow-page">
-          <div className="flow-page-title row">
-            <div>
-              <span>REVIEW</span>
-              <h2>发布检查</h2>
-              <p>检查 manifest、入口文件、权限声明、测试结果和运行资源是否满足发布条件。</p>
-            </div>
-            <button type="button" className="primary" onClick={runPublishCheck} disabled={!activeDraft}>重新检查</button>
-          </div>
-          <div className="release-check-grid">
-            <div className={activeDraft ? 'pass' : 'fail'}><b>草稿</b><span>{activeDraft ? '已生成' : '未生成'}</span></div>
-            <div className={selectedSkills.length || selectedKnowledge.length ? 'pass' : 'warn'}><b>资源</b><span>{selectedSkills.length + selectedKnowledge.length + selectedConnectors.length} 项</span></div>
-            <div className={evaluation?.ok ? 'pass' : 'warn'}><b>测试</b><span>{evaluation ? `${evaluation.passed}/${evaluation.total}` : '未测试'}</span></div>
-            <div className={validation?.ok ? 'pass' : blocking.length ? 'fail' : 'warn'}><b>Manifest</b><span>{validation?.ok ? '通过' : '待确认'}</span></div>
-          </div>
-          <div className="release-issues">
-            {blocking.map(item => <p className="fail" key={item}>阻断：{item}</p>)}
-            {warnings.map(item => <p className="warn" key={item}>提醒：{item}</p>)}
-            {validation?.ok && <p className="pass">发布检查通过，可以进入发布确认。</p>}
-            {!validation && <p>点击“重新检查”生成发布检查结果。</p>}
-          </div>
-          <div className="flow-page-actions">
-            <button type="button" onClick={() => setFlowPage('test')}>返回测试</button>
-            <button type="button" className="primary" onClick={() => setFlowPage('publish')} disabled={!validation?.ok}>进入发布</button>
-          </div>
-        </div>
-      )
-    }
-
+  function renderDevelop() {
     return (
-      <div className="flow-page publish-flow-page">
-        <div className="flow-page-title">
-          <span>PUBLISH</span>
-          <h2>发布确认</h2>
-          <p>确认上线后，这个 Agent 会进入“我的 Agents”列表，并可通过运行按钮发起真实任务。</p>
+      <div className="develop-workspace">
+        <div className="project-messages" ref={messagesRef}>
+          {messages.map(message => (
+            <div className={`project-message ${message.role}`} key={message.id}>
+              {message.role === 'assistant' && <span className="bot-avatar">A</span>}
+              <div className={message.kind === 'error' ? 'agent-failure-card' : 'builder-message-body'}>
+                <p>{message.content}</p>
+                {(message.version_no || message.changed_files?.length) && (
+                  <div className="change-summary">
+                    {message.version_no && <b>v{message.version_no}</b>}
+                    {message.changed_files?.map(file => <span key={file}>{file}</span>)}
+                  </div>
+                )}
+                {message.kind === 'config' && renderConfigCard()}
+              </div>
+            </div>
+          ))}
+          {busy && <div className="project-message assistant"><span className="bot-avatar">A</span><div className="agent-thinking"><i className="typing-dot" />Coding Agent 正在分析并修改项目...</div></div>}
         </div>
-        <div className="publish-summary">
-          <div><b>{projectSummary.name}</b><span>Agent 名称</span></div>
-          <div><b>{selectedSkills.length}</b><span>Skills</span></div>
-          <div><b>{selectedKnowledge.length}</b><span>知识库</span></div>
-          <div><b>{selectedConnectors.length}</b><span>连接器</span></div>
-        </div>
-        <button
-          type="button"
-          className="publish-button"
-          disabled={!validation?.ok || published}
-          onClick={() => {
-            setPublished(true)
-            notice('发布流程已完成')
-          }}
-        >
-          {published ? '已发布' : '确认发布'}
-        </button>
-        {published && <button type="button" onClick={onGoToAgentsList}>回到我的 Agents</button>}
+        <form className="project-composer auto-composer" onSubmit={submit}>
+          {!activeDraft && <div className="starter-row">{starterPrompts.map(item => <button type="button" key={item} onClick={() => setInput(item)}>{item}</button>)}</div>}
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={event => setInput(event.target.value)}
+            placeholder={activeDraft ? '继续描述要修改的功能、规则、文件或输出格式...' : '描述要创建的 Agent，例如：做一个客服助手，根据知识库回答售后问题...'}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault()
+                event.currentTarget.form?.requestSubmit()
+              }
+            }}
+          />
+          <div className="project-composer-actions">
+            <span>{activeDraft ? `下一次修改将生成 v${projectSummary.version + 1}` : '首次对话将创建完整项目'}</span>
+            <button className="send-project" disabled={busy || !input.trim()}>{busy ? '...' : '↑'}</button>
+          </div>
+        </form>
       </div>
     )
   }
 
-  return (
-    <section className="project-chat-page auto-agent-page">
-      <aside className="project-list-pane">
-        <div className="project-list-title">
-          <strong>自动 Agent</strong>
-          <button type="button" onClick={() => setInput('做一个新的企业智能体应用')}>+</button>
+  function renderRunEvidence(result: RunPreviewResult | null) {
+    if (!result) return <div className="flow-empty">运行后将在这里展示回答、来源、Skill 和工具步骤。</div>
+    return (
+      <div className="runtime-evidence">
+        <section className="runtime-answer"><div><b>Agent 回答</b><span>{result.ok ? '运行成功' : '需要处理'}</span></div><p>{result.answer || result.error || '无输出'}</p></section>
+        {!result.ok && result.error !== 'confirmation_required' && (
+          <div className="repair-action">
+            <span>把运行错误和日志交回 Coding Agent，修改会生成新版本。</span>
+            <button type="button" onClick={() => {
+              setInput(`请修复当前 Agent 的运行问题。错误：${result.error || '未知'}\n日志：${result.logs.slice(0, 3000)}`)
+              setFlowPage('develop')
+              window.setTimeout(() => inputRef.current?.focus(), 0)
+            }}>交给 Coding Agent 修复</button>
+          </div>
+        )}
+        {result.requires_confirmation && (
+          <section className="runtime-confirm">
+            <b>写操作确认</b>
+            <p>Agent 准备执行 {result.requires_confirmation.tool}。确认后会用相同输入重新运行并放行该工具。</p>
+            <button type="button" className="primary" onClick={() => runAgent(runInput, [result.requires_confirmation!.tool], true)}>确认执行</button>
+          </section>
+        )}
+        <div className="runtime-columns">
+          <section><h3>执行步骤</h3>{result.trace.map((step, index) => <div className={`runtime-step ${step.status}`} key={`${step.title}-${index}`}><i>{index + 1}</i><span><b>{step.title}</b><small>{step.executor} · {step.status}</small></span></div>)}{!result.trace.length && <p>没有步骤记录</p>}</section>
+          <section><h3>引用来源</h3>{result.sources.map((source, index) => <div className="runtime-source" key={`${source.document}-${index}`}><b>{source.document} · 第 {source.page} 页</b><p>{source.quote}</p></div>)}{!result.sources.length && <p>本次未使用知识库来源</p>}</section>
+          <section><h3>工具调用</h3>{result.tool_calls.map((tool, index) => <div className="runtime-tool" key={`${tool.name}-${index}`}><b>{tool.name}</b><span>{tool.provider || 'platform'} · {tool.status}</span></div>)}{!result.tool_calls.length && <p>本次未调用外部工具</p>}</section>
         </div>
-        <div className="project-user-card auto-card">
-          <span>Atlas</span>
-          <b>{projectSummary.name}</b>
-          <small>{generated ? '已生成可运行草稿' : '一句话生成 Agent 应用'}</small>
-        </div>
-        <div className="auto-steps-mini">
-          {buildSteps.map((step, index) => (
-            <div className={index <= activeStep ? 'active' : ''} key={step.title}>
-              <i>{index + 1}</i>
-              <span>{step.title}</span>
+      </div>
+    )
+  }
+
+  function renderTest() {
+    return (
+      <div className="flow-page test-workspace">
+        <div className="flow-page-title row"><div><span>TEST</span><h2>单次测试</h2><p>验证当前草稿能否运行，并查看知识库引用、Skill 和连接器步骤。</p></div><b className="evidence-badge">草稿 v{projectSummary.version}{projectSummary.dirty ? ' · 有未保存版本的修改' : ''}</b></div>
+        <div className="single-test-input"><textarea value={runInput} onChange={event => setRunInput(event.target.value)} /><button type="button" className="primary" onClick={() => runAgent()} disabled={!activeDraft || runBusy}>{runBusy ? '运行中' : '运行测试'}</button></div>
+        {renderRunEvidence(runResult)}
+      </div>
+    )
+  }
+
+  function renderEvaluate() {
+    const metrics = evaluation?.summary.metrics || {}
+    const failures = evaluation?.results.filter(item => !item.ok) || []
+    return (
+      <div className="flow-page evaluation-workspace">
+        <div className="flow-page-title row"><div><span>EVALUATE</span><h2>批量评测</h2><p>用固定评测集判断发布风险。语义指标缺少依据时会明确标记为待配置。</p></div><button type="button" className="primary" onClick={runEvaluation} disabled={!activeDraft || evaluating || !testCases.length}>{evaluating ? '评测中' : '运行全部评测'}</button></div>
+        <div className="test-case-table">
+          {testCases.map((item, index) => (
+            <div className="test-case-row" key={index}>
+              <input value={item.name} onChange={event => setTestCases(old => old.map((row, i) => i === index ? { ...row, name: event.target.value } : row))} aria-label="样例名称" />
+              <textarea value={item.input} onChange={event => setTestCases(old => old.map((row, i) => i === index ? { ...row, input: event.target.value } : row))} aria-label="测试输入" />
+              <textarea value={item.expected} onChange={event => setTestCases(old => old.map((row, i) => i === index ? { ...row, expected: event.target.value } : row))} aria-label="期望包含" placeholder="期望输出包含，可留空" />
+              <button type="button" onClick={() => setTestCases(old => old.filter((_, i) => i !== index))}>删除</button>
             </div>
           ))}
         </div>
-        <div className="project-history-item active">
-          <b>{projectSummary.name}</b>
-          <span>{activeDraft ? '已创建文件，可在左侧高级编辑' : '描述业务场景即可生成 Agent'}</span>
-        </div>
-        <section className="left-resource-board">
-          <div className="left-resource-title">
-            <strong>运行资源</strong>
-            <button type="button" onClick={() => setFlowPage('resources')}>配置</button>
-          </div>
-          {renderResourcePickers(true)}
-        </section>
-        <section className={`project-inline-editor ${editorOpen ? 'open' : ''}`}>
-          <button type="button" className="inline-editor-toggle" onClick={() => setEditorOpen(open => !open)} disabled={!activeDraft}>
-            高级编辑
-            <span>{activeDraft ? activeDraft.name : '等待草稿'}</span>
-          </button>
-          {editorOpen && activeDraft && (
-            <div className="inline-editor-body">
-              <div className="inline-file-list">
-                {fileTree.map(file => (
-                  <button
-                    type="button"
-                    className={selectedFile === file.path ? 'active' : ''}
-                    key={file.path}
-                    onClick={() => openDraftFile(activeDraft.id, file.path)}
-                  >
-                    {file.name}
-                  </button>
-                ))}
-              </div>
-              <textarea value={fileContent} onChange={event => setFileContent(event.target.value)} spellCheck={false} />
-              <button type="button" className="inline-save" onClick={saveCurrentFile} disabled={savingFile || !selectedFile}>
-                {savingFile ? '保存中' : '保存文件'}
-              </button>
+        <button type="button" onClick={() => setTestCases(old => [...old, { name: `样例 ${old.length + 1}`, input: '', expected: '' }])}>添加样例</button>
+        {evaluation && (
+          <>
+            <div className="evaluation-verdict"><b>{evaluation.summary.recommendation_label}</b><span>{evaluation.passed}/{evaluation.total} 通过 · 平均 {evaluation.summary.avg_elapsed_ms.toFixed(0)} ms</span></div>
+            <div className="metric-grid">
+              <div><b>{metricText(metrics.task_completion_rate)}</b><span>任务完成率</span></div>
+              <div><b>{metricText(metrics.first_pass_rate)}</b><span>一次解决率</span></div>
+              <div><b>{metricText(metrics.skill_success_rate)}</b><span>Skill 成功率</span></div>
+              <div><b>{metricText(metrics.tool_success_rate)}</b><span>工具成功率</span></div>
+              <div><b>{metricText(metrics.citation_accuracy)}</b><span>引用准确率</span></div>
+              <div><b>{metricText(metrics.hallucination_rate)}</b><span>幻觉率</span></div>
+              <div><b>{metricText(metrics.avg_elapsed_ms, false)}</b><span>平均响应</span></div>
+              <div><b>{metrics.token_cost == null ? '待计量' : metrics.token_cost}</b><span>任务成本</span></div>
             </div>
-          )}
+            <section className="failure-samples"><h3>失败样例</h3>{failures.map((item, index) => <div key={`${item.name}-${index}`}><b>{item.name}</b><p>期望：{item.expected || '完成任务'}</p><p>实际：{item.output || item.logs}</p><span>{item.suggestion}</span><button type="button" onClick={() => { setInput(`请修复评测失败样例“${item.name}”。输入：${item.input}\n期望：${item.expected || '完成任务'}\n实际：${item.output || item.logs.slice(0, 1800)}\n建议：${item.suggestion}`); setFlowPage('develop'); window.setTimeout(() => inputRef.current?.focus(), 0) }}>生成修复版本</button></div>)}{!failures.length && <p>当前评测集没有失败样例。</p>}</section>
+          </>
+        )}
+      </div>
+    )
+  }
+
+  function renderDeploy() {
+    return (
+      <div className="flow-page deploy-workspace">
+        <div className="flow-page-title row"><div><span>DEPLOY</span><h2>落地配置</h2><p>确定谁可以使用、允许访问哪些资源，以及外部调用和审计规则。</p></div><button className="primary" type="button" onClick={saveDeploy} disabled={!activeDraft || savingDeploy}>{savingDeploy ? '保存中' : '保存配置'}</button></div>
+        <section className="deploy-band"><h3>可见范围</h3><div className="deploy-choice-grid">{(Object.keys(visibilityLabels) as DeployConfig['visibility'][]).map(item => <label className={deployConfig.visibility === item ? 'selected' : ''} key={item}><input type="radio" checked={deployConfig.visibility === item} onChange={() => updateDeploy('visibility', item)} />{visibilityLabels[item]}</label>)}</div>{deployConfig.visibility === 'shared' && <div className="deploy-inline-list">{members.map(member => <label key={member.id}><input type="checkbox" checked={deployConfig.shared_user_ids.includes(member.id)} onChange={() => toggleDeployList('shared_user_ids', member.id)} />{member.name}</label>)}</div>}</section>
+        <section className="deploy-band"><h3>发布资源权限 <small>留空表示仅按开发阶段绑定资源执行</small></h3><div className="deploy-permission-columns"><div><b>知识库</b>{knowledgeBases.map(kb => <label key={kb.id}><input type="checkbox" checked={deployConfig.allowed_knowledge_base_ids.includes(kb.id)} onChange={() => toggleDeployList('allowed_knowledge_base_ids', kb.id)} />{kb.name}</label>)}</div><div><b>Skills</b>{skills.map(skill => <label key={skill.id}><input type="checkbox" checked={deployConfig.allowed_skill_ids.includes(skill.id)} onChange={() => toggleDeployList('allowed_skill_ids', skill.id)} />{skill.name}</label>)}</div><div><b>连接器</b>{connectors.map(connector => <label key={connector.provider}><input type="checkbox" checked={deployConfig.allowed_connectors.includes(connector.provider)} onChange={() => toggleDeployList('allowed_connectors', connector.provider)} />{connector.name}</label>)}</div></div></section>
+        <section className="deploy-band deploy-switches"><h3>运行治理</h3><label><input type="checkbox" checked={deployConfig.write_confirm} onChange={event => updateDeploy('write_confirm', event.target.checked)} /><span><b>写操作二次确认</b><small>发送消息、修改外部数据前要求用户确认</small></span></label><label><input type="checkbox" checked={deployConfig.api_access} onChange={event => updateDeploy('api_access', event.target.checked)} /><span><b>允许外部 API 调用</b><small>发布后可以创建 API Key</small></span></label><label><input type="checkbox" checked={deployConfig.call_log_enabled} onChange={event => updateDeploy('call_log_enabled', event.target.checked)} /><span><b>保留调用日志</b><small>记录来源、状态、耗时和错误</small></span></label><label className="high-risk-approval"><input type="checkbox" checked={deployConfig.high_risk_approved} onChange={event => updateDeploy('high_risk_approved', event.target.checked)} /><span><b>管理员批准高风险连接器</b><small>仅工作空间所有者可保存；适用于发送消息和修改外部数据的连接器</small></span></label></section>
+      </div>
+    )
+  }
+
+  function renderPublish() {
+    const checklist = productState?.publish_checklist
+    const published = productState?.agent.status === 'published' && !productState.agent.has_unpublished_changes
+    return (
+      <div className="flow-page publish-workspace">
+        <div className="flow-page-title row"><div><span>PUBLISH</span><h2>发布版本</h2><p>发布会自动保存当前工作区，并生成不可变发布版本。评测可以跳过，但会保留风险提醒。</p></div><button type="button" onClick={refreshPublishCheck} disabled={!activeDraft}>重新检查</button></div>
+        <div className="publish-version-strip"><div><small>当前草稿</small><b>v{projectSummary.version}{projectSummary.dirty ? ' + 未版本化修改' : ''}</b></div><div><small>线上版本</small><b>{projectSummary.publishedVersion ? `v${projectSummary.publishedVersion}` : '尚未发布'}</b></div><div><small>目标范围</small><b>{visibilityLabels[deployConfig.visibility]}</b></div></div>
+        <section className="publish-checklist"><h3>发布检查</h3>{checklist?.items.map(item => <div className={item.ok ? 'pass' : item.level === 'blocking' ? 'fail' : 'warn'} key={item.key}><i>{item.ok ? '✓' : item.level === 'blocking' ? '×' : '!'}</i><span><b>{item.label}</b><small>{item.level === 'blocking' ? '必须通过' : '风险提醒'}</small></span></div>)}{validation?.errors.map(error => <p className="fail" key={error}>{error}</p>)}</section>
+        {published ? <div className="publish-success"><b>已发布 v{projectSummary.publishedVersion}</b><p>工作台和外部 API 会固定运行这个版本，后续草稿修改不会影响线上。</p><button type="button" onClick={onGoToAgentsList}>回到我的 Agents</button></div> : <button className="publish-button" type="button" onClick={publish} disabled={!checklist?.can_publish || publishing}>{publishing ? '发布中' : productState?.agent.status === 'published' ? '发布草稿更新' : '确认发布当前版本'}</button>}
+      </div>
+    )
+  }
+
+  function renderMain() {
+    if (flowPage === 'develop') return renderDevelop()
+    if (flowPage === 'test') return renderTest()
+    if (flowPage === 'evaluate') return renderEvaluate()
+    if (flowPage === 'deploy') return renderDeploy()
+    return renderPublish()
+  }
+
+  function renderResourcePanel() {
+    return (
+      <div className="resource-picker compact product-resource-picker">
+        <label className="resource-model"><span>运行模型</span><select value={selectedModel} onChange={event => setSelectedModel(event.target.value)}>{models?.providers.flatMap(provider => provider.models).map(model => <option key={model}>{model}</option>) || <option>{selectedModel}</option>}</select></label>
+        <section><div className="resource-picker-head"><b>Skills</b><span>{selectedSkills.length}</span></div><div className="resource-options">{selectedSkills.filter(name => !skills.some(skill => skill.name === name)).map(name => <label className="checked project-skill-option" key={name}><input type="checkbox" checked onChange={() => toggleResource(name, selectedSkills, setSelectedSkills)} /><span><strong>{name}</strong><small>项目内置 Skill</small></span></label>)}{skills.map(skill => <label className={selectedSkills.includes(skill.name) ? 'checked' : ''} key={skill.id}><input type="checkbox" checked={selectedSkills.includes(skill.name)} onChange={() => toggleResource(skill.name, selectedSkills, setSelectedSkills)} /><span><strong>{skill.name}</strong><small>{skill.description}</small></span></label>)}</div></section>
+        <section><div className="resource-picker-head"><b>知识库</b><span>{selectedKnowledge.length}</span></div><div className="resource-options">{knowledgeBases.map(kb => <label className={selectedKnowledge.includes(kb.id) ? 'checked' : ''} key={kb.id}><input type="checkbox" checked={selectedKnowledge.includes(kb.id)} onChange={() => toggleResource(kb.id, selectedKnowledge, setSelectedKnowledge)} /><span><strong>{kb.name}</strong><small>{kb.documents.length} 个文档</small></span></label>)}</div></section>
+        <section><div className="resource-picker-head"><b>连接器</b><span>{selectedConnectors.length}</span></div><div className="resource-options">{connectors.map(connector => <label className={selectedConnectors.includes(connector.provider) ? 'checked' : ''} key={connector.provider}><input type="checkbox" checked={selectedConnectors.includes(connector.provider)} onChange={() => toggleResource(connector.provider, selectedConnectors, setSelectedConnectors)} /><span><strong>{connector.name}</strong><small>{connector.connected ? '已连接' : connector.configured ? '需要重连' : '未配置'}</small></span></label>)}</div></section>
+        <button className="resource-save" type="button" onClick={() => saveResourceConfig()} disabled={!activeDraft || savingResources}>{savingResources ? '保存中' : '保存运行资源'}</button>
+      </div>
+    )
+  }
+
+  const flowSteps: Array<{ key: FlowPage; label: string; detail: string; state: string }> = [
+    { key: 'develop', label: '开发', detail: activeDraft ? `v${projectSummary.version}${projectSummary.dirty ? ' · 未保存版本' : ''}` : '描述需求', state: activeDraft ? 'done' : 'todo' },
+    { key: 'test', label: '测试', detail: productState?.latest_test ? (productState.latest_test.ok ? '已通过' : '有问题') : '未开始', state: productState?.latest_test?.ok ? 'done' : productState?.latest_test ? 'warn' : 'todo' },
+    { key: 'evaluate', label: '评测', detail: productState?.latest_evaluation ? `${Math.round(productState.latest_evaluation.pass_rate * 100)}%` : '可跳过', state: productState?.latest_evaluation?.ok ? 'done' : productState?.latest_evaluation ? 'warn' : 'todo' },
+    { key: 'deploy', label: '落地配置', detail: productState?.agent.deploy_config_configured ? '已保存' : '未配置', state: productState?.agent.deploy_config_configured ? 'done' : 'todo' },
+    { key: 'publish', label: '发布', detail: productState?.agent.workflow_stage === 'published' ? `v${projectSummary.publishedVersion}` : productState?.agent.status === 'published' ? '有待发布更新' : '未发布', state: productState?.agent.workflow_stage === 'published' ? 'done' : 'todo' },
+  ]
+
+  return (
+    <section className="project-chat-page product-builder-page">
+      <aside className="project-list-pane product-left-rail">
+        <div className="project-list-title"><strong>Agent 项目</strong><button type="button" onClick={() => { setActiveDraft(null); setProductState(null); setMessages([]); setProjectName('新 Agent 项目'); setFlowPage('develop') }}>+</button></div>
+        <div className="project-user-card auto-card"><span>{productState?.agent.workflow_stage || 'DRAFT'}</span><b>{projectSummary.name}</b><small>{projectSummary.publishedVersion ? `线上 v${projectSummary.publishedVersion}` : activeDraft ? `草稿 v${projectSummary.version}` : '等待创建'}</small></div>
+        <section className="left-resource-board"><div className="left-resource-title"><strong>运行资源</strong><span>{selectedKnowledge.length + selectedSkills.length + selectedConnectors.length}</span></div>{renderResourcePanel()}</section>
+        <section className={`project-inline-editor ${editorOpen ? 'open' : ''}`}>
+          <button className="inline-editor-toggle" type="button" onClick={() => setEditorOpen(open => !open)} disabled={!activeDraft}><span>高级编辑</span><small>{projectSummary.dirty ? '工作区有修改' : '版本已同步'}</small></button>
+          {editorOpen && activeDraft && <div className="inline-editor-body"><div className="inline-file-list">{files.map(file => <button type="button" className={selectedFile === file.path ? 'active' : ''} onClick={() => openFile(activeDraft.id, file.path)} key={file.path}>{file.name}</button>)}</div><textarea value={fileContent} onChange={event => setFileContent(event.target.value)} spellCheck={false} /><button className="inline-save" type="button" onClick={saveCurrentFile} disabled={savingFile}>{savingFile ? '保存中' : '保存文件'}</button></div>}
         </section>
       </aside>
 
-      <main className="project-chat-main">
-        <header className="project-chat-header auto-header">
-          <div className="project-avatar">A</div>
-          <div>
-            <span className="auto-eyebrow">Conversational Agent Builder</span>
-            <h1>{projectSummary.name}</h1>
-            <p>像聊天一样自动生成 Agent：需求理解、能力设计、文件创建、左侧高级编辑和右侧运行预览一步完成。</p>
-          </div>
-        </header>
-
-        <div className="auto-progress-strip flow-progress-strip">
-          {flowSteps.map(step => (
-            <button
-              type="button"
-              className={flowPage === step.key ? 'active' : ''}
-              key={step.key}
-              onClick={() => setFlowPage(step.key)}
-            >
-              <b>{step.title}</b>
-              <span>{step.desc}</span>
-            </button>
-          ))}
-        </div>
-
-        {renderFlowMain()}
+      <main className="project-chat-main product-builder-main">
+        <header className="project-chat-header product-builder-header"><div className="project-avatar">A</div><div><span className="auto-eyebrow">ATLAS AGENT RELEASE CONSOLE</span><h1>{projectSummary.name}</h1><p>持续对话开发、真实运行证据、批量评测、权限配置和不可变版本发布。</p></div><div className={`builder-health ${productState?.agent.health_status || 'unknown'}`}><small>健康状态</small><b>{productState?.agent.health_status === 'healthy' ? '健康' : productState?.agent.health_status === 'risk' ? '有风险' : productState?.agent.health_status === 'attention' ? '需关注' : '待验证'}</b></div></header>
+        <nav className="release-rail">{flowSteps.map((step, index) => <button type="button" className={`${flowPage === step.key ? 'active' : ''} ${step.state}`} key={step.key} onClick={() => setFlowPage(step.key)}><i>{index + 1}</i><span><b>{step.label}</b><small>{step.detail}</small></span></button>)}</nav>
+        {renderMain()}
       </main>
 
-      <aside className="project-settings-pane auto-settings-pane run-console-pane">
-        <div className="run-console-head">
-          <span>运行预览</span>
-          <h2>{activeDraft?.name || generated?.draft.name || '等待 Agent'}</h2>
-          <p>这里和“我的 Agents”点击运行后的对话体验保持一致：输入任务、查看步骤、读取输出。</p>
-        </div>
-
-        <div className="agent-chat-row assistant compact">
-          <span>A</span>
-          <div>
-            <strong>{activeDraft?.name || 'Atlas Agent'}</strong>
-            <p>{generated || activeDraft ? '我已经可以试运行。你可以输入业务问题，我会按当前草稿输出结果。' : '生成或打开一个 Agent 后即可运行预览。'}</p>
-          </div>
-        </div>
-
-        <label className="agent-use-input compact">
-          让 Agent 处理什么任务？
-          <textarea
-            value={runInput}
-            onChange={event => setRunInput(event.target.value)}
-            placeholder="例如：请根据知识库说明售后处理流程，并生成一段给客户的回复。"
-          />
-        </label>
-
-        <button className="run-console-button" type="button" onClick={runActiveDraft} disabled={runBusy || !runInput.trim()}>
-          {runBusy ? '运行中' : '运行 Agent'}
-        </button>
-
-        <div className="run-mini-steps console-steps">
-          <div className={activeDraft ? 'active' : ''}><i>1</i>校验 manifest</div>
-          <div className={runBusy ? 'active' : ''}><i>2</i>执行 Agent</div>
-          <div className={runLogs && !runBusy ? 'active' : ''}><i>3</i>输出结果</div>
-        </div>
-
-        <div className="agent-answer-card console-answer">
-          <div className="answer-title">
-            <span>Agent 输出</span>
-            <b>{runBusy ? '运行中' : '就绪'}</b>
-          </div>
-          <pre>{runLogs}</pre>
-        </div>
-
-        <section className="settings-section">
-          <span className="settings-label">生成文件</span>
-          <div className="file-chips">
-            {projectSummary.files.length ? projectSummary.files.map(file => <b key={file}>{file}</b>) : fileTree.map(file => <b key={file.path}>{file.name}</b>)}
-            {!projectSummary.files.length && !fileTree.length && <b>对话后自动生成</b>}
-          </div>
-        </section>
+      <aside className="project-settings-pane product-runtime-pane">
+        <nav className="runtime-tabs">
+          <button className={rightView === 'run' ? 'active' : ''} onClick={() => setRightView('run')}>运行</button>
+          <button className={rightView === 'preview' ? 'active' : ''} onClick={() => setRightView('preview')} disabled={!previewHtml}>预览</button>
+          <button className={rightView === 'code' ? 'active' : ''} onClick={() => setRightView('code')}>代码</button>
+          <button className={rightView === 'logs' ? 'active' : ''} onClick={() => setRightView('logs')}>日志</button>
+        </nav>
+        {rightView === 'run' && <div className="runtime-run-view"><div className="run-console-head"><span>{productState?.agent.status === 'published' ? `草稿预览 · 线上 v${projectSummary.publishedVersion}` : '草稿运行'}</span><h2>{projectSummary.name}</h2><p>开发侧始终运行当前草稿；发布后的工作台与 API 固定运行线上版本。</p></div><div className="runtime-chat-answer"><span>A</span><div><strong>{projectSummary.name}</strong><p>{runResult?.answer || (activeDraft ? '输入任务即可验证当前草稿。' : '创建 Agent 后开始运行。')}</p></div></div><label className="agent-use-input compact"><span>任务输入</span><textarea value={runInput} onChange={event => setRunInput(event.target.value)} /></label><button className="run-console-button" type="button" onClick={() => runAgent()} disabled={!activeDraft || runBusy || !runInput.trim()}>{runBusy ? '运行中' : '运行 Agent'}</button>{runResult?.requires_confirmation && <button className="runtime-confirm-button" type="button" onClick={() => runAgent(runInput, [runResult.requires_confirmation!.tool], true)}>确认 {runResult.requires_confirmation.tool}</button>}<div className="runtime-mini-meta"><span>{runResult?.version_label || 'draft'} {runResult?.version_no ? `v${runResult.version_no}` : 'workspace'}</span><span>{runResult?.elapsed_ms != null ? `${runResult.elapsed_ms} ms` : '未运行'}</span><span>{runResult?.sources.length || 0} 来源</span></div></div>}
+        {rightView === 'preview' && <div className="runtime-preview-view">{previewHtml ? <iframe title="Agent HTML 预览" srcDoc={previewHtml} sandbox="allow-forms allow-scripts" /> : <div className="flow-empty">项目没有 preview.html。通过开发对话要求 Coding Agent 创建前端页面后会自动显示。</div>}</div>}
+        {rightView === 'code' && <div className="runtime-code-view"><div className="runtime-file-index">{files.map(file => <button className={selectedFile === file.path ? 'active' : ''} type="button" key={file.path} onClick={() => activeDraft && openFile(activeDraft.id, file.path)}>{file.path}</button>)}</div><pre>{fileContent || '选择文件查看代码'}</pre></div>}
+        {rightView === 'logs' && <div className="runtime-log-view"><div className="runtime-log-status"><b>{runResult?.ok ? 'SUCCEEDED' : runResult ? 'REQUIRES ACTION' : 'IDLE'}</b><span>{runResult?.run_id || '尚无运行记录'}</span></div><pre>{runResult?.logs || '运行后显示版本、模型、资源命中、工具和耗时日志。'}</pre>{runResult?.warnings?.map(warning => <p key={warning}>{warning}</p>)}</div>}
       </aside>
     </section>
   )

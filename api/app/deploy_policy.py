@@ -14,6 +14,7 @@ DEFAULT_DEPLOY_CONFIG = {
     "write_confirm": True,
     "api_access": False,  # 占位：需要 API Key 功能完成后才有实际入口消费它
     "call_log_enabled": True,
+    "high_risk_approved": False,
 }
 
 
@@ -93,6 +94,7 @@ def build_publish_checklist(
     last_eval_ok: bool | None,
     deploy_config_configured: bool,
     allowed_connectors: list[str],
+    high_risk_approved: bool = False,
 ) -> dict:
     """组装发布前检查清单。blocking 项任意一条不过则不能发布；warning 项不阻断，仅提示。
 
@@ -103,12 +105,14 @@ def build_publish_checklist(
     「敏感数据风险」本轮做成静态占位（未接入内容扫描），恒为 warning 未通过，提示人工确认。
     """
     is_prompt = kind == "prompt"
+    has_high_risk_connector = any(is_high_risk_connector(c) for c in allowed_connectors)
     items = [
         {"key": "has_version", "label": "有可发布的版本", "ok": has_current_version, "level": "blocking"},
         {"key": "passed_test", "label": "已通过基础测试", "ok": is_prompt or has_passed_test, "level": "blocking"},
-        {"key": "has_eval", "label": "已有评测结果", "ok": is_prompt or last_eval_ok is not None, "level": "blocking"},
+        {"key": "has_eval", "label": "已有评测结果", "ok": is_prompt or last_eval_ok is not None, "level": "warning"},
         {"key": "permissions_configured", "label": "已配置落地权限", "ok": deploy_config_configured, "level": "blocking"},
-        {"key": "no_high_risk_connector", "label": "未绑定高风险连接器", "ok": not any(is_high_risk_connector(c) for c in allowed_connectors), "level": "warning"},
+        {"key": "high_risk_approval", "label": "高风险连接器已获管理员批准", "ok": not has_high_risk_connector or high_risk_approved, "level": "blocking"},
+        {"key": "no_high_risk_connector", "label": "未绑定高风险连接器", "ok": not has_high_risk_connector, "level": "warning"},
         {"key": "no_sensitive_data_risk", "label": "无敏感数据风险", "ok": False, "level": "warning"},
     ]
     can_publish = all(item["ok"] for item in items if item["level"] == "blocking")

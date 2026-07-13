@@ -22,7 +22,7 @@ export default function AgentApiKeyDialog({
 }) {
   const [keyInfo, setKeyInfo] = useState<ApiKey | null>(null)
   const [plaintext, setPlaintext] = useState('')
-  const [apiAccessEnabled, setApiAccessEnabled] = useState(true)
+  const [apiAccessEnabled, setApiAccessEnabled] = useState(false)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [expiresAt, setExpiresAt] = useState('')
@@ -105,7 +105,7 @@ export default function AgentApiKeyDialog({
     notice('已复制')
   }
 
-  const apiBase = window.location.origin.replace(/:\d+$/, ':3001')
+  const apiBase = window.location.origin
 
   return (
     <div className="run-drawer-mask" onClick={onClose}>
@@ -139,7 +139,7 @@ export default function AgentApiKeyDialog({
               <section className="deploy-config-section">
                 <p className="rd-empty">尚未生成 API Key</p>
                 <div className="deploy-config-actions">
-                  <button className="solid" onClick={generate} disabled={busy}>生成 API Key</button>
+                  <button className="solid" onClick={generate} disabled={busy || !apiAccessEnabled}>生成 API Key</button>
                 </div>
               </section>
             ) : (

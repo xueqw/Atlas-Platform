@@ -72,7 +72,7 @@ async def invoke_agent_endpoint(agent_id: str, payload: InvokeRequest, request: 
     result = await invoke_agent(agent, payload.input, db)
 
     if result["ok"]:
-        wf.finish_run(run_id, "succeeded", output={"answer": result["output"]})
+        wf.finish_run(run_id, "succeeded", output={"answer": result["output"], "version_no": result.get("version_no")})
     else:
         wf.finish_run(run_id, "failed", error=result.get("error") or "调用失败")
 
@@ -82,4 +82,9 @@ async def invoke_agent_endpoint(agent_id: str, payload: InvokeRequest, request: 
     if not result["ok"]:
         raise HTTPException(status_code=502, detail=result.get("error") or "调用失败")
 
-    return InvokeResponse(output=result["output"], elapsed_ms=result["elapsed_ms"])
+    return InvokeResponse(
+        output=result["output"],
+        elapsed_ms=result["elapsed_ms"],
+        version_no=result.get("version_no"),
+        run_id=run_id,
+    )

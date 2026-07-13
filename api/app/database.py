@@ -53,6 +53,14 @@ def ensure_schema():
             wcols = {row[1] for row in conn.execute(text("PRAGMA table_info(workflow_runs)"))}
             if wcols and "source" not in wcols:
                 conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN source VARCHAR(20) DEFAULT 'chat'"))
+            # 统一评测迁移：旧 agent_eval_runs 保留，补评测集、版本和摘要关联。
+            ecols = {row[1] for row in conn.execute(text("PRAGMA table_info(agent_eval_runs)"))}
+            if ecols and "suite_id" not in ecols:
+                conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN suite_id VARCHAR(36)"))
+            if ecols and "agent_version_id" not in ecols:
+                conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN agent_version_id VARCHAR(36)"))
+            if ecols and "summary_json" not in ecols:
+                conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN summary_json TEXT DEFAULT '{}'"))
     # 预置测试账号 + 内置 skill（幂等，须在建表完成后；用 ORM 会话）
     from .auth import seed_test_accounts
     from .skills_seed import seed_builtin_skills
