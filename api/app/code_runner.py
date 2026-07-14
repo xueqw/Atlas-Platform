@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,13 +18,18 @@ def run_python(project_dir: Path, timeout: int) -> subprocess.CompletedProcess[s
             cwd=str(project_dir), capture_output=True, text=True, timeout=timeout,
         )
 
+    runner_uid = os.getuid()
+    runner_gid = os.getgid()
+    if runner_uid == 0:
+        raise RuntimeError("Atlas service must not run code-agent containers as root")
+
     command = [
         "docker", "run", "--rm", "--network", "none", "--read-only",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--memory", settings.code_runner_memory, "--cpus", str(settings.code_runner_cpus),
         "--pids-limit", str(settings.code_runner_pids_limit),
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m",
-        "--user", "10001:10001",
+        "--user", f"{runner_uid}:{runner_gid}",
         "--mount", f"type=bind,src={project_dir.resolve()},dst=/workspace,readonly",
         settings.code_runner_image,
     ]
