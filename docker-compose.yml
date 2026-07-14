@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: atlas
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - atlas_postgres:/var/lib/postgresql/data
     secrets:
