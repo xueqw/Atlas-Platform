@@ -1,0 +1,4 @@
+alembic>=1.13,<2.0
+psycopg[binary]>=3.1,<4
+redis>=5,<6
+minio>=7,<8

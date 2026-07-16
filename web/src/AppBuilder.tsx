@@ -1,91 +1,33 @@
-﻿import { useState } from 'react'
-import AgentProjectChat from './AgentProjectChat'
-import AgentsList from './AgentsList'
-import AgentStudio from './AgentStudio'
 import type { Agent, KnowledgeBase } from './types'
-import type { AppDraft } from './api'
 import './webide.css'
 
-export default function AppBuilder({
-  agents,
-  knowledge,
-  refresh,
-  notice,
-  onInvokeAgent,
-}: {
+const gatewayOrigin = (import.meta.env.VITE_AGENTGATEWAY_URL || 'http://localhost:3100').replace(/\/$/, '')
+
+type Props = {
   agents: Agent[]
   knowledge: KnowledgeBase[]
   refresh: () => Promise<void> | void
   notice: (text: string) => void
   onInvokeAgent: (agent: Agent) => void
-}) {
-  const [tab, setTab] = useState<'agents' | 'project' | 'agent'>('agents')
-  const [openedDraft, setOpenedDraft] = useState<AppDraft | null>(null)
-  const [openedAgentId, setOpenedAgentId] = useState('')
+}
 
-  function openDraft(draft: AppDraft) {
-    setOpenedDraft(draft)
-    setTab('project')
-  }
-
-  function openCodeAgent(agent: Agent) {
-    openDraft({ id: agent.id, name: agent.name, status: agent.status })
-  }
-
-  function openPromptAgent(agent: Agent) {
-    setOpenedAgentId(agent.id)
-    setTab('agent')
-  }
-
+export default function AppBuilder(_props: Props) {
   return (
-    <section className="builder-page">
-      <div className="builder-tabs">
-        <button
-          type="button"
-          className={tab === 'agents' ? 'active' : ''}
-          onClick={() => setTab('agents')}
-        >
-          我的 Agents
-        </button>
-
-        <button
-          type="button"
-          className={tab === 'project' ? 'active' : ''}
-          onClick={() => setTab('project')}
-        >
-          项目对话生成
-        </button>
-      </div>
-
-      <div className="builder-content">
-        {tab === 'agents' ? (
-          <AgentsList
-            onOpenCode={openCodeAgent}
-            onOpenPrompt={openPromptAgent}
-            onInvoke={onInvokeAgent}
-            onNewProject={() => {
-              setOpenedDraft(null)
-              setTab('project')
-            }}
-            notice={notice}
-          />
-        ) : tab === 'project' ? (
-          <AgentProjectChat
-            onGoToAgentsList={() => setTab('agents')}
-            knowledgeBases={knowledge}
-            notice={notice}
-            initialDraft={openedDraft}
-          />
-        ) : tab === 'agent' ? (
-          <AgentStudio
-            agents={agents}
-            knowledge={knowledge}
-            refresh={refresh}
-            notice={notice}
-            initialAgentId={openedAgentId}
-          />
-        ) : null}
-      </div>
+    <section className="gateway-builder">
+      <header className="gateway-builder-header">
+        <div>
+          <span>APPLICATION DEVELOPMENT</span>
+          <h1>智能体开发工作台</h1>
+          <p>规划、DAG 编排、测试、评测、监控和发布统一在一个开发模块中完成。</p>
+        </div>
+        <a href={`${gatewayOrigin}/workbench`} target="_blank" rel="noreferrer">在新窗口打开</a>
+      </header>
+      <iframe
+        className="gateway-builder-frame"
+        src={`${gatewayOrigin}/workbench`}
+        title="AgentGateway 智能体开发工作台"
+        allow="clipboard-read; clipboard-write"
+      />
     </section>
   )
 }

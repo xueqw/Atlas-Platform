@@ -13,6 +13,8 @@ from .config import settings
 from .database import get_db
 from .model_gateway import embed_query
 from .models import Agent, AgentMemory, User
+from .memory_ledger import MemoryScope, explain_memory_retrieval, record_fact, tombstone_fact
+from .governance_models import SemanticFact
 from .state_store import state_store
 
 
@@ -30,6 +32,26 @@ class LongMemoryRequest(BaseModel):
     ttl_days: int | None = Field(default=None, ge=1, le=3650)
 
 
+class GovernedFactRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=240)
+    predicate: str = Field(min_length=1, max_length=160)
+    object_value: str = Field(min_length=1, max_length=4000)
+    idempotency_key: str = Field(min_length=1, max_length=160)
+    evidence: str = Field(default="", max_length=4000)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    sensitivity: str = Field(default="internal", max_length=24)
+    consent_status: str = Field(default="unknown", max_length=24)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    expires_at: datetime | None = None
+    supersedes_fact_id: str | None = Field(default=None, max_length=36)
+
+
+class GovernedFactDeleteRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=160)
+    reason: str = Field(default="", max_length=1000)
+
+
 def _agent(agent_id: str, workspace_id: str, db: Session) -> Agent:
     agent = db.scalar(select(Agent).where(Agent.id == agent_id, Agent.workspace_id == workspace_id))
     if not agent:
@@ -39,6 +61,10 @@ def _agent(agent_id: str, workspace_id: str, db: Session) -> Agent:
 
 def _short_key(workspace_id: str, user_id: str, agent_id: str, conversation_id: str) -> str:
     return f"{workspace_id}:{user_id}:{agent_id}:{conversation_id}"
+
+
+def _scope(workspace_id: str, user_id: str, agent_id: str) -> MemoryScope:
+    return MemoryScope(workspace_id=workspace_id, user_id=user_id, agent_id=agent_id)
 
 
 @router.put("/short")
@@ -80,6 +106,54 @@ async def create_long_memory(
     )
     db.add(item); db.commit(); db.refresh(item)
     return {"id": item.id, "content": item.content, "category": item.category, "expires_at": item.expires_at}
+
+
+@router.post("/facts", status_code=201)
+def create_governed_fact(
+    agent_id: str, payload: GovernedFactRequest, user: User = Depends(current_user),
+    workspace_id: str = Depends(current_workspace_id), db: Session = Depends(get_db),
+):
+    _agent(agent_id, workspace_id, db)
+    try:
+        fact, created = record_fact(
+            db, scope=_scope(workspace_id, user.id, agent_id), subject=payload.subject,
+            predicate=payload.predicate, object_value=payload.object_value,
+            idempotency_key=payload.idempotency_key, evidence=payload.evidence,
+            confidence=payload.confidence, sensitivity=payload.sensitivity,
+            consent_status=payload.consent_status, valid_from=payload.valid_from,
+            valid_to=payload.valid_to, expires_at=payload.expires_at,
+            supersedes_fact_id=payload.supersedes_fact_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, "被修正的记忆事实不存在") from exc
+    db.commit()
+    return {"id": fact.fact_id, "created": created, "transaction_from": fact.transaction_from}
+
+
+@router.get("/facts")
+def list_governed_facts(
+    agent_id: str, user: User = Depends(current_user), workspace_id: str = Depends(current_workspace_id),
+    db: Session = Depends(get_db),
+):
+    _agent(agent_id, workspace_id, db)
+    return explain_memory_retrieval(db, scope=_scope(workspace_id, user.id, agent_id))
+
+
+@router.delete("/facts/{fact_id}")
+def delete_governed_fact(
+    agent_id: str, fact_id: str, payload: GovernedFactDeleteRequest, user: User = Depends(current_user),
+    workspace_id: str = Depends(current_workspace_id), db: Session = Depends(get_db),
+):
+    _agent(agent_id, workspace_id, db)
+    try:
+        fact, created = tombstone_fact(
+            db, scope=_scope(workspace_id, user.id, agent_id), fact_id=fact_id,
+            idempotency_key=payload.idempotency_key, reason=payload.reason,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, "记忆事实不存在") from exc
+    db.commit()
+    return {"id": fact.fact_id, "tombstoned": created}
 
 
 @router.get("/long")

@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import AgentEvaluationPanel from './AgentEvaluationPanel'
 import {
   configureModelProvider,
   evaluateDraftApp,
@@ -26,7 +27,7 @@ import {
   type ManifestValidation,
   type RunPreviewResult,
 } from './api'
-import type { Connector, DeployConfig, KnowledgeBase, ModelCatalog, ModelProvider, Skill, WorkspaceMember } from './types'
+import type { Agent, Connector, DeployConfig, KnowledgeBase, ModelCatalog, ModelProvider, Skill, WorkspaceMember } from './types'
 import './product-builder.css'
 
 type FlowPage = 'develop' | 'test' | 'evaluate' | 'deploy' | 'publish'
@@ -116,6 +117,7 @@ export default function AgentProjectChat({
   ])
   const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null)
   const [evaluating, setEvaluating] = useState(false)
+  const [evaluationSuiteOpen, setEvaluationSuiteOpen] = useState(false)
   const [validation, setValidation] = useState<ManifestValidation | null>(null)
   const [deployConfig, setDeployConfig] = useState<DeployConfig>(emptyDeployConfig)
   const [savingDeploy, setSavingDeploy] = useState(false)
@@ -556,9 +558,11 @@ export default function AgentProjectChat({
   function renderEvaluate() {
     const metrics = evaluation?.summary.metrics || {}
     const failures = evaluation?.results.filter(item => !item.ok) || []
+    const releaseGate = productState?.publish_checklist.items.find(item => item.key === 'release_evaluation')
     return (
       <div className="flow-page evaluation-workspace">
-        <div className="flow-page-title row"><div><span>EVALUATE</span><h2>批量评测</h2><p>用固定评测集判断发布风险。语义指标缺少依据时会明确标记为待配置。</p></div><button type="button" className="primary" onClick={runEvaluation} disabled={!activeDraft || evaluating || !testCases.length}>{evaluating ? '评测中' : '运行全部评测'}</button></div>
+        <div className="flow-page-title row"><div><span>EVALUATE</span><h2>批量评测</h2><p>用固定评测集判断发布风险。语义指标缺少依据时会明确标记为待配置。</p></div><div className="flow-page-actions"><button type="button" onClick={() => setEvaluationSuiteOpen(true)} disabled={!activeDraft}>评测集与发布门禁</button><button type="button" className="primary" onClick={runEvaluation} disabled={!activeDraft || evaluating || !testCases.length}>{evaluating ? '评测中' : '运行全部评测'}</button></div></div>
+        <section className="deploy-band evaluation-suite-summary"><div><h3>可复用评测集</h3><p>为当前版本保存回归样例，配置关键词、JSON Schema、时延和 LLM Judge 评分。标记为发布门禁的评测集必须在当前版本通过后才能发布。</p></div><div className={releaseGate?.ok ? 'evaluation-gate-status pass' : 'evaluation-gate-status warn'}>{releaseGate ? `${releaseGate.ok ? '发布门禁已通过' : '发布门禁未通过'}：${releaseGate.label}` : '尚未配置发布评测集'}</div></section>
         <div className="test-case-table">
           {testCases.map((item, index) => (
             <div className="test-case-row" key={index}>
@@ -672,6 +676,7 @@ export default function AgentProjectChat({
         {rightView === 'code' && <div className="runtime-code-view"><div className="runtime-file-index">{files.map(file => <button className={selectedFile === file.path ? 'active' : ''} type="button" key={file.path} onClick={() => activeDraft && openFile(activeDraft.id, file.path)}>{file.path}</button>)}</div><pre>{fileContent || '选择文件查看代码'}</pre></div>}
         {rightView === 'logs' && <div className="runtime-log-view"><div className="runtime-log-status"><b>{runResult?.ok ? 'SUCCEEDED' : runResult ? 'REQUIRES ACTION' : 'IDLE'}</b><span>{runResult?.run_id || '尚无运行记录'}</span></div><pre>{runResult?.logs || '运行后显示版本、模型、资源命中、工具和耗时日志。'}</pre>{runResult?.warnings?.map(warning => <p key={warning}>{warning}</p>)}</div>}
       </aside>
+      {evaluationSuiteOpen && activeDraft && <AgentEvaluationPanel agent={productState?.agent || ({ id: activeDraft.id, name: activeDraft.name } as Agent)} onClose={() => { setEvaluationSuiteOpen(false); void refreshState(activeDraft.id) }} notice={notice} />}
     </section>
   )
 }

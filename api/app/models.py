@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
 from .database import Base
@@ -291,6 +291,81 @@ class WorkflowStep(Base):
     run: Mapped[WorkflowRun] = relationship(back_populates="steps")
 
 
+class RuntimeRun(Base):
+    """Durable boundary for one LangGraph-backed execution.
+
+    WorkflowRun stays the product projection during the migration. RuntimeRun
+    owns request idempotency, graph/checkpoint identity, and durable event order.
+    """
+    __tablename__ = "runtime_runs"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_runtime_runs_workspace_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True, index=True)
+    version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(30), default="workbench")
+    graph_template: Mapped[str] = mapped_column(String(60), default="react")
+    execution_mode: Mapped[str] = mapped_column(String(30), default="legacy")
+    graph_schema_version: Mapped[str] = mapped_column(String(40), default="atlas.agent-graph.v1")
+    thread_id: Mapped[str] = mapped_column(String(180), unique=True, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default="created", index=True)
+    input_json: Mapped[str] = mapped_column(Text, default="{}")
+    state_json: Mapped[str] = mapped_column(Text, default="{}")
+    last_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    legacy_workflow_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    events: Mapped[list["RuntimeEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan", order_by="RuntimeEvent.sequence")
+    interrupts: Mapped[list["RuntimeInterrupt"]] = relationship(back_populates="run", cascade="all, delete-orphan")
+
+
+class RuntimeEvent(Base):
+    """Immutable Atlas Runtime Event ledger, ordered only within one run."""
+    __tablename__ = "runtime_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_runtime_events_run_sequence"),
+        UniqueConstraint("run_id", "event_id", name="uq_runtime_events_run_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runtime_runs.id", ondelete="CASCADE"), index=True)
+    event_id: Mapped[str] = mapped_column(String(64), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    schema_version: Mapped[str] = mapped_column(String(40), default="atlas.runtime-event.v1")
+    type: Mapped[str] = mapped_column(String(60), index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    run: Mapped[RuntimeRun] = relationship(back_populates="events")
+
+
+class RuntimeInterrupt(Base):
+    """Persisted approval/resume request. Phase 1 stores it but denies writes."""
+    __tablename__ = "runtime_interrupts"
+    __table_args__ = (UniqueConstraint("run_id", "nonce", name="uq_runtime_interrupt_run_nonce"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runtime_runs.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    parameter_digest: Mapped[str] = mapped_column(String(128), default="")
+    resource_version: Mapped[str] = mapped_column(String(80), default="")
+    nonce: Mapped[str] = mapped_column(String(80))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    run: Mapped[RuntimeRun] = relationship(back_populates="interrupts")
+
+
 class Skill(Base):
     """Skill Hub 的 instruction 型技能（PRD M3，§8.4 简化版）。"""
     __tablename__ = "skills"
@@ -301,6 +376,16 @@ class Skill(Base):
     type: Mapped[str] = mapped_column(String(30), default="instruction")
     trigger_phrases: Mapped[str] = mapped_column(Text, default="")  # 逗号分隔，弱信号
     content: Mapped[str] = mapped_column(Text, default="")          # 注入回答步的正文
+    category_path: Mapped[str] = mapped_column(String(240), default="general")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    use_when: Mapped[str] = mapped_column(Text, default="[]")
+    do_not_use_when: Mapped[str] = mapped_column(Text, default="[]")
+    examples: Mapped[str] = mapped_column(Text, default="[]")
+    input_schema: Mapped[str] = mapped_column(Text, default="{}")
+    output_schema: Mapped[str] = mapped_column(Text, default="{}")
+    requirements: Mapped[str] = mapped_column(Text, default="[]")
+    permissions: Mapped[str] = mapped_column(Text, default="[]")
+    version: Mapped[str] = mapped_column(String(40), default="1.0.0")
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(30), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

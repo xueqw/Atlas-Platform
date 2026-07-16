@@ -22,6 +22,7 @@ from .apps import agents_router, create_version, execute_agent_runtime, next_ver
 from .api_invoke import invoke_router
 from .evaluation import router as evaluation_router
 from .memory import router as memory_router
+from .runtime_api import router as runtime_router
 from .object_storage import knowledge_object_key, object_storage
 from .state_store import state_store
 from .code_runner import runner_health
@@ -37,6 +38,7 @@ app.include_router(agents_router)
 app.include_router(invoke_router)
 app.include_router(evaluation_router)
 app.include_router(memory_router)
+app.include_router(runtime_router)
 
 @app.on_event("startup")
 def startup():
@@ -592,11 +594,11 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
     if is_web_fetch and remote_mcp.is_configured("fetcher") and "fetcher" not in enabled_connectors:
         enabled_connectors.insert(0, "fetcher")
 
-    # 本次可用 skill 池（M3）：catalog 只给 name/description/trigger 喂规划器（渐进披露），
-    # content 留到选中后再注入。手动勾选先按 catalog 过滤防脏 id / 跨租户。
+    # 本次可用 skill 池：规划器只见元数据；正文仅在权限通过且实际选中后读取。
     skill_rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
     skill_catalog = [{"id": s.id, "name": s.name, "description": s.description,
-                      "trigger_phrases": s.trigger_phrases, "content": s.content} for s in skill_rows]
+                      "summary": s.summary, "category_path": s.category_path,
+                      "trigger_phrases": s.trigger_phrases} for s in skill_rows]
 
     # 落地配置：按该 Agent 的资源权限收窄本次实际可用的连接器/Skill/知识库（允许列表为空=不限制）
     if deploy_config:
@@ -661,8 +663,35 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 skill_catalog=skill_catalog,
             )
             # M3：手动勾选 ∪ 自动选取，覆写为解析后的对象数组随 plan_json 落库
-            from .skills_engine import build_skill_instructions, resolve_skills
-            selected_skills = resolve_skills(skill_catalog, manual_skill_ids, plan.get("skills", []))
+            from .skill_router import load_selected_skill_content, route_skills
+            # The planner proposes candidates; the deterministic router is the
+            # policy gate and emits the auditable no-selection/selection record.
+            rows_by_skill_id = {row.id: row for row in skill_rows}
+            router_catalog = [
+                {
+                    **skill,
+                    "use_when": json.loads(rows_by_skill_id[skill["id"]].use_when or "[]"),
+                    "do_not_use_when": json.loads(rows_by_skill_id[skill["id"]].do_not_use_when or "[]"),
+                }
+                for skill in skill_catalog
+            ]
+            proposed_ids = set(plan.get("skills", []))
+            router_audit = route_skills(
+                router_catalog, query=payload.content,
+                permitted_ids=[skill["id"] for skill in skill_catalog], manual_ids=manual_skill_ids,
+                # A model proposal is retained as a vector-stage signal; lexical
+                # scoring remains deterministic and negative scenarios can veto it.
+                vector_scores={skill_id: 1.0 if skill_id in proposed_ids else 0.0 for skill_id in proposed_ids},
+            )
+            selected_ids = router_audit["selected_ids"]
+            selection_sources = router_audit["selection_sources"]
+            selected_skills = load_selected_skill_content(
+                [{"id": row.id, "name": row.name, "content": row.content} for row in skill_rows], selected_ids
+            )
+            for selected in selected_skills:
+                selected["source"] = selection_sources[selected["id"]]
+            from .skills_engine import build_skill_instructions
+            plan["skill_router"] = router_audit
             plan["skills"] = selected_skills
             # M4：MCP Strategy Agent——确定性工具策略，落进 plan_json 供审计
             tool_policy = build_tool_policy(tool_specs, write_names, connector_of, plan.get("requires_tools", False))
@@ -853,9 +882,42 @@ def list_skills(ws: str = Depends(current_workspace_id), db: Session = Depends(g
     return db.scalars(select(Skill).where(Skill.workspace_id == ws).order_by(Skill.builtin.desc(), Skill.created_at)).all()
 
 
+@app.get("/api/skills/discovery")
+def discover_skills(category: str | None = None, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    """Metadata-only Skill discovery; no unselected instruction body crosses this boundary."""
+    from .skill_router import build_category_tree, discover_skill_metadata
+    rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
+    catalog = [
+        {
+            "id": row.id, "name": row.name, "category_path": row.category_path,
+            "summary": row.summary or row.description,
+            "use_when": json.loads(row.use_when or "[]"),
+            "do_not_use_when": json.loads(row.do_not_use_when or "[]"),
+            "examples": json.loads(row.examples or "[]"),
+            "input_schema": json.loads(row.input_schema or "{}"),
+            "output_schema": json.loads(row.output_schema or "{}"),
+            "requirements": json.loads(row.requirements or "[]"),
+            "permissions": json.loads(row.permissions or "[]"),
+            "version": row.version, "status": row.status,
+        }
+        for row in rows
+    ]
+    return {"tree": build_category_tree(catalog), "skills": discover_skill_metadata(catalog, category_prefix=category)}
+
+
+def _skill_payload(data: dict) -> dict:
+    """Persist Skill discovery collections as JSON while the public create schema stays ergonomic."""
+    from .skill_router import validate_category_path
+    validate_category_path(data.get("category_path", "general"))
+    for key in ("use_when", "do_not_use_when", "examples", "input_schema", "output_schema", "requirements", "permissions"):
+        if key in data and not isinstance(data[key], str):
+            data[key] = json.dumps(data[key], ensure_ascii=False)
+    return data
+
+
 @app.post("/api/skills", response_model=SkillOut, status_code=201)
 def create_skill(payload: SkillCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
-    skill = Skill(workspace_id=ws, type="instruction", builtin=False, **payload.model_dump())
+    skill = Skill(workspace_id=ws, type="instruction", builtin=False, **_skill_payload(payload.model_dump()))
     db.add(skill); db.commit(); db.refresh(skill)
     return skill
 
@@ -877,7 +939,7 @@ def update_skill(skill_id: str, payload: SkillUpdate, ws: str = Depends(current_
     skill = _get_owned_skill(skill_id, ws, db)
     if skill.builtin:
         raise HTTPException(403, "内置技能只读")
-    for k, v in payload.model_dump().items():
+    for k, v in _skill_payload(payload.model_dump()).items():
         setattr(skill, k, v)
     db.commit(); db.refresh(skill)
     return skill

@@ -2,11 +2,13 @@ import { FormEvent, useEffect, useState } from 'react'
 import {
   createEvaluationCase,
   createEvaluationSuite,
+  compareEvaluationRuns,
   deleteEvaluationCase,
+  listEvaluationRuns,
   listEvaluationSuites,
   runEvaluationSuite,
 } from './api'
-import type { Agent, EvaluationRunV2, EvaluationSuite } from './types'
+import type { Agent, EvaluationRunComparison, EvaluationRunHistory, EvaluationRunV2, EvaluationSuite } from './types'
 
 export default function AgentEvaluationPanel({ agent, onClose, notice }: {
   agent: Agent
@@ -16,12 +18,18 @@ export default function AgentEvaluationPanel({ agent, onClose, notice }: {
   const [suites, setSuites] = useState<EvaluationSuite[]>([])
   const [selected, setSelected] = useState('')
   const [run, setRun] = useState<EvaluationRunV2 | null>(null)
+  const [runs, setRuns] = useState<EvaluationRunHistory[]>([])
+  const [baselineRunId, setBaselineRunId] = useState('')
+  const [candidateRunId, setCandidateRunId] = useState('')
+  const [comparison, setComparison] = useState<EvaluationRunComparison | null>(null)
   const [busy, setBusy] = useState(false)
   const active = suites.find(suite => suite.id === (selected || suites[0]?.id))
+  const suiteRuns = runs.filter(item => item.suite_id === active?.id)
 
   async function reload() {
-    const items = await listEvaluationSuites(agent.id)
+    const [items, history] = await Promise.all([listEvaluationSuites(agent.id), listEvaluationRuns(agent.id)])
     setSuites(items)
+    setRuns(history)
     if (!selected && items[0]) setSelected(items[0].id)
   }
 
@@ -70,11 +78,22 @@ export default function AgentEvaluationPanel({ agent, onClose, notice }: {
     try {
       const result = await runEvaluationSuite(agent.id, active.id)
       setRun(result)
+      await reload()
       notice(`评测完成：${result.summary.passed}/${result.summary.total}`)
     } catch (error) {
       notice(error instanceof Error ? error.message : '评测失败')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function compareRuns() {
+    if (!baselineRunId || !candidateRunId) return notice('请选择两次评测运行')
+    if (baselineRunId === candidateRunId) return notice('请选择不同的运行记录')
+    try {
+      setComparison(await compareEvaluationRuns(agent.id, baselineRunId, candidateRunId))
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '评测对比失败')
     }
   }
 
@@ -85,7 +104,7 @@ export default function AgentEvaluationPanel({ agent, onClose, notice }: {
         <section className="deploy-config-section">
           <h4>评测集</h4>
           <div className="deploy-visibility-options">
-            {suites.map(suite => <button key={suite.id} className={active?.id === suite.id ? 'solid' : ''} onClick={() => { setSelected(suite.id); setRun(null) }}>{suite.name}</button>)}
+            {suites.map(suite => <button key={suite.id} className={active?.id === suite.id ? 'solid' : ''} onClick={() => { setSelected(suite.id); setRun(null); setComparison(null); setBaselineRunId(''); setCandidateRunId('') }}>{suite.name}</button>)}
             <button onClick={addSuite}>＋ 新建</button>
           </div>
           {active && <p>通过阈值 {Math.round(active.pass_threshold * 100)}% · {active.is_release_gate ? '阻断发布' : '仅观察'}</p>}
@@ -122,6 +141,25 @@ export default function AgentEvaluationPanel({ agent, onClose, notice }: {
             <p>{result.output || result.error}</p>
             {result.scores.map(score => <div key={score.dimension}>{score.passed ? '✓' : '✗'} {score.dimension}：{score.reason}</div>)}
           </details>)}
+        </section>}
+        {active && <section className="deploy-config-section">
+          <h4>运行历史<small>{suiteRuns.length} 次</small></h4>
+          {!suiteRuns.length && <p>运行评测后会保存当前版本、得分和逐样例结果。</p>}
+          {suiteRuns.map(item => <button className="evaluation-run-history" type="button" key={item.id} onClick={() => setRun(item)}>
+            <span>{item.ok ? '通过' : '未通过'} · {Math.round(item.summary.pass_rate * 100)}%</span>
+            <small>{item.agent_version_id ? `版本 ${item.agent_version_id.slice(0, 8)}` : '未绑定版本'} · {new Date(item.created_at).toLocaleString()}</small>
+          </button>)}
+          {suiteRuns.length >= 2 && <div className="evaluation-compare-controls">
+            <select value={baselineRunId} onChange={event => setBaselineRunId(event.target.value)}><option value="">基线运行</option>{suiteRuns.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {Math.round(item.summary.pass_rate * 100)}%</option>)}</select>
+            <select value={candidateRunId} onChange={event => setCandidateRunId(event.target.value)}><option value="">对比运行</option>{suiteRuns.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {Math.round(item.summary.pass_rate * 100)}%</option>)}</select>
+            <button type="button" onClick={compareRuns}>比较</button>
+          </div>}
+          {comparison && <div className="evaluation-comparison-result">
+            <b>通过率 {comparison.deltas.pass_rate == null ? '无变化数据' : `${comparison.deltas.pass_rate >= 0 ? '+' : ''}${Math.round(comparison.deltas.pass_rate * 100)}%`}</b>
+            <span>平均耗时 {comparison.deltas.average_latency_ms == null ? '无数据' : `${comparison.deltas.average_latency_ms >= 0 ? '+' : ''}${Math.round(comparison.deltas.average_latency_ms)} ms`}</span>
+            <p>{comparison.regressions.length ? `退化：${comparison.regressions.map(item => item.name).join('、')}` : '没有发现退化样例'}</p>
+            <p>{comparison.improvements.length ? `改进：${comparison.improvements.map(item => item.name).join('、')}` : '没有新增通过样例'}</p>
+          </div>}
         </section>}
       </div>
     </aside>

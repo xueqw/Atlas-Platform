@@ -72,6 +72,14 @@ class Settings(BaseSettings):
 
     app_port: int = 8000
 
+    # LangGraph runtime migration. Disabled by default so legacy production
+    # paths remain the rollback target until the runtime acceptance gates pass.
+    langgraph_runtime_enabled: bool = False
+    langgraph_shadow_mode: bool = False
+    langgraph_runtime_legacy_fallback: bool = False
+    langgraph_checkpoint_database_url: str = ""
+    langgraph_checkpoint_database_password_file: str = ""
+
     # Docker/systemd secrets can be mounted as files instead of appearing in
     # process definitions. A non-empty *_FILE value takes precedence.
     openai_api_key_file: str = ""
@@ -89,9 +97,10 @@ class Settings(BaseSettings):
         for url_name, password_file in (
             ("database_url", self.database_password_file),
             ("redis_url", self.redis_password_file),
+            ("langgraph_checkpoint_database_url", self.langgraph_checkpoint_database_password_file),
         ):
             if password_file:
-                password = Path(password_file).read_text(encoding="utf-8").strip()
+                password = self._secret_path(password_file).read_text(encoding="utf-8").strip()
                 setattr(self, url_name, getattr(self, url_name).replace("{password}", quote(password, safe="")))
         for name in (
             "openai_api_key", "zhipu_api_key", "siliconflow_api_key",
@@ -99,7 +108,12 @@ class Settings(BaseSettings):
         ):
             path = getattr(self, f"{name}_file", "")
             if path:
-                setattr(self, name, Path(path).read_text(encoding="utf-8").strip())
+                setattr(self, name, self._secret_path(path).read_text(encoding="utf-8").strip())
+
+    @staticmethod
+    def _secret_path(value: str) -> Path:
+        path = Path(value)
+        return path if path.is_absolute() else (_ENV_FILE.parent / path).resolve()
 
 
 settings = Settings()

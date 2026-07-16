@@ -1,0 +1,134 @@
+# docker-compose.dev.yml — DeerFlow / agentgateway 开发拓扑（Batch C, task 4.8）
+#
+# 七服务：frontend(3000) / backend(8000) / worker / postgres / redis / minio /
+# mem0。端口约定不变（前端 3000、后端 8000）。这是 dev 形态：bind-mount 源码、
+# 不做生产加固。环境变量从 backend/.env 注入（DATABASE_URL / REDIS_URL / S3_* /
+# MEM0_* 等），ENABLE_* 控制是否真正接入。
+#
+# 启动：docker compose -f docker-compose.dev.yml up
+# 仅校验：docker compose -f docker-compose.dev.yml config
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-agentgateway}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the four logical buckets, then exit.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb -p local/${S3_BUCKET_ATTACHMENTS:-planner-attachments} &&
+      mc mb -p local/${S3_BUCKET_ARTIFACTS:-agent-artifacts} &&
+      mc mb -p local/${S3_BUCKET_KNOWLEDGE:-knowledge-assets} &&
+      mc mb -p local/${S3_BUCKET_EVALUATION:-evaluation-reports} &&
+      echo 'buckets ready'
+      "
+
+  # Semantic memory body store (pgvector-backed). Optional — only consulted when
+  # MEMORY_PROVIDER=mem0 / ENABLE_MEM0=true.
+  mem0:
+    image: mem0/mem0:latest
+    ports:
+      - "8888:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+    command: python -m app.worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    command: npm run dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      BACKEND_ORIGIN: http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
+  minio_data:
+

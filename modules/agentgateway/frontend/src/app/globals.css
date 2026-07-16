@@ -1,0 +1,204 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* AgentGateway workbench design system — semantic layer on top of shadcn.
+     Maps the ink / surface / line / status tokens (defined in :root and .dark)
+     to color utilities so Tailwind v4 generates text, bg and border classes. */
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-surface: var(--surface);
+  --color-paper: var(--paper);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-status-idle: var(--status-idle);
+  --color-status-active: var(--status-active);
+  --color-status-running: var(--status-running);
+  --color-status-connected: var(--status-connected);
+  --color-status-reconnecting: var(--status-reconnecting);
+  --color-status-stale: var(--status-stale);
+  --color-status-degraded: var(--status-degraded);
+  --color-status-passed: var(--status-passed);
+  --color-status-failed: var(--status-failed);
+  --color-status-draft: var(--status-draft);
+  --color-status-published: var(--status-published);
+}
+
+:root {
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+
+  /* --- AgentGateway semantic layer (light) --- */
+  /* Information hierarchy: three ink weights + two surface depths + two line weights. */
+  --ink: oklch(0.205 0 0);        /* primary text — strongest */
+  --ink-soft: oklch(0.45 0 0);    /* secondary text */
+  --ink-faint: oklch(0.62 0 0);   /* tertiary / hints */
+  --surface: oklch(0.985 0 0);    /* raised surface above paper */
+  --paper: oklch(0.97 0 0);       /* recessed background */
+  --line: oklch(0.9 0 0);         /* default border */
+  --line-soft: oklch(0.945 0 0);  /* subtle divider */
+  /* Status semantics — workbench lifecycle states. */
+  --status-idle: oklch(0.62 0 0);                /* neutral grey */
+  --status-active: oklch(0.55 0.18 264);         /* indigo */
+  --status-running: oklch(0.68 0.15 75);         /* amber */
+  --status-connected: oklch(0.6 0.16 150);       /* green */
+  --status-reconnecting: oklch(0.68 0.15 75);    /* amber */
+  --status-stale: oklch(0.62 0 0);               /* grey */
+  --status-degraded: oklch(0.62 0.17 45);        /* orange */
+  --status-passed: oklch(0.6 0.16 150);          /* green */
+  --status-failed: oklch(0.577 0.245 27.325);    /* red (matches destructive hue) */
+  --status-draft: oklch(0.62 0 0);               /* grey */
+  --status-published: oklch(0.55 0.18 264);      /* indigo */
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+
+  /* --- AgentGateway semantic layer (dark) --- */
+  --ink: oklch(0.985 0 0);        /* primary text */
+  --ink-soft: oklch(0.78 0 0);    /* secondary text */
+  --ink-faint: oklch(0.62 0 0);   /* tertiary / hints */
+  --surface: oklch(0.205 0 0);    /* raised surface */
+  --paper: oklch(0.17 0 0);       /* recessed background */
+  --line: oklch(1 0 0 / 12%);     /* default border */
+  --line-soft: oklch(1 0 0 / 7%); /* subtle divider */
+  /* Status semantics (lifted for contrast on dark). */
+  --status-idle: oklch(0.7 0 0);
+  --status-active: oklch(0.7 0.16 264);
+  --status-running: oklch(0.78 0.14 75);
+  --status-connected: oklch(0.72 0.15 150);
+  --status-reconnecting: oklch(0.78 0.14 75);
+  --status-stale: oklch(0.7 0 0);
+  --status-degraded: oklch(0.72 0.16 45);
+  --status-passed: oklch(0.72 0.15 150);
+  --status-failed: oklch(0.704 0.191 22.216);
+  --status-draft: oklch(0.7 0 0);
+  --status-published: oklch(0.7 0.16 264);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* The workbench is commonly embedded in a wide desktop platform shell.
+   A slightly larger root scale keeps controls and dense planning surfaces
+   comfortably readable without changing the compact mobile experience. */
+@media (min-width: 1024px) {
+  html {
+    font-size: 18px;
+  }
+}

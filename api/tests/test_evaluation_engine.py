@@ -1,8 +1,8 @@
 import asyncio
 import json
 
-from app.evaluation import score_execution, score_execution_with_judge
-from app.models import EvaluationCase
+from app.evaluation import compare_run_payloads, score_execution, score_execution_with_judge
+from app.models import AgentEvalRun, EvaluationCase
 
 
 def test_deterministic_scorers_cover_text_keywords_schema_and_latency():
@@ -22,6 +22,32 @@ def test_deterministic_scorers_cover_text_keywords_schema_and_latency():
     ok, scores = score_execution(case, execution)
     assert ok is True
     assert {item["dimension"] for item in scores} == {"runtime", "contains", "keywords", "json_schema", "latency"}
+
+
+def test_evaluation_run_comparison_surfaces_regressions_and_improvements():
+    baseline = AgentEvalRun(
+        id="baseline", agent_id="agent", kind="suite", suite_id="suite", ok=True,
+        summary_json=json.dumps({"pass_rate": 1.0}),
+        results_json=json.dumps([
+            {"case_id": "stable", "name": "Stable", "ok": True, "elapsed_ms": 100},
+            {"case_id": "improved", "name": "Improved", "ok": False, "elapsed_ms": 200},
+        ]),
+    )
+    candidate = AgentEvalRun(
+        id="candidate", agent_id="agent", kind="suite", suite_id="suite", ok=False,
+        summary_json=json.dumps({"pass_rate": 0.5}),
+        results_json=json.dumps([
+            {"case_id": "stable", "name": "Stable", "ok": False, "elapsed_ms": 150},
+            {"case_id": "improved", "name": "Improved", "ok": True, "elapsed_ms": 50},
+        ]),
+    )
+
+    comparison = compare_run_payloads(baseline, candidate)
+
+    assert comparison["deltas"]["pass_rate"] == -0.5
+    assert comparison["deltas"]["average_latency_ms"] == -50.0
+    assert comparison["regressions"] == [{"case_id": "stable", "name": "Stable", "is_key": False}]
+    assert comparison["improvements"] == [{"case_id": "improved", "name": "Improved", "is_key": False}]
 
 
 def test_evaluation_suite_crud(auth_client):

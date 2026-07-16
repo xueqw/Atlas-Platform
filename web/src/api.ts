@@ -12,6 +12,8 @@ import type {
   Conversation,
   DeployConfig,
   EvaluationRunV2,
+  EvaluationRunComparison,
+  EvaluationRunHistory,
   EvaluationSuite,
   KnowledgeBase,
   Me,
@@ -22,11 +24,16 @@ import type {
   Skill,
   Source,
   WorkflowRun,
+  RuntimeRunHandle,
+  RuntimeRunState,
   WorkspaceMember,
+  GovernedMemory,
+  SkillDiscovery,
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const apiUrl = (path: string) => `${API_BASE}${path}`
+export const runtimeEventStreamUrl = (runId: string, cursor: number) => apiUrl(`/api/runtime/runs/${encodeURIComponent(runId)}/events/stream?after_sequence=${cursor}`)
 
 async function errorDetail(response: Response, fallback: string) {
   try {
@@ -56,6 +63,15 @@ export const createConversation = () =>
   json<Conversation>('/api/conversations', { method: 'POST', body: JSON.stringify({ title: '新任务' }) })
 export const getConversation = (id: string) => json<Conversation>(`/api/conversations/${id}`)
 export const listRuns = (id: string) => json<WorkflowRun[]>(`/api/conversations/${id}/runs`)
+export const startRuntimeRun = (payload: { agent_id: string; input: string; idempotency_key: string; conversation_id?: string; source?: 'workbench' | 'builder' | 'subagent' | 'chat' | 'preview' | 'api' | 'evaluation' }) =>
+  json<RuntimeRunHandle>('/api/runtime/runs', { method: 'POST', body: JSON.stringify({ ...payload, source: payload.source || 'workbench' }) })
+export const getRuntimeRun = (runId: string) => json<RuntimeRunState>(`/api/runtime/runs/${runId}`)
+export const discoverSkills = () => json<SkillDiscovery>('/api/skills/discovery')
+export const listGovernedMemories = (agentId: string) => json<GovernedMemory>(`/api/agents/${agentId}/memory/facts`)
+export const createGovernedMemory = (agentId: string, payload: { subject: string; predicate: string; object_value: string; evidence?: string }) =>
+  json<{ id: string; created: boolean }>(`/api/agents/${agentId}/memory/facts`, { method: 'POST', body: JSON.stringify({ ...payload, idempotency_key: crypto.randomUUID() }) })
+export const deleteGovernedMemory = (agentId: string, factId: string) =>
+  json<{ id: string; tombstoned: boolean }>(`/api/agents/${agentId}/memory/facts/${factId}`, { method: 'DELETE', body: JSON.stringify({ idempotency_key: crypto.randomUUID(), reason: 'manual_workspace_delete' }) })
 export const listKnowledgeBases = () => json<KnowledgeBase[]>('/api/knowledge-bases')
 export const createKnowledgeBase = (name: string, description: string) =>
   json<KnowledgeBase>('/api/knowledge-bases', { method: 'POST', body: JSON.stringify({ name, description }) })
@@ -425,6 +441,9 @@ export const createEvaluationSuite = (agentId: string, payload: {name:string;des
 export const createEvaluationCase = (agentId: string, suiteId: string, payload: {name:string;input_text:string;expected_text?:string;scorers?:Record<string,unknown>;is_key?:boolean}) => json(`/api/agents/${agentId}/evaluation-suites/${suiteId}/cases`, {method:'POST',body:JSON.stringify(payload)})
 export const deleteEvaluationCase = (agentId: string, suiteId: string, caseId: string) => json<{ok:boolean}>(`/api/agents/${agentId}/evaluation-suites/${suiteId}/cases/${caseId}`, {method:'DELETE'})
 export const runEvaluationSuite = (agentId: string, suiteId: string) => json<EvaluationRunV2>(`/api/agents/${agentId}/evaluation-suites/${suiteId}/run`, {method:'POST'})
+export const listEvaluationRuns = (agentId: string) => json<EvaluationRunHistory[]>(`/api/agents/${agentId}/evaluation-runs`)
+export const compareEvaluationRuns = (agentId: string, baselineRunId: string, candidateRunId: string) =>
+  json<EvaluationRunComparison>(`/api/agents/${agentId}/evaluation-runs/compare`, {method:'POST', body: JSON.stringify({baseline_run_id: baselineRunId, candidate_run_id: candidateRunId})})
 
 export const listAgentVersions = (agentId: string) =>
   json<AgentVersion[]>(`/api/agents/${agentId}/versions`)

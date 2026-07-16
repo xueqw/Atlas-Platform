@@ -3,6 +3,7 @@ api/data/
 **/__pycache__/
 *.py[cod]
 api/.env
+api/.venv-runtime/
 .env
 secrets/
 /atlas-deploy-*.tar.gz
@@ -11,6 +12,18 @@ web/node_modules/
 web/dist/
 web/.vite/
 web/*.tsbuildinfo
+modules/agentgateway/backend/.venv/
+modules/agentgateway/backend/data/
+modules/agentgateway/backend/.pytest_cache/
+modules/agentgateway/backend/*.db
+modules/agentgateway/backend/*.log
+modules/agentgateway/backend/**/__pycache__/
+modules/agentgateway/backend/*.py[cod]
+modules/agentgateway/backend/*.egg-info/
+modules/agentgateway/frontend/node_modules/
+modules/agentgateway/frontend/.next/
+modules/agentgateway/frontend/.env.local
+modules/agentgateway/frontend/*.tsbuildinfo
 .api.pid
 .web.pid
 .server.pid

@@ -1,0 +1,48 @@
+[project]
+name = "agent-factory-backend"
+version = "0.1.0"
+description = "Agent Factory backend API with AgentScope 2.0 runtime"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.0.0",
+    "sqlmodel>=0.0.22",
+    "aiosqlite>=0.20.0",
+    "python-multipart>=0.0.12",
+    "websockets>=13.0",
+    "agentscope>=1.0.0",
+    "pyyaml>=6.0",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+    "langfuse>=2.50.0",
+    "alembic>=1.13,<2.0",
+    "psycopg[binary]>=3.1,<4",
+    "redis>=5,<6",
+    "minio>=7,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+    "fakeredis>=2,<3",
+]
+# Ragas-backed semantic scorers (answer_relevancy / answer_correctness) are
+# optional: the four core scorers (keyword/schema/rule/judge) never import
+# ragas, and the ragas scorer degrades gracefully when this extra is absent.
+ragas = [
+    "ragas>=0.1.0",
+    "datasets>=2.14.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

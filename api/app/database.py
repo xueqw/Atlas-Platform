@@ -25,6 +25,10 @@ def ensure_schema():
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
+    # Governed memory is deliberately additive while legacy AgentMemory remains
+    # available during the migration window.
+    from .governance_models import GovernanceBase
+    GovernanceBase.metadata.create_all(engine)
     if engine.dialect.name == "sqlite":
         with engine.begin() as conn:
             cols = {row[1] for row in conn.execute(text("PRAGMA table_info(document_chunks)"))}
@@ -59,6 +63,23 @@ def ensure_schema():
             wcols = {row[1] for row in conn.execute(text("PRAGMA table_info(workflow_runs)"))}
             if wcols and "source" not in wcols:
                 conn.execute(text("ALTER TABLE workflow_runs ADD COLUMN source VARCHAR(20) DEFAULT 'chat'"))
+            # Skill discovery migration: legacy rows get conservative metadata defaults.
+            scols = {row[1] for row in conn.execute(text("PRAGMA table_info(skills)"))}
+            skill_columns = {
+                "category_path": "VARCHAR(240) DEFAULT 'general'",
+                "summary": "TEXT DEFAULT ''",
+                "use_when": "TEXT DEFAULT '[]'",
+                "do_not_use_when": "TEXT DEFAULT '[]'",
+                "examples": "TEXT DEFAULT '[]'",
+                "input_schema": "TEXT DEFAULT '{}'",
+                "output_schema": "TEXT DEFAULT '{}'",
+                "requirements": "TEXT DEFAULT '[]'",
+                "permissions": "TEXT DEFAULT '[]'",
+                "version": "VARCHAR(40) DEFAULT '1.0.0'",
+            }
+            for name, ddl in skill_columns.items():
+                if scols and name not in scols:
+                    conn.execute(text(f"ALTER TABLE skills ADD COLUMN {name} {ddl}"))
             # 统一评测迁移：旧 agent_eval_runs 保留，补评测集、版本和摘要关联。
             ecols = {row[1] for row in conn.execute(text("PRAGMA table_info(agent_eval_runs)"))}
             if ecols and "suite_id" not in ecols:
@@ -67,6 +88,9 @@ def ensure_schema():
                 conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN agent_version_id VARCHAR(36)"))
             if ecols and "summary_json" not in ecols:
                 conn.execute(text("ALTER TABLE agent_eval_runs ADD COLUMN summary_json TEXT DEFAULT '{}'"))
+            rcols = {row[1] for row in conn.execute(text("PRAGMA table_info(runtime_runs)"))}
+            if rcols and "execution_mode" not in rcols:
+                conn.execute(text("ALTER TABLE runtime_runs ADD COLUMN execution_mode VARCHAR(30) DEFAULT 'legacy'"))
     _encrypt_legacy_connector_secrets()
     # 预置测试账号 + 内置 skill（幂等，须在建表完成后；用 ORM 会话）
     from .auth import seed_test_accounts

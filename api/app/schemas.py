@@ -326,6 +326,53 @@ class WorkflowRunOut(BaseModel):
     steps: list[WorkflowStepOut] = []
 
 
+class RuntimeStartRequest(BaseModel):
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    source: str = Field(default="workbench", max_length=30)
+    version_selector: str = Field(default="published", max_length=30)
+    version_id: str | None = None
+    input: dict = Field(default_factory=dict)
+    requested_resources: dict = Field(default_factory=dict)
+    idempotency_key: str = Field(min_length=8, max_length=120)
+
+
+class RuntimeResumeRequest(BaseModel):
+    interrupt_id: str
+    command: dict = Field(default_factory=dict)
+
+
+class RuntimeEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    event_id: str
+    run_id: str
+    sequence: int
+    schema_version: str
+    type: str
+    payload: dict
+    time: datetime
+
+
+class RuntimeRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    workspace_id: str
+    user_id: str
+    agent_id: str | None = None
+    conversation_id: str | None = None
+    version_id: str | None = None
+    source: str
+    graph_template: str
+    graph_schema_version: str
+    thread_id: str
+    status: str
+    last_sequence: int
+    error: str = ""
+    created_at: datetime
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
 # === Skill Hub（M3） ===
 
 class SkillCreate(BaseModel):
@@ -333,6 +380,16 @@ class SkillCreate(BaseModel):
     description: str = Field(default="", max_length=2000)
     content: str = Field(default="", max_length=12000)
     trigger_phrases: str = Field(default="", max_length=1000)
+    category_path: str = Field(default="general", max_length=240)
+    summary: str = Field(default="", max_length=2000)
+    use_when: list[str] = []
+    do_not_use_when: list[str] = []
+    examples: list[str] = []
+    input_schema: dict = {}
+    output_schema: dict = {}
+    requirements: list[str] = []
+    permissions: list[str] = []
+    version: str = Field(default="1.0.0", max_length=40)
 
 
 class SkillUpdate(SkillCreate):
@@ -349,5 +406,15 @@ class SkillOut(BaseModel):
     content: str
     builtin: bool
     status: str
+    category_path: str = "general"
+    summary: str = ""
+    use_when: str = "[]"
+    do_not_use_when: str = "[]"
+    examples: str = "[]"
+    input_schema: str = "{}"
+    output_schema: str = "{}"
+    requirements: str = "[]"
+    permissions: str = "[]"
+    version: str = "1.0.0"
     created_at: datetime
     updated_at: datetime

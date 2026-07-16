@@ -32,6 +32,11 @@ class CaseCreate(BaseModel):
     sort_order: int = 0
 
 
+class RunCompareRequest(BaseModel):
+    baseline_run_id: str
+    candidate_run_id: str
+
+
 def _agent(agent_id: str, workspace_id: str, db: Session) -> Agent:
     agent = db.scalar(select(Agent).where(Agent.id == agent_id, Agent.workspace_id == workspace_id))
     if not agent:
@@ -61,6 +66,62 @@ def suite_payload(suite: EvaluationSuite, db: Session, include_cases: bool = Tru
             "is_key": c.is_key, "sort_order": c.sort_order,
         } for c in cases]
     return data
+
+
+def run_payload(run: AgentEvalRun) -> dict:
+    try:
+        summary = json.loads(run.summary_json or "{}")
+    except json.JSONDecodeError:
+        summary = {}
+    try:
+        results = json.loads(run.results_json or "[]")
+    except json.JSONDecodeError:
+        results = []
+    return {
+        "id": run.id,
+        "suite_id": run.suite_id,
+        "agent_version_id": run.agent_version_id,
+        "ok": run.ok,
+        "summary": summary,
+        "results": results,
+        "created_at": run.created_at,
+    }
+
+
+def _average_latency(results: list[dict]) -> float | None:
+    values = [float(item.get("elapsed_ms") or 0) for item in results if item.get("elapsed_ms") is not None]
+    return round(sum(values) / len(values), 1) if values else None
+
+
+def _delta(candidate: float | None, baseline: float | None) -> float | None:
+    return round(candidate - baseline, 4) if candidate is not None and baseline is not None else None
+
+
+def compare_run_payloads(baseline: AgentEvalRun, candidate: AgentEvalRun) -> dict:
+    before, after = run_payload(baseline), run_payload(candidate)
+    baseline_cases = {str(item.get("case_id")): item for item in before["results"]}
+    candidate_cases = {str(item.get("case_id")): item for item in after["results"]}
+    regressions, improvements = [], []
+
+    for case_id, previous in baseline_cases.items():
+        current = candidate_cases.get(case_id)
+        if not current:
+            continue
+        if previous.get("ok") and not current.get("ok"):
+            regressions.append({"case_id": case_id, "name": previous.get("name", "未命名样例"), "is_key": bool(previous.get("is_key"))})
+        elif not previous.get("ok") and current.get("ok"):
+            improvements.append({"case_id": case_id, "name": current.get("name", "未命名样例"), "is_key": bool(current.get("is_key"))})
+
+    return {
+        "baseline": {key: before[key] for key in ("id", "agent_version_id", "ok", "summary", "created_at")},
+        "candidate": {key: after[key] for key in ("id", "agent_version_id", "ok", "summary", "created_at")},
+        "deltas": {
+            "pass_rate": _delta(after["summary"].get("pass_rate"), before["summary"].get("pass_rate")),
+            "average_latency_ms": _delta(_average_latency(after["results"]), _average_latency(before["results"])),
+        },
+        "regressions": regressions,
+        "improvements": improvements,
+    }
 
 
 def score_execution(case: EvaluationCase, execution: dict) -> tuple[bool, list[dict]]:
@@ -228,8 +289,16 @@ async def run_suite(agent_id: str, suite_id: str, workspace_id: str = Depends(cu
 def list_runs(agent_id: str, workspace_id: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
     _agent(agent_id, workspace_id, db)
     runs = db.scalars(select(AgentEvalRun).where(AgentEvalRun.agent_id == agent_id, AgentEvalRun.kind == "suite").order_by(AgentEvalRun.created_at.desc())).all()
-    return [{
-        "id": r.id, "suite_id": r.suite_id, "agent_version_id": r.agent_version_id,
-        "ok": r.ok, "summary": json.loads(r.summary_json or "{}"),
-        "results": json.loads(r.results_json or "[]"), "created_at": r.created_at,
-    } for r in runs]
+    return [run_payload(run) for run in runs]
+
+
+@router.post("/{agent_id}/evaluation-runs/compare")
+def compare_runs(agent_id: str, payload: RunCompareRequest, workspace_id: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    _agent(agent_id, workspace_id, db)
+    baseline = db.scalar(select(AgentEvalRun).where(AgentEvalRun.id == payload.baseline_run_id, AgentEvalRun.agent_id == agent_id, AgentEvalRun.kind == "suite"))
+    candidate = db.scalar(select(AgentEvalRun).where(AgentEvalRun.id == payload.candidate_run_id, AgentEvalRun.agent_id == agent_id, AgentEvalRun.kind == "suite"))
+    if not baseline or not candidate:
+        raise HTTPException(status_code=404, detail="评测运行不存在")
+    if baseline.suite_id != candidate.suite_id:
+        raise HTTPException(status_code=400, detail="只能比较同一评测集的运行记录")
+    return compare_run_payloads(baseline, candidate)

@@ -94,7 +94,7 @@ def test_docker_runner_has_security_limits(tmp_path, monkeypatch):
     assert "--read-only" in command
     assert ["--cap-drop", "ALL"] == command[command.index("--cap-drop"):command.index("--cap-drop") + 2]
     assert "no-new-privileges" in command
-    assert command[command.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+    assert command[command.index("--user") + 1] == f"{getattr(os, 'getuid', lambda: 1000)()}:{getattr(os, 'getgid', lambda: 1000)()}"
     assert command[command.index("--mount") + 1].endswith("readonly")
 
 
