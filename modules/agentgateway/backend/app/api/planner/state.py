@@ -14,8 +14,10 @@ is byte-for-byte the previous ``_planner_conversations`` dict. The live
 serialisable and must never leave the process.
 """
 
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 import json
+import re
 from fastapi import WebSocket
 
 from app.core import redis_client
@@ -428,20 +430,294 @@ _MEMORY_MERGEABLE_FIELDS = frozenset(
 )
 
 
-def _merge_memory_update(memory: dict, update: dict) -> dict:
-    """Tolerantly merge a parsed <memory_update> into ``memory`` in place (D4).
+_PIVOT_MARKERS = (
+    "改成", "改为", "换成", "调整为", "转为", "不再做", "重新做", "重新设计",
+    "change to", "switch to", "instead", "pivot to", "no longer",
+)
+
+_DOMAIN_TERMS = {
+    "stock": ("股票", "选股", "证券", "行情", "量化", "投资组合"),
+    "customer_service": ("客服", "售后", "工单", "客户服务", "呼叫中心"),
+    "policy_news": ("时政", "政策", "新闻", "舆情"),
+    "knowledge_rag": ("rag", "知识库", "知识问答", "检索增强"),
+    "sales": ("销售", "crm", "商机", "线索"),
+    "coding": ("代码", "编程", "软件开发", "代码审查"),
+}
+
+_NON_SUBSTANTIVE_USER_TEXT = {
+    "好", "好的", "可以", "确认", "继续", "请继续", "没问题", "ok", "yes",
+}
+
+_AUDIT_LIMIT = 100
+
+
+def _utc_iso(value: Any = None) -> str:
+    """Return an ISO-8601 UTC timestamp suitable for bitemporal metadata."""
+    if isinstance(value, datetime):
+        current = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            current = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            current = datetime.now(timezone.utc)
+    else:
+        current = datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_substantive_user_text(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) < 4 or text.casefold() in _NON_SUBSTANTIVE_USER_TEXT:
+        return False
+    # A2UI acknowledgement strings are evidence of a decision, not a new goal.
+    if text.startswith("已选择「") or text.startswith("已选择\""):
+        return False
+    return True
+
+
+def _ensure_goal_anchor(
+    memory: dict,
+    messages: Optional[List[dict]] = None,
+    *,
+    user_request: str = "",
+    conversation_id: str = "",
+    transaction_time: Any = None,
+) -> Optional[dict]:
+    """Lazily create the immutable goal anchor from user-authored evidence.
+
+    ``valid_time`` records when the fact became true in the user's timeline;
+    ``transaction_time`` records when Atlas materialized it. Existing anchors
+    are never silently rewritten, so a later pivot remains a governed delta
+    with its own audit evidence rather than history destruction.
+    """
+    if not isinstance(memory, dict):
+        return None
+    existing = memory.get("goal_anchor")
+    if isinstance(existing, dict) and str(existing.get("text") or "").strip():
+        return existing
+
+    source_text = ""
+    source: dict[str, Any] = {}
+    valid_from: Any = None
+
+    if _is_substantive_user_text(user_request):
+        source_text = re.sub(r"\s+", " ", str(user_request)).strip()
+        source = {"kind": "planner_session.user_request"}
+
+    for index, message in enumerate(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not _is_substantive_user_text(content):
+            continue
+        # Prefer the earliest transcript message because it has the strongest
+        # source reference and valid-time evidence.
+        source_text = re.sub(r"\s+", " ", str(content)).strip()
+        source = {
+            "kind": "planner_message",
+            "message_index": index,
+        }
+        message_id = message.get("id")
+        if message_id not in (None, ""):
+            source["message_id"] = message_id
+        valid_from = message.get("created_at") or message.get("timestamp")
+        break
+
+    if not source_text:
+        return None
+    if conversation_id:
+        source["conversation_id"] = conversation_id
+    recorded_at = _utc_iso(transaction_time)
+    anchor = {
+        "text": source_text[:2000],
+        "source": source,
+        "valid_time": {"from": _utc_iso(valid_from or transaction_time), "to": None},
+        "transaction_time": {"recorded_at": recorded_at},
+    }
+    memory["goal_anchor"] = anchor
+    return anchor
+
+
+def _normalized_key(value: Any) -> str:
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).casefold()
+        except (TypeError, ValueError):
+            return str(value).strip().casefold()
+    if isinstance(value, list):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).casefold()
+        except (TypeError, ValueError):
+            return str(value).strip().casefold()
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _merge_additive(existing: Any, candidates: list) -> list:
+    """Union list candidates without deleting supported prior facts."""
+    output: list = []
+    seen: set[str] = set()
+    for value in list(existing) if isinstance(existing, list) else []:
+        key = _normalized_key(value)
+        if key and key not in seen:
+            output.append(value)
+            seen.add(key)
+    for value in candidates:
+        key = _normalized_key(value)
+        if key and key not in seen:
+            output.append(value)
+            seen.add(key)
+    return output
+
+
+def _domain_tags(value: str) -> set[str]:
+    lowered = str(value or "").casefold()
+    return {
+        domain
+        for domain, terms in _DOMAIN_TERMS.items()
+        if any(term.casefold() in lowered for term in terms)
+    }
+
+
+def _concept_tokens(value: str) -> set[str]:
+    lowered = str(value or "").casefold()
+    words = set(re.findall(r"[a-z0-9]{3,}", lowered))
+    cjk_runs = re.findall(r"[\u3400-\u9fff]+", lowered)
+    bigrams = {
+        run[index:index + 2]
+        for run in cjk_runs
+        for index in range(max(0, len(run) - 1))
+    }
+    return words | bigrams
+
+
+def _is_explicit_pivot(recent_user_text: str) -> bool:
+    lowered = str(recent_user_text or "").casefold()
+    return any(marker in lowered for marker in _PIVOT_MARKERS)
+
+
+def _candidate_matches_user_evidence(candidate: str, recent_user_text: str) -> bool:
+    candidate_domains = _domain_tags(candidate)
+    recent_domains = _domain_tags(recent_user_text)
+    if candidate_domains and recent_domains:
+        return not candidate_domains.isdisjoint(recent_domains)
+    candidate_tokens = _concept_tokens(candidate)
+    recent_tokens = _concept_tokens(recent_user_text)
+    return bool(candidate_tokens and candidate_tokens.intersection(recent_tokens))
+
+
+def _summary_is_supported(anchor_text: str, current: str, candidate: str, recent_user_text: str) -> bool:
+    """Conservative lexical/domain check; explicit pivots are handled first."""
+    baseline = current or anchor_text
+    # Backward-compatible initialization for callers/tests with no user evidence
+    # yet. Production planner turns establish the anchor before model deltas.
+    if not baseline:
+        return True
+    base_domains = _domain_tags(anchor_text) | _domain_tags(baseline)
+    candidate_domains = _domain_tags(candidate)
+    recent_domains = _domain_tags(recent_user_text)
+    if base_domains and candidate_domains and base_domains.isdisjoint(candidate_domains):
+        return False
+    if candidate_domains and recent_domains and not candidate_domains.isdisjoint(recent_domains):
+        return True
+    base_tokens = _concept_tokens(f"{anchor_text} {baseline}")
+    candidate_tokens = _concept_tokens(candidate)
+    if base_tokens and candidate_tokens and base_tokens.intersection(candidate_tokens):
+        return True
+    # Unknown domains are not permission to replace the goal. A candidate must
+    # still be grounded in either the anchor/current view or this user turn.
+    # This fails closed for model-only drift outside the small domain lexicon.
+    return _candidate_matches_user_evidence(candidate, recent_user_text)
+
+
+def _audit_excerpt(value: Any) -> str:
+    """Bounded, redacted audit detail; never retain credentials."""
+    def redact(item: Any) -> Any:
+        if isinstance(item, dict):
+            output = {}
+            for key, child in item.items():
+                normalized = re.sub(r"[^a-z]", "", str(key).casefold())
+                output[key] = (
+                    "[REDACTED]"
+                    if normalized in {"apikey", "token", "secret", "password", "accesstoken"}
+                    else redact(child)
+                )
+            return output
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        return item
+
+    safe_value = redact(value)
+    raw = safe_value if isinstance(safe_value, str) else _normalized_key(safe_value)
+    text = str(raw or "")
+    text = re.sub(
+        r"""(?i)(["']?(?:api[_-]?key|token|secret|password)["']?\s*[:=]\s*)["']?[^"',;\s}]+""",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"\b(?:sk|ak)-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer [REDACTED]", text)
+    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[REDACTED_PHONE]", text)
+    text = re.sub(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "[REDACTED_EMAIL]",
+        text,
+    )
+    return text[:240]
+
+
+def _record_memory_audit(
+    memory: dict,
+    *,
+    field: str,
+    candidate: Any,
+    decision: str,
+    reason: str,
+    source_turn: Any,
+    transaction_time: Any,
+) -> None:
+    audit = memory.setdefault("memory_update_audit", [])
+    if not isinstance(audit, list):
+        audit = []
+        memory["memory_update_audit"] = audit
+    audit.append({
+        "field": field,
+        "candidate_summary": _audit_excerpt(candidate),
+        "decision": decision,
+        "reason": reason,
+        "source_turn": source_turn,
+        "transaction_time": _utc_iso(transaction_time),
+    })
+    if len(audit) > _AUDIT_LIMIT:
+        del audit[:-_AUDIT_LIMIT]
+
+
+def _merge_memory_update(
+    memory: dict,
+    update: dict,
+    *,
+    recent_user_text: str = "",
+    source_turn: Any = None,
+    has_validated_proposal: bool = False,
+    transaction_time: Any = None,
+) -> dict:
+    """Validate and materialize a model-authored memory candidate in place.
 
     - Only known richer-state fields merge; unknown keys are ignored.
     - Missing fields keep their old value (only produced keys are iterated).
     - Empty / falsy values count as "not produced this turn" and keep the old
       value, so a partial update never wipes accumulated state.
-    - Light type-guarding: list fields take lists, strategy/readiness take
-      dicts, string fields are coerced to str. A malformed individual field is
-      skipped rather than raising — one bad field must not drop the whole turn.
+    - List views are additive and normalized/de-duplicated.
+    - Goal replacement requires anchor continuity or explicit recent user pivot.
+    - Readiness cannot transition to ready without a validated proposal.
+    - Every accepted/rejected candidate is appended to the bounded audit view.
     Returns the same ``memory`` dict for convenience.
     """
     if not isinstance(update, dict):
         return memory
+    anchor = memory.get("goal_anchor")
+    anchor_text = str(anchor.get("text") or "") if isinstance(anchor, dict) else ""
     for k, v in update.items():
         if k not in _MEMORY_MERGEABLE_FIELDS:
             continue
@@ -449,19 +725,88 @@ def _merge_memory_update(memory: dict, update: dict) -> dict:
             if k in _MEMORY_STRATEGY_FIELDS:
                 if isinstance(v, dict) and v:
                     memory[k] = v
+                    _record_memory_audit(
+                        memory, field=k, candidate=v, decision="accepted",
+                        reason="valid_strategy_candidate", source_turn=source_turn,
+                        transaction_time=transaction_time,
+                    )
             elif k == "apply_readiness":
                 if isinstance(v, dict) and v:
+                    requested_status = str(v.get("status") or "not_ready")
+                    if requested_status == "ready" and not has_validated_proposal:
+                        current = memory.get("apply_readiness")
+                        if not isinstance(current, dict) or current.get("status") == "ready":
+                            current = _default_apply_readiness()
+                        else:
+                            current = dict(current)
+                        current["status"] = "not_ready"
+                        missing = current.get("missing")
+                        if not isinstance(missing, list):
+                            missing = []
+                        if "validated_proposal" not in missing:
+                            missing.append("validated_proposal")
+                        current["missing"] = missing
+                        memory[k] = current
+                        _record_memory_audit(
+                            memory, field=k, candidate=v, decision="rejected",
+                            reason="validated_proposal_required", source_turn=source_turn,
+                            transaction_time=transaction_time,
+                        )
+                        continue
                     merged = _default_apply_readiness()
                     merged.update(v)
                     memory[k] = merged
+                    _record_memory_audit(
+                        memory, field=k, candidate=v, decision="accepted",
+                        reason="validated_proposal_present" if requested_status == "ready" else "not_ready_transition",
+                        source_turn=source_turn, transaction_time=transaction_time,
+                    )
             elif k in _MEMORY_STR_FIELDS:
                 if isinstance(v, str) and v.strip():
-                    memory[k] = v
+                    candidate = v.strip()
+                    if k == "requirement_summary":
+                        current = str(memory.get(k) or "")
+                        explicit_pivot = (
+                            _is_explicit_pivot(recent_user_text)
+                            and _candidate_matches_user_evidence(candidate, recent_user_text)
+                        )
+                        if explicit_pivot or _summary_is_supported(
+                            anchor_text, current, candidate, recent_user_text
+                        ):
+                            memory[k] = candidate
+                            _record_memory_audit(
+                                memory, field=k, candidate=candidate, decision="accepted",
+                                reason="explicit_user_pivot" if explicit_pivot else "anchor_continuity",
+                                source_turn=source_turn, transaction_time=transaction_time,
+                            )
+                        else:
+                            _record_memory_audit(
+                                memory, field=k, candidate=candidate, decision="rejected",
+                                reason="conflicts_with_goal_anchor_without_user_evidence",
+                                source_turn=source_turn, transaction_time=transaction_time,
+                            )
+                    else:
+                        memory[k] = candidate
+                        _record_memory_audit(
+                            memory, field=k, candidate=candidate, decision="accepted",
+                            reason="valid_string_candidate", source_turn=source_turn,
+                            transaction_time=transaction_time,
+                        )
                 elif v not in (None, "", [], {}) and not isinstance(v, (list, dict)):
                     memory[k] = str(v)
+                    _record_memory_audit(
+                        memory, field=k, candidate=v, decision="accepted",
+                        reason="coerced_scalar_candidate", source_turn=source_turn,
+                        transaction_time=transaction_time,
+                    )
             else:  # list fields
                 if isinstance(v, list) and v:
-                    memory[k] = v
+                    memory[k] = _merge_additive(memory.get(k), v)
+                    _record_memory_audit(
+                        memory, field=k, candidate=v, decision="accepted",
+                        reason="additive_deduplicated_merge", source_turn=source_turn,
+                        transaction_time=transaction_time,
+                    )
         except Exception:
             continue
     return memory
@@ -480,6 +825,14 @@ def _new_memory() -> dict:
     for k in _MEMORY_STRATEGY_FIELDS:
         mem[k] = {}
     mem["apply_readiness"] = _default_apply_readiness()
+    # Planner-local ledger/views/policy metadata. Additive and JSON-native so
+    # Redis and planning_state_json can persist it without a schema migration.
+    mem["goal_anchor"] = {}
+    mem["memory_update_audit"] = []
+    # Durable hand-off between an A2UI decision and the one planner turn that
+    # continues from it.  The record remains after consumption so a replayed
+    # continuation token can be acknowledged without running the model twice.
+    mem["pending_continuation"] = {}
     return mem
 
 

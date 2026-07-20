@@ -16,3 +16,7 @@ The system SHALL retain valid-time and transaction-time ranges, evidence, confid
 
 ### Requirement: Memory lifecycle safety
 The system SHALL treat retrieved memory as untrusted context, support explainable retrieval, checkpoint session/working state durably, and require evaluation plus approval before any procedural candidate is published.
+
+#### Scenario: Procedural candidate awaits governance
+- **WHEN** repeated successful trajectories produce a procedural-memory or Skill candidate
+- **THEN** the candidate SHALL remain unavailable to runtime selection until redaction, evaluation, and explicit approval succeed

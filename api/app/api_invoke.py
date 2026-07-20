@@ -17,6 +17,7 @@ from .deploy_policy import parse_deploy_config
 from .models import Agent, AgentApiKey, WorkflowRun
 from .schemas import InvokeRequest, InvokeResponse
 from . import workflow as wf
+from .config import settings
 
 invoke_router = APIRouter(prefix="/api/agents", tags=["invoke"])
 
@@ -68,13 +69,21 @@ async def invoke_agent_endpoint(agent_id: str, payload: InvokeRequest, request: 
         if used_today >= key.daily_quota:
             raise HTTPException(status_code=429, detail="今日调用额度已用完")
 
-    run_id = wf.create_run(None, agent.id, None, agent.workspace_id, payload.input, source="api")
+    # With the unified runtime enabled, its durable projection owns the product
+    # WorkflowRun. Creating a second legacy run here would double-count quota
+    # and split the audit trail.
+    run_id = None if settings.langgraph_runtime_enabled else wf.create_run(
+        None, agent.id, None, agent.workspace_id, payload.input, source="api"
+    )
     result = await invoke_agent(agent, payload.input, db)
 
-    if result["ok"]:
-        wf.finish_run(run_id, "succeeded", output={"answer": result["output"], "version_no": result.get("version_no")})
+    if run_id is not None:
+        if result["ok"]:
+            wf.finish_run(run_id, "succeeded", output={"answer": result["output"], "version_no": result.get("version_no")})
+        else:
+            wf.finish_run(run_id, "failed", error=result.get("error") or "调用失败")
     else:
-        wf.finish_run(run_id, "failed", error=result.get("error") or "调用失败")
+        run_id = result.get("run_id")
 
     key.last_used_at = now
     db.commit()

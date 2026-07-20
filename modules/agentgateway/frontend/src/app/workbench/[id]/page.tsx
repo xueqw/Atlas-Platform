@@ -27,6 +27,7 @@ import EvaluationSuitePanel from "@/components/workbench/EvaluationSuitePanel";
 import { createChatSocket } from "@/lib/ws";
 import { ArrowLeft, Save, Eye, Play, Sparkles, Columns2, Layout, ClipboardCheck } from "lucide-react";
 import type { PromptVersion, OptimizeResult } from "@/lib/types";
+import { useAtlasRuntimeExecution } from "@/lib/atlas-runtime";
 
 export default function AgentEditorPage() {
   const params = useParams();
@@ -61,6 +62,35 @@ export default function AgentEditorPage() {
   const [socketRef, setSocketRef] = useState<ReturnType<typeof createChatSocket> | null>(null);
   const testMsgIdRef = useRef(0);
   const testStreamingRef = useRef("");
+  const atlasRuntime = useAtlasRuntimeExecution(agentId, {
+    onEvent: (event) => {
+      if (event.type === "token.delta" || event.type === "response.token") {
+        const token = typeof event.payload.token === "string" ? event.payload.token : typeof event.payload.content === "string" ? event.payload.content : "";
+        testStreamingRef.current += token;
+        setStreamingContent(testStreamingRef.current);
+        setThinking(false);
+      } else if (event.type === "run.completed") {
+        const content = typeof event.payload.output === "string" ? event.payload.output : testStreamingRef.current;
+        testStreamingRef.current = "";
+        setStreamingContent("");
+        setThinking(false);
+        setTestMessages((messages) => [
+          ...messages,
+          { id: nextTestId(), conversation_id: 0, role: "assistant", content, created_at: new Date().toISOString() },
+        ]);
+      } else if (event.type === "run.failed") {
+        setThinking(false);
+        toast.error(String(event.payload.message || event.payload.error || "Atlas Runtime 执行失败"));
+      } else if (event.type === "run.cancelled") {
+        setThinking(false);
+        toast.info("Atlas Runtime 运行已取消");
+      }
+    },
+    onError: (message) => {
+      setThinking(false);
+      toast.error(message);
+    },
+  });
   const [dagMode, setDagMode] = useState(false);
   const [dagGraphJson, setDagGraphJson] = useState<string>("{}");
   const [namePromptOpen, setNamePromptOpen] = useState(false);
@@ -182,6 +212,9 @@ export default function AgentEditorPage() {
   const estimatedCostPerTurn = selectedModelData
     ? ((selectedModelData.input_price_per_1k * (4000 / 1000)) + (selectedModelData.output_price_per_1k * (model.max_tokens / 1000))).toFixed(4)
     : "0.00";
+  const workbenchRootHref = atlasRuntime.binding
+    ? `/workbench?atlas_agent_id=${encodeURIComponent(atlasRuntime.binding.agentId)}${atlasRuntime.binding.versionId ? `&atlas_agent_version_id=${encodeURIComponent(atlasRuntime.binding.versionId)}` : ""}`
+    : "/workbench";
 
   const startTestChat = () => {
     socketRef?.disconnect();
@@ -189,6 +222,11 @@ export default function AgentEditorPage() {
     setTestMessages([]);
     setStreamingContent("");
     testStreamingRef.current = "";
+    if (atlasRuntime.embedded) {
+      setWsStatus(atlasRuntime.mappingError ? "disconnected" : "connected");
+      if (atlasRuntime.mappingError) toast.error(atlasRuntime.mappingError);
+      return;
+    }
     const socket = createChatSocket(agentId);
     socket.onMessage((data) => {
       if (data.type === "thinking") {
@@ -223,7 +261,12 @@ export default function AgentEditorPage() {
       ...prev,
       { id: nextTestId(), conversation_id: 0, role: "user", content, created_at: new Date().toISOString() },
     ]);
-    socketRef?.send(content);
+    if (atlasRuntime.embedded) {
+      setThinking(true);
+      if (!atlasRuntime.start(content, [`agentgateway:agent:${agentId}`, "agentgateway:test-chat"])) setThinking(false);
+    } else {
+      socketRef?.send(content);
+    }
   };
 
   if (loading) {
@@ -237,7 +280,7 @@ export default function AgentEditorPage() {
     <div className="flex-1 flex flex-col h-full">
       {/* Header */}
       <div className="flex items-center gap-4 p-4 border-b shrink-0">
-        <Button variant="ghost" size="icon" onClick={() => router.push("/workbench")}>
+        <Button variant="ghost" size="icon" onClick={() => router.push(workbenchRootHref)}>
           <ArrowLeft className="w-4 h-4" />
         </Button>
         <Input
@@ -399,7 +442,7 @@ export default function AgentEditorPage() {
                 <h3 className="text-sm font-medium">测试会话</h3>
                 <div className="flex items-center gap-2">
                   <Badge variant={wsStatus === "connected" ? "default" : "destructive"} className="text-xs">
-                    {wsStatus === "connected" ? "已连接" : wsStatus === "reconnecting" ? "重连中..." : "已断开"}
+                    {atlasRuntime.embedded && wsStatus === "connected" ? "Atlas Runtime" : wsStatus === "connected" ? "已连接" : wsStatus === "reconnecting" ? "重连中..." : "已断开"}
                   </Badge>
                   <Button variant="ghost" size="sm" onClick={() => {
                     socketRef?.disconnect();
@@ -409,8 +452,20 @@ export default function AgentEditorPage() {
                   }}>关闭</Button>
                 </div>
               </div>
+              {atlasRuntime.pendingInterrupt && (
+                <div className="border-b border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                  <p className="mb-2 font-medium">工具写操作等待授权</p>
+                  <div className="flex gap-2">
+                    <Button size="sm" onClick={() => atlasRuntime.resolveInterrupt("approve")}>授权并继续</Button>
+                    <Button size="sm" variant="destructive" onClick={() => atlasRuntime.resolveInterrupt("deny")}>拒绝</Button>
+                  </div>
+                </div>
+              )}
               <ChatMessages messages={testMessages} streamingContent={streamingContent} thinking={thinking} />
-              <ChatInput onSend={sendTestMessage} disabled={wsStatus !== "connected"} />
+              {atlasRuntime.running && (
+                <Button type="button" variant="outline" size="sm" className="m-2" onClick={atlasRuntime.cancel}>取消运行</Button>
+              )}
+              <ChatInput onSend={sendTestMessage} disabled={wsStatus !== "connected" || atlasRuntime.running || Boolean(atlasRuntime.pendingInterrupt)} />
             </div>
           )}
 

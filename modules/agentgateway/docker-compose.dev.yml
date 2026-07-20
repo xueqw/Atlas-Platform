@@ -85,7 +85,8 @@ services:
       context: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
     ports:
       - "8000:8000"
     volumes:
@@ -103,7 +104,8 @@ services:
       context: ./backend
     command: python -m app.worker
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
     volumes:
       - ./backend:/app
     depends_on:
@@ -131,4 +133,3 @@ services:
 volumes:
   pg_data:
   minio_data:
-

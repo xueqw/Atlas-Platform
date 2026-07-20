@@ -81,6 +81,10 @@ class ModelRegistryResponse(BaseModel):
     supports_streaming: bool = True
     supports_vision: bool = False
     is_available: bool = True
+    # A catalog entry can be enabled while its provider credentials are still
+    # absent. Keep that distinction explicit so the UI never presents a model
+    # name as proof that it can already be called.
+    configured: bool = False
 
 
 class ConversationResponse(BaseModel):

@@ -42,8 +42,10 @@ class ObjectStorage:
             client = self._minio()
             if not client.bucket_exists(settings.object_storage_bucket):
                 client.make_bucket(settings.object_storage_bucket)
-        else:
+        elif self.backend == "local":
             self.root.mkdir(parents=True, exist_ok=True)
+        else:
+            raise RuntimeError(f"Unsupported object storage backend: {self.backend}")
 
     def put(self, key: str, payload: bytes, content_type: str = "application/octet-stream") -> None:
         self.ensure_ready()

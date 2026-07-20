@@ -9,6 +9,7 @@ than the process-local test repositories.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hmac
 import json
 from typing import Callable
 import uuid
@@ -18,11 +19,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .models import RuntimeEvent as DbRuntimeEvent
+from .models import RuntimeInterrupt as DbRuntimeInterrupt
 from .models import RuntimeRun as DbRuntimeRun
-from .runtime_contract import RuntimeAccessDenied, RuntimeEvent, RuntimeStartRequest, RuntimeStatus, RuntimeTransition
+from .runtime_contract import (
+    RuntimeAccessDenied,
+    RuntimeEvent,
+    RuntimeInterruptCreate,
+    RuntimeInterruptRecord,
+    RuntimeResumeRequest,
+    RuntimeStartRequest,
+    RuntimeStatus,
+    RuntimeTransition,
+)
 from .runtime_events import RuntimeEventRepository
 from .runtime_graph import AtlasAgentState
-from .runtime_service import RuntimeRunRecord, RuntimeRunRepository
+from .runtime_projection import ensure_workflow_run, project_runtime_event
+from .runtime_service import RuntimeInterruptRepository, RuntimeRunRecord, RuntimeRunRepository
 
 
 def _request_json(request: RuntimeStartRequest) -> str:
@@ -48,7 +60,11 @@ class SqlAlchemyRuntimeRunRepository(RuntimeRunRepository):
                 return self._record(existing), False
 
             run_id = str(uuid.uuid4())
-            state = AtlasAgentState.initial(request.make_identity(run_id), request.input)
+            state = AtlasAgentState.initial(
+                request.make_identity(run_id), request.input,
+                requested_execution_strategy=request.execution_strategy.value,
+                requested_resources=request.requested_resources,
+            )
             row = DbRuntimeRun(
                 id=run_id,
                 workspace_id=request.workspace_id,
@@ -68,6 +84,8 @@ class SqlAlchemyRuntimeRunRepository(RuntimeRunRepository):
             )
             db.add(row)
             try:
+                db.flush()
+                ensure_workflow_run(db, row, request)
                 db.commit()
             except IntegrityError:
                 # A concurrent start won the unique idempotency key. Return its
@@ -105,6 +123,8 @@ class SqlAlchemyRuntimeRunRepository(RuntimeRunRepository):
             row.state_json = record.state.model_dump_json()
             row.status = record.state.status.value
             row.execution_mode = record.execution_mode
+            if record.state.execution_strategy:
+                row.graph_template = record.state.execution_strategy
             row.error = json.dumps(record.state.errors[-1], ensure_ascii=False) if record.state.errors else ""
             if record.state.status in {RuntimeStatus.SUCCEEDED, RuntimeStatus.FAILED, RuntimeStatus.CANCELLED}:
                 row.ended_at = datetime.now(timezone.utc)
@@ -150,6 +170,15 @@ class SqlAlchemyRuntimeEventRepository(RuntimeEventRepository):
                 created_at=created_at,
             )
             db.add(row)
+            db.flush()
+            project_runtime_event(
+                db,
+                runtime_run=run,
+                event_type=row.type,
+                sequence=row.sequence,
+                payload=transition.payload,
+                timestamp=created_at,
+            )
             db.commit()
             return RuntimeEvent(
                 event_id=row.event_id,
@@ -184,3 +213,114 @@ class SqlAlchemyRuntimeEventRepository(RuntimeEventRepository):
                 type=row.type,
                 payload=json.loads(row.payload_json),
             ) for row in rows)
+
+
+class SqlAlchemyRuntimeInterruptRepository(RuntimeInterruptRepository):
+    """Atomic, tenant-scoped interrupt decisions with nonce anti-replay."""
+
+    def __init__(self, session_factory: Callable[[], Session]) -> None:
+        self._session_factory = session_factory
+
+    def create(self, request: RuntimeInterruptCreate) -> RuntimeInterruptRecord:
+        now = datetime.now(timezone.utc)
+        if request.expires_at <= now:
+            raise ValueError("interrupt expiry must be in the future")
+        with self._session_factory() as db:
+            run = db.scalar(select(DbRuntimeRun).where(
+                DbRuntimeRun.id == request.run_id,
+                DbRuntimeRun.workspace_id == request.workspace_id,
+                DbRuntimeRun.user_id == request.user_id,
+            ))
+            if run is None:
+                raise RuntimeAccessDenied()
+            row = DbRuntimeInterrupt(
+                id=str(uuid.uuid4()),
+                run_id=request.run_id,
+                workspace_id=request.workspace_id,
+                user_id=request.user_id,
+                status="pending",
+                payload_json=json.dumps(
+                    {"scope": list(request.scope), "payload": request.payload},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                parameter_digest=request.parameter_digest,
+                resource_version=request.resource_version,
+                nonce=request.nonce,
+                expires_at=request.expires_at,
+            )
+            db.add(row)
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise ValueError("interrupt nonce was already used for this run") from exc
+            db.refresh(row)
+            return self._record(row)
+
+    def resolve(self, request: RuntimeResumeRequest) -> RuntimeInterruptRecord:
+        if request.interrupt_id is None:
+            raise ValueError("interrupt_id is required")
+        with self._session_factory() as db:
+            row = db.scalar(select(DbRuntimeInterrupt).where(
+                DbRuntimeInterrupt.id == request.interrupt_id,
+                DbRuntimeInterrupt.run_id == request.run_id,
+                DbRuntimeInterrupt.workspace_id == request.workspace_id,
+                DbRuntimeInterrupt.user_id == request.user_id,
+            ).with_for_update())
+            if row is None:
+                raise RuntimeAccessDenied()
+            now = datetime.now(timezone.utc)
+            if row.status != "pending":
+                raise ValueError("interrupt decision was already consumed")
+            expires_at = row.expires_at
+            if expires_at is None or _aware(expires_at) <= now:
+                row.status = "expired"
+                row.resolved_at = now
+                db.commit()
+                raise ValueError("interrupt decision has expired")
+            if not (
+                hmac.compare_digest(row.nonce, request.nonce or "")
+                and hmac.compare_digest(row.parameter_digest, request.parameter_digest or "")
+                and hmac.compare_digest(row.resource_version, request.resource_version or "")
+            ):
+                raise RuntimeAccessDenied()
+            row.status = "approved" if request.decision == "approve" else "denied"
+            row.resolved_at = now
+            db.commit()
+            db.refresh(row)
+            return self._record(row)
+
+    def get_by_nonce(
+        self, *, run_id: str, workspace_id: str, user_id: str, nonce: str,
+    ) -> RuntimeInterruptRecord | None:
+        with self._session_factory() as db:
+            row = db.scalar(select(DbRuntimeInterrupt).where(
+                DbRuntimeInterrupt.run_id == run_id,
+                DbRuntimeInterrupt.workspace_id == workspace_id,
+                DbRuntimeInterrupt.user_id == user_id,
+                DbRuntimeInterrupt.nonce == nonce,
+            ))
+            return self._record(row) if row is not None else None
+
+    @staticmethod
+    def _record(row: DbRuntimeInterrupt) -> RuntimeInterruptRecord:
+        data = json.loads(row.payload_json or "{}")
+        return RuntimeInterruptRecord(
+            interrupt_id=row.id,
+            run_id=row.run_id,
+            workspace_id=row.workspace_id,
+            user_id=row.user_id,
+            status=row.status,
+            parameter_digest=row.parameter_digest,
+            resource_version=row.resource_version,
+            scope=tuple(data.get("scope") or ()),
+            nonce=row.nonce,
+            expires_at=_aware(row.expires_at),
+            payload=data.get("payload") or {},
+            resolved_at=_aware(row.resolved_at) if row.resolved_at else None,
+        )
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)

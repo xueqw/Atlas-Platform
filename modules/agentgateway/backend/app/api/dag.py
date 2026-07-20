@@ -36,7 +36,7 @@ async def debug_node(agent_id: int, payload: DebugNodeRequest):
     try:
         instance = node_cls(config=payload.config)
         t_start = time.time()
-        output = await instance.run(payload.inputs, {})
+        output = await instance.run(payload.inputs, {"_isolated_debug": True})
         elapsed_ms = round((time.time() - t_start) * 1000)
         return {
             "node_id": payload.node_id,

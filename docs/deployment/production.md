@@ -69,27 +69,90 @@ sudo systemctl is-active atlas nginx docker
 
 健康响应中的 `database`、`redis`、`object_storage`、`code_runner` 必须全部为 `true`。功能验收包括登录、知识上传与检索、Agent 短期/长期记忆隔离、代码超时终止、预览无法读取父页面、发布版本和 API Key 调用。
 
+自适应执行必须独立灰度，不能因部署自动开启：
+
+```dotenv
+LANGGRAPH_RUNTIME_ENABLED=false
+ADAPTIVE_RUNTIME_ENABLED=false
+LANGGRAPH_RUNTIME_LEGACY_FALLBACK=false
+```
+
+先在测试 workspace 验证 PostgreSQL Checkpointer、父/子 RuntimeRun、并行 Worker、
+独立 Reviewer、五类 verdict、事件游标和取消/恢复，再依次开启 LangGraph 与
+Adaptive。回滚时先关闭 `ADAPTIVE_RUNTIME_ENABLED`，保留已写入的 Plan/Review
+状态和事件；副作用开始后的运行不得切换模板或 legacy 重放。
+
 ## 6. 备份与恢复
 
-每日以 root 运行：
+生产备份只包含 PostgreSQL 权威数据、MinIO bucket 对象、Agent code 和非敏感
+Compose 配置。PostgreSQL 使用 custom logical dump，并在发布备份前执行
+`pg_restore --list`；MinIO 必须通过 S3 对象 API (`mc mirror`) 导出，不能复制
+运行中的 `/data` 私有卷。Redis 是可重建的 TTL/热状态层，**永不进入备份**。
+
+每日以 root 运行（也可由具备 Docker 与 Agent code 读取权限的专用备份账号运行）：
 
 ```bash
-BACKUP_ROOT=/var/backups/atlas BACKUP_RETENTION_DAYS=14 /opt/atlas/scripts/backup.sh
+sudo env \
+  ATLAS_COMPOSE_PROJECT=atlas-production \
+  BACKUP_ROOT=/var/backups/atlas \
+  BACKUP_RETENTION_DAYS=14 \
+  MINIO_ROOT_USER=atlas \
+  MINIO_ROOT_PASSWORD_FILE=/etc/atlas/secrets/minio_root_password \
+  /opt/atlas/scripts/backup.sh
 ```
 
-先只校验，不覆盖数据：
+脚本先写同一文件系统中的隐藏临时目录，全部完成后再原子重命名。可用备份目录
+必须同时包含 `manifest.json`、`SHA256SUMS`、`minio-index.tsv` 和与目录 ID 一致的
+`COMPLETE`；未完成目录不会被恢复或被 retention 当作历史备份删除。默认保留 14
+天，retention 只删除命名、完成标记均符合生产 backup schema 的过期目录。
+
+PostgreSQL、MinIO 与 Agent code 之间不存在分布式快照事务。正式每日调度必须先让
+Atlas 进入只读/排空写入的一致性窗口，等待在途 Runtime 与对象上传结束后再执行
+`backup.sh`，完成后恢复写流量；调度系统应记录窗口开始、备份 ID 和完成状态。若
+业务 SLA 不允许短暂只读，应在上线前补充应用级维护锁或版本水位协议，不能把三个
+存储各自成功误认为跨存储强一致快照。
+
+恢复命令默认仅执行严格校验，不写任何服务。它会校验 schema、路径、SHA-256、
+MinIO 逐对象内容索引、Agent code archive 和 PostgreSQL custom dump 列表：
 
 ```bash
-/opt/atlas/scripts/restore.sh /var/backups/atlas/<timestamp>
+sudo env \
+  ATLAS_COMPOSE_PROJECT=atlas-production \
+  BACKUP_ROOT=/var/backups/atlas \
+  MINIO_ROOT_PASSWORD_FILE=/etc/atlas/secrets/minio_root_password \
+  /opt/atlas/scripts/restore.sh /var/backups/atlas/<backup-id>
 ```
 
-恢复必须在维护窗口显式确认：
+生产写恢复只能在维护窗口执行。`ATLAS_COMPOSE_PROJECT` 必须显式选择实际容器组，
+所有 Compose 命令都固定使用 `--project-name`；`ATLAS_RESTORE_TARGET` 必须与该 project
+完全一致，确认值再同时绑定 project 和本次精确 backup ID，避免确认 A 却误写 B，
+或把隔离演练、旧备份误写生产。
+PostgreSQL 通过 `--single-transaction --exit-on-error` 全成或全败；
+MinIO 恢复后会重新下载整个 bucket 并比对逐对象 hash/index；Redis 执行
+`FLUSHALL SYNC` 后同时验证 `DBSIZE=0` 且不存在任何 keyspace，因此旧 session、
+短期记忆 TTL 和一次性工具授权票据不会复活：
 
 ```bash
-ATLAS_RESTORE_CONFIRM=RESTORE /opt/atlas/scripts/restore.sh /var/backups/atlas/<timestamp> --apply
+BACKUP_ID=<backup-id>
+sudo env \
+  BACKUP_ROOT=/var/backups/atlas \
+  MINIO_ROOT_USER=atlas \
+  MINIO_ROOT_PASSWORD_FILE=/etc/atlas/secrets/minio_root_password \
+  ATLAS_COMPOSE_PROJECT=atlas-production \
+  ATLAS_RESTORE_TARGET=atlas-production \
+  ATLAS_RESTORE_CONFIRM="RESTORE:atlas-production:$BACKUP_ID" \
+  /opt/atlas/scripts/restore.sh "/var/backups/atlas/$BACKUP_ID" --apply
 ```
 
-正式使用前至少做一次隔离环境恢复演练。建议目标 RPO 24 小时、RTO 4 小时；企业上线后再按 SLA 调整。
+Agent code 在同父目录中完成 staging 后原子替换。备份内 `config/` 仅供人工差异
+比对，不会覆盖生产配置；`api/.env`、根 `.env`、平台密钥和供应商凭据必须从
+密钥管理系统恢复，备份不会包含它们。
+
+不要用生产 `restore.sh --apply` 做演练。正式使用前至少通过
+[`acceptance-backup-restore.md`](./acceptance-backup-restore.md) 的
+`make acceptance-rehearse` 在不同的 `atlas-acceptance-*` Compose project 完成一次
+隔离恢复，并留存 restore JSON、对象索引、镜像 digest 和 RTO 证据。建议目标 RPO
+24 小时、RTO 4 小时；企业上线后再按 SLA 调整。
 
 ## 7. 回滚
 

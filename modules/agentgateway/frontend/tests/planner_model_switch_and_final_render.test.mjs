@@ -52,7 +52,7 @@ function blocked(workingList, cid) {
   reduceWsEvent(A, { type: "model_resolved", model: "gpt-5.4", provider: "openai" });
   eq(A.model, "gpt-5.4", "A picks up switched model");
   eq(A.provider, "openai", "A picks up switched provider");
-  eq(B.model, "qwen3.6-27b", "B model untouched by A's switch (isolation)");
+eq(B.model, "glm-4-flash", "B model untouched by A's switch (isolation)");
 }
 
 // ── #3 working derivation + concurrency gate ─────────────────────────────────

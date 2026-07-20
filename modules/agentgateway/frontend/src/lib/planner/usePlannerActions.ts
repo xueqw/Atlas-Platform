@@ -27,7 +27,7 @@ type Router = ReturnType<typeof useRouter>;
 interface ActionsConfig {
   runtime: PlannerRuntimeStore;
   router: Router;
-  models: Array<{ model_id: string; display_name: string; provider: string }>;
+  models: Array<{ model_id: string; display_name: string; provider: string; configured: boolean }>;
 }
 
 export interface PlannerActions {
@@ -136,6 +136,7 @@ export function usePlannerActions({ runtime, router, models }: ActionsConfig): P
       rt.mode = (detail.mode === "replan" ? "replan" : "create");
       rt.replanContext = detail.replan_context || "";
       rt.selectedSkills = (detail.memory as PlannerMemory & { selected_skills?: string[] })?.selected_skills || [];
+      rt.pendingContinuation = detail.pending_continuation || null;
       setActive(conversationId);
       syncConvIdToUrl(conversationId);
       syncViewFromRuntime(rt);
@@ -195,7 +196,12 @@ export function usePlannerActions({ runtime, router, models }: ActionsConfig): P
   // runtime for the response. Shared by the composer and the A2UI auto-continue
   // path so both go through the same concurrency gate + reset. Returns true when
   // the turn was actually dispatched.
-  const sendPlannerTurn = (content: string, atts: AttachmentMeta[] = [], capabilityContext = ""): boolean => {
+  const sendPlannerTurn = (
+    content: string,
+    atts: AttachmentMeta[] = [],
+    capabilityContext = "",
+    continuation?: { requestId: string; choiceId: string; token?: string },
+  ): boolean => {
     const cid = activeConvIdRef.current;
     if (!cid) return false;
     const rt = runtimeRef.current.get(cid);
@@ -208,7 +214,20 @@ export function usePlannerActions({ runtime, router, models }: ActionsConfig): P
       return false;
     }
     const plannerContent = capabilityContext ? `${content}\n\n${capabilityContext}` : content;
-    rt.ws.send(JSON.stringify({ type: "message", content: plannerContent, attachments: atts }));
+    rt.ws.send(JSON.stringify({
+      type: "message",
+      content: plannerContent,
+      attachments: atts,
+      ...(continuation ? {
+        a2ui_request_id: continuation.requestId,
+        a2ui_choice: continuation.choiceId,
+        continuation_token: continuation.token,
+      } : {}),
+    }));
+    if (continuation?.token) {
+      rt.dispatchedContinuationToken = continuation.token;
+      rt.pendingContinuation = null;
+    }
     rt.msgId++;
     rt.messages = [...rt.messages, { id: rt.msgId, role: "user", content, attachments: atts.length ? atts : undefined }];
     rt.thinking = true;
@@ -263,30 +282,59 @@ export function usePlannerActions({ runtime, router, models }: ActionsConfig): P
     const cid = activeConvIdRef.current;
     const rt = cid ? runtimeRef.current.get(cid) : null;
     if (!rt || !rt.a2uiRequest || !rt.ws || rt.ws.readyState !== WebSocket.OPEN) return;
+    if (rt.pendingA2UIResponseId) return;
+    const requestId = rt.a2uiRequest.id;
     const optionLabel = rt.a2uiRequest.options.find((o) => o.id === choiceId)?.label || choiceId;
-    rt.ws.send(JSON.stringify({
+    const userLine = freeText ? `已选择「${optionLabel}」：${freeText}` : `已选择「${optionLabel}」`;
+    const shouldAdvance = isAdvanceChoice(choiceId, optionLabel);
+    const ws = rt.ws;
+    rt.pendingA2UIResponseId = requestId;
+    syncViewFromRuntime(rt);
+
+    // WebSocket frames are ordered, but waiting for the durable ACK closes the
+    // disconnect window where the follow-up turn could outrun decision
+    // persistence. Duplicate clicks are blocked by pendingA2UIResponseId.
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      ws.removeEventListener("message", onRecorded);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+    const onRecorded = (event: MessageEvent) => {
+      let ack: { type?: string; id?: string; choice?: string; continuation_token?: string };
+      try { ack = JSON.parse(String(event.data)); } catch { return; }
+      if (
+        ack.type !== "a2ui_recorded"
+        || ack.id !== requestId
+        || ack.choice !== choiceId
+      ) return;
+      cleanup();
+      rt.pendingA2UIResponseId = null;
+      if (shouldAdvance) {
+        sendPlannerTurn(userLine, [], "", {
+          requestId,
+          choiceId,
+          token: ack.continuation_token,
+        });
+      } else {
+        rt.msgId++;
+        rt.messages = [...rt.messages, { id: rt.msgId, role: "user", content: userLine }];
+        syncViewFromRuntime(rt);
+      }
+    };
+    ws.addEventListener("message", onRecorded);
+    timeoutId = setTimeout(() => {
+      cleanup();
+      rt.pendingA2UIResponseId = null;
+      syncViewFromRuntime(rt);
+      toast.error("确认记录超时，未继续生成；请重试。");
+    }, 15_000);
+
+    ws.send(JSON.stringify({
       type: "a2ui_response",
-      id: rt.a2uiRequest.id,
+      id: requestId,
       choice: choiceId,
       free_text: freeText,
     }));
-    rt.a2uiRequest = null;
-
-    const userLine = freeText ? `已选择「${optionLabel}」：${freeText}` : `已选择「${optionLabel}」`;
-
-    if (isAdvanceChoice(choiceId, optionLabel)) {
-      // Proceed intent: continue the planner turn right away so the proposal /
-      // JSON gets generated without forcing the user to type "创建吧".
-      syncViewFromRuntime(rt); // clear the card first
-      sendPlannerTurn(userLine);
-      return;
-    }
-
-    // Non-advance choice (e.g. "我要修改"): record only and let the user follow
-    // up — optimistically render the choice so the trail is visible.
-    rt.msgId++;
-    rt.messages = [...rt.messages, { id: rt.msgId, role: "user", content: userLine }];
-    syncViewFromRuntime(rt);
   };
 
   // Keep pending attachments on the active runtime (so a session switch preserves them).

@@ -356,6 +356,12 @@ class PlannerSession(SQLModel, table=True):
     __tablename__ = "planner_sessions"
     id: Optional[int] = Field(default=None, primary_key=True)
     conversation_id: str = Field(index=True, unique=True, max_length=64)
+    # Explicit ownership boundary. The local single-user frontend omits scope
+    # headers and therefore lands in the well-known default scope; production
+    # gateways provide verified tenant/workspace/user claims.
+    tenant_id: str = Field(default="default", max_length=128, index=True)
+    workspace_id: str = Field(default="default", max_length=128, index=True)
+    user_id: str = Field(default="default", max_length=128, index=True)
     session_title: str = Field(default="", max_length=200)
     stage: str = Field(default="clarifying", max_length=30)
     user_request: str = Field(default="")

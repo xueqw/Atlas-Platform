@@ -717,6 +717,149 @@ async def runtime_tooling(connectors: list[str]) -> tuple[list[dict], dict[str, 
     return specs, owners, writes, warnings
 
 
+def _runtime_actor_id(agent: Agent, db: Session, explicit_user_id: str | None) -> str | None:
+    """Resolve a real tenant member for durable runtime attribution.
+
+    External API and background evaluation calls do not carry a browser user,
+    but RuntimeRun deliberately requires an actor FK. Prefer the authenticated
+    user, then the Agent creator, then a deterministic workspace owner/member.
+    """
+    if explicit_user_id:
+        return explicit_user_id
+    if agent.created_by:
+        return agent.created_by
+    if not agent.workspace_id:
+        return None
+    return db.scalar(
+        select(Membership.user_id)
+        .where(Membership.workspace_id == agent.workspace_id)
+        .order_by((Membership.role == "owner").desc(), Membership.created_at, Membership.user_id)
+    )
+
+
+async def _execute_langgraph_runtime(
+    agent: Agent,
+    input_text: str,
+    db: Session,
+    *,
+    use_published: bool,
+    source: str,
+    conversation_id: str | None,
+    user_id: str | None,
+    package: dict,
+) -> dict | None:
+    """Compatibility facade used by every legacy product entry point.
+
+    It returns ``None`` only when the caller has no immutable prompt version;
+    callers may use the legacy adapter before any runtime side effect when the
+    explicit fallback flag permits it. Code Agents remain on the Docker sandbox
+    adapter until their executable graph node is introduced in the next phase.
+    """
+    if agent.kind != "prompt":
+        return None
+    version_id = agent.published_version_id if use_published else (
+        agent.current_version_id or agent.published_version_id
+    )
+    actor_id = _runtime_actor_id(agent, db, user_id)
+    if not version_id or not actor_id or not agent.workspace_id:
+        return None
+    version = db.scalar(select(AgentVersion).where(
+        AgentVersion.id == version_id,
+        AgentVersion.agent_id == agent.id,
+    ))
+    if version is None:
+        return None
+
+    from .runtime_api import RuntimeRunCreate, _start_service, _to_start_request
+    from .runtime_contract import RuntimeSource, RuntimeStatus
+
+    source_map = {
+        "chat": RuntimeSource.CHAT,
+        "workbench": RuntimeSource.WORKBENCH,
+        "preview": RuntimeSource.PREVIEW,
+        "builder": RuntimeSource.BUILDER,
+        "evaluate": RuntimeSource.EVALUATION,
+        "evaluation": RuntimeSource.EVALUATION,
+        "api": RuntimeSource.API,
+        "subagent": RuntimeSource.SUBAGENT,
+    }
+    runtime_source = source_map.get(source, RuntimeSource.PREVIEW)
+    snapshot = version_snapshot(version)
+    started = time.perf_counter()
+    payload = RuntimeRunCreate(
+        agent_id=agent.id,
+        input=input_text,
+        idempotency_key=f"compat:{runtime_source.value}:{uuid4()}",
+        source=runtime_source,
+        version_id=version.id,
+        conversation_id=conversation_id,
+    )
+    async with _start_service(snapshot, agent.workspace_id) as service:
+        handle = await service.start(_to_start_request(
+            payload,
+            workspace_id=agent.workspace_id,
+            user_id=actor_id,
+            version_id=version.id,
+        ))
+        handle = await service.wait(run_id=handle.run_id, workspace_id=agent.workspace_id)
+        record = service.runs.get(run_id=handle.run_id, workspace_id=agent.workspace_id)
+        events = service.stream(run_id=handle.run_id, workspace_id=agent.workspace_id)
+
+    state = record.state
+    answer = state.output or ""
+    active_errors = [item for item in state.errors if not item.get("recovered")]
+    error = str(active_errors[-1].get("message")) if active_errors else None
+    trace = [
+        {
+            "type": event.payload.get("node", event.type),
+            "title": event.payload.get("node", event.type),
+            "status": event.payload.get("status", "failed" if event.type == "node.failed" else "succeeded"),
+            "executor": "langgraph",
+            **({"error": event.payload.get("error", "")} if event.type == "node.failed" else {}),
+        }
+        for event in events
+        if event.type in {"node.completed", "node.failed"}
+    ]
+    tool_calls = [
+        {"name": item.get("name", ""), "status": "succeeded", "access": "read"}
+        for item in state.tool_results
+    ]
+    sources: list[dict] = []
+    for item in state.tool_results:
+        result = item.get("result")
+        if item.get("name") == "knowledge_search" and isinstance(result, dict):
+            sources.extend(result.get("matches") or [])
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    ok = handle.status is RuntimeStatus.SUCCEEDED
+    warnings = []
+    logs = "\n".join([
+        f"> runtime: {record.execution_mode}",
+        f"> version: {package['version_label']} {package['version_no'] or 'workspace'}",
+        f"> run_id: {handle.run_id}",
+        f"> elapsed: {elapsed_ms} ms",
+        "",
+        answer or error or "",
+    ])
+    return {
+        "ok": ok,
+        "answer": answer,
+        "content": answer,
+        "logs": logs,
+        "error": error,
+        "warnings": warnings,
+        "sources": sources,
+        "trace": trace,
+        "tool_calls": tool_calls,
+        "requires_confirmation": None,
+        "elapsed_ms": elapsed_ms,
+        "usage": None,
+        "run_id": handle.run_id,
+        "version_no": package["version_no"],
+        "version_label": package["version_label"],
+        "runtime_mode": record.execution_mode,
+    }
+
+
 async def execute_agent_runtime(
     agent: Agent,
     input_text: str,
@@ -732,6 +875,24 @@ async def execute_agent_runtime(
     """One runtime for draft preview, workbench, evaluation and external API."""
     started = time.perf_counter()
     package = runtime_package(agent, db, use_published)
+    if settings.langgraph_runtime_enabled:
+        unified = await _execute_langgraph_runtime(
+            agent,
+            input_text,
+            db,
+            use_published=use_published,
+            source=source,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            package=package,
+        )
+        if unified is not None:
+            return unified
+        if not settings.langgraph_runtime_legacy_fallback:
+            raise HTTPException(
+                status_code=409,
+                detail="该入口缺少可绑定的不可变 Prompt Agent 版本，禁止绕过统一运行时",
+            )
     manifest = package["manifest"] if isinstance(package.get("manifest"), dict) else {}
     model = str(manifest.get("model") or agent.model or "qwen-turbo")
     prompt = str(manifest.get("prompt") or agent.system_prompt)

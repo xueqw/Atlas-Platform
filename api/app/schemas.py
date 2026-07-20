@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class UserOut(BaseModel):
@@ -382,18 +382,28 @@ class SkillCreate(BaseModel):
     trigger_phrases: str = Field(default="", max_length=1000)
     category_path: str = Field(default="general", max_length=240)
     summary: str = Field(default="", max_length=2000)
-    use_when: list[str] = []
-    do_not_use_when: list[str] = []
-    examples: list[str] = []
-    input_schema: dict = {}
-    output_schema: dict = {}
-    requirements: list[str] = []
-    permissions: list[str] = []
+    use_when: list[str] = Field(default_factory=list, max_length=50)
+    do_not_use_when: list[str] = Field(default_factory=list, max_length=50)
+    examples: list[str] = Field(default_factory=list, max_length=50)
+    input_schema: dict = Field(default_factory=dict)
+    output_schema: dict = Field(default_factory=dict)
+    requirements: list[str] = Field(default_factory=list, max_length=50)
+    permissions: list[str] = Field(default_factory=list, max_length=100)
     version: str = Field(default="1.0.0", max_length=40)
+    status: str = Field(default="active", max_length=30)
+
+    @model_validator(mode="after")
+    def validate_governed_metadata(self):
+        from .skill_router import validate_skill_metadata
+
+        validate_skill_metadata({"id": "validation", **self.model_dump()})
+        if self.status == "published" and (not self.summary.strip() or not self.use_when or not self.do_not_use_when):
+            raise ValueError("published skills require summary, use_when, and do_not_use_when")
+        return self
 
 
 class SkillUpdate(SkillCreate):
-    status: str = Field(default="active", max_length=30)
+    pass
 
 
 class SkillOut(BaseModel):

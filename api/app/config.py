@@ -1,9 +1,33 @@
+import os
 from pathlib import Path
 from urllib.parse import quote
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).parent.parent / ".env"
+
+
+def _env_file_chain() -> tuple[str, ...]:
+    """Load a shared secrets file while keeping worktree-local overrides.
+
+    Git worktrees intentionally do not copy ignored ``.env`` files. A local
+    ``ATLAS_SHARED_ENV_FILE`` pointer lets every worktree reuse the developer's
+    existing secret source without duplicating or exposing key values.
+    """
+    shared = os.environ.get("ATLAS_SHARED_ENV_FILE", "").strip()
+    if not shared and _ENV_FILE.exists():
+        for raw in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+            key, separator, value = raw.partition("=")
+            if separator and key.strip() == "ATLAS_SHARED_ENV_FILE":
+                shared = value.strip().strip('"').strip("'")
+                break
+    files: list[str] = []
+    if shared:
+        shared_path = Path(shared).expanduser()
+        if shared_path.exists():
+            files.append(str(shared_path))
+    files.append(str(_ENV_FILE))
+    return tuple(files)
 
 
 class Settings(BaseSettings):
@@ -75,6 +99,7 @@ class Settings(BaseSettings):
     # LangGraph runtime migration. Disabled by default so legacy production
     # paths remain the rollback target until the runtime acceptance gates pass.
     langgraph_runtime_enabled: bool = False
+    adaptive_runtime_enabled: bool = False
     langgraph_shadow_mode: bool = False
     langgraph_runtime_legacy_fallback: bool = False
     langgraph_checkpoint_database_url: str = ""
@@ -91,7 +116,7 @@ class Settings(BaseSettings):
     secret_encryption_key: str = ""
     secret_encryption_key_file: str = ""
 
-    model_config = SettingsConfigDict(env_file=str(_ENV_FILE), extra="ignore")
+    model_config = SettingsConfigDict(env_file=_env_file_chain(), extra="ignore")
 
     def model_post_init(self, __context) -> None:
         for url_name, password_file in (
@@ -102,6 +127,16 @@ class Settings(BaseSettings):
             if password_file:
                 password = self._secret_path(password_file).read_text(encoding="utf-8").strip()
                 setattr(self, url_name, getattr(self, url_name).replace("{password}", quote(password, safe="")))
+        # redis-py 6 treats an explicitly empty ACL username in
+        # ``redis://:<password>@...`` as a two-argument AUTH for user ``""``.
+        # Redis' requirepass config protects the built-in ``default`` user, so
+        # normalize the conventional password-only URL to that explicit user.
+        # This keeps existing production templates working without exposing the
+        # secret or changing callers of ``Redis.from_url``.
+        if self.redis_url.startswith("redis://:"):
+            self.redis_url = self.redis_url.replace("redis://:", "redis://default:", 1)
+        elif self.redis_url.startswith("rediss://:"):
+            self.redis_url = self.redis_url.replace("rediss://:", "rediss://default:", 1)
         for name in (
             "openai_api_key", "zhipu_api_key", "siliconflow_api_key",
             "github_pat", "feishu_app_secret", "object_storage_secret_key", "secret_encryption_key",

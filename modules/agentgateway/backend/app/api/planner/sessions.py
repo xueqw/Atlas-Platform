@@ -4,7 +4,7 @@ import json
 import shutil
 import uuid
 from typing import Dict, List, Optional
-from fastapi import HTTPException, UploadFile, File, Query
+from fastapi import Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse, Response
 from sqlmodel import Session, select, desc
 from app.core.database import engine
@@ -22,11 +22,12 @@ from . import state
 from .state import (
     PLANNER_GREETING,
     _new_memory,
+    _ensure_goal_anchor,
     _default_source,
     _is_default_skill,
     _normalize_pending_a2ui,
 )
-from .proposal import _parse_json_list
+from .proposal import _parse_json_list, _validate_proposal_payload
 from .prompts import (
     _resolve_model,
     _build_replan_context,
@@ -45,6 +46,13 @@ from .schemas import (
     PlannerFileItem,
     PlannerSkillItem,
 )
+from .scope import (
+    DEFAULT_PLANNER_SCOPE,
+    PlannerScope,
+    coerce_planner_scope,
+    resolve_planner_scope,
+    scope_session_select,
+)
 
 
 def _derive_session_title(memory: dict, messages: List[dict]) -> str:
@@ -58,13 +66,35 @@ def _derive_session_title(memory: dict, messages: List[dict]) -> str:
     return "未命名会话"
 
 
-def _infer_stage(memory: dict, proposal: Optional[dict], applied: bool) -> str:
-    """Infer the planner stage from current state."""
+def _infer_stage(
+    memory: dict,
+    proposal: Optional[dict],
+    applied: bool,
+    *,
+    pending_a2ui: Optional[dict] = None,
+) -> str:
+    """Infer stage only from durable, structured evidence.
+
+    Model-authored summaries and assistant-message counts are intentionally not
+    sufficient to enter proposal-related stages.
+    """
     if applied:
         return "applied"
-    if proposal:
+    candidate = proposal
+    if not isinstance(candidate, dict) and isinstance(memory, dict):
+        candidate = memory.get("proposal_payload")
+    _, proposal_ok = _validate_proposal_payload(candidate)
+    has_proposal_identity = isinstance(candidate, dict) and any(
+        isinstance(candidate.get(key), str) and bool(candidate.get(key).strip())
+        for key in ("title", "goal", "architecture_summary")
+    )
+    if proposal_ok and has_proposal_identity:
         return "ready_to_apply"
-    if memory and memory.get("latest_proposal_summary"):
+    if (
+        isinstance(pending_a2ui, dict)
+        and isinstance(pending_a2ui.get("options"), list)
+        and bool(pending_a2ui.get("options"))
+    ):
         return "awaiting_confirmation"
     if memory and (memory.get("requirement_summary") or memory.get("confirmed_constraints")):
         return "drafting"
@@ -82,6 +112,12 @@ def _serialize_planning_state(memory: dict) -> str:
         "decisions_pending", "decisions_confirmed", "tradeoffs", "risks",
         "architecture_pattern", "runtime_strategy", "memory_strategy",
         "knowledge_strategy", "evaluation_strategy", "apply_readiness",
+        # Planner-local ledger/views/policy metadata. These live only in the
+        # aggregate JSON blob to remain migration-free and backend-compatible.
+        "goal_anchor", "memory_update_audit",
+        # Durable A2UI → planner hand-off.  Kept in the additive aggregate blob
+        # so reconnect recovery needs no destructive database migration.
+        "pending_continuation",
         # Plan-first structured proposal mirror (T2). Persisted so the validated
         # ProposalPayload round-trips inside planner_sessions without a new table.
         "proposal_payload",
@@ -90,14 +126,95 @@ def _serialize_planning_state(memory: dict) -> str:
     return json.dumps(state, ensure_ascii=False)
 
 
-def _persist_session(conv_id: str, conv_data: dict) -> None:
+def _pending_continuation_from_memory(memory: dict) -> Optional[dict]:
+    """Return a resumable A2UI continuation.
+
+    ``processing`` is deliberately exposed too: after a process/socket loss the
+    backend claim path decides whether the local run is still active or whether
+    the durable command must be replayed.
+    """
+    item = (memory or {}).get("pending_continuation")
+    if not isinstance(item, dict) or item.get("status") not in {"pending", "processing"}:
+        return None
+    required = ("request_id", "choice", "token", "content")
+    if not all(isinstance(item.get(key), str) and item[key].strip() for key in required):
+        return None
+    return dict(item)
+
+
+def _scope_for_conv(conv_data: dict, scope=None) -> PlannerScope:
+    if isinstance(scope, PlannerScope):
+        return scope
+    if isinstance(conv_data, dict) and isinstance(conv_data.get("_scope"), dict):
+        return coerce_planner_scope(conv_data["_scope"])
+    return coerce_planner_scope(scope)
+
+
+def _scoped_row(session: Session, conversation_id: str, scope: PlannerScope) -> Optional[PlannerSession]:
+    return session.exec(
+        scope_session_select(
+            select(PlannerSession).where(PlannerSession.conversation_id == conversation_id),
+            scope,
+        )
+    ).first()
+
+
+def _require_scoped_row(session: Session, conversation_id: str, scope: PlannerScope) -> PlannerSession:
+    row = _scoped_row(session, conversation_id, scope)
+    if row is None:
+        raise HTTPException(status_code=404, detail="planner session not found")
+    return row
+
+
+def _authorize_session_resource(
+    session: Session,
+    conversation_id: str,
+    scope: PlannerScope,
+) -> Optional[PlannerSession]:
+    """Authorize files/attachments, including pre-session local artifacts.
+
+    Historical local builds could create planner files before a PlannerSession
+    row existed. Those unowned artifacts belong only to the explicit default
+    scope; non-default scopes require a matching durable row.
+    """
+    row = _scoped_row(session, conversation_id, scope)
+    if row is not None:
+        return row
+    any_row = session.exec(
+        select(PlannerSession.id).where(PlannerSession.conversation_id == conversation_id)
+    ).first()
+    if any_row is None and scope == DEFAULT_PLANNER_SCOPE:
+        return None
+    raise HTTPException(status_code=404, detail="planner session not found")
+
+
+def _session_exists_any_scope(conversation_id: str) -> bool:
+    with Session(engine) as session:
+        return session.exec(
+            select(PlannerSession.id).where(PlannerSession.conversation_id == conversation_id)
+        ).first() is not None
+
+
+def _persist_session(
+    conv_id: str,
+    conv_data: dict,
+    scope: Optional[PlannerScope] = None,
+) -> None:
     """Upsert PlannerSession row from in-memory conv_data. Called after every turn."""
+    scope = _scope_for_conv(conv_data, scope)
+    conv_data["_scope"] = scope.as_dict()
     memory = conv_data.get("memory") or _new_memory()
     messages = conv_data.get("messages") or []
     proposal = conv_data.get("proposal")
     linked_agent_id = conv_data.get("linked_agent_id")
     title = conv_data.get("session_title") or _derive_session_title(memory, messages)
-    stage = _infer_stage(memory, proposal, linked_agent_id is not None)
+    stage = _infer_stage(
+        memory,
+        proposal,
+        linked_agent_id is not None,
+        pending_a2ui=conv_data.get("pending_a2ui"),
+    )
+    conv_data["stage"] = stage
     mode = conv_data.get("mode") or "create"
     replan_context = conv_data.get("replan_context") or ""
 
@@ -108,12 +225,21 @@ def _persist_session(conv_id: str, conv_data: dict) -> None:
     apply_readiness_json = json.dumps(memory.get("apply_readiness", {}) or {}, ensure_ascii=False)
 
     with Session(engine) as session:
-        row = session.exec(
-            select(PlannerSession).where(PlannerSession.conversation_id == conv_id)
-        ).first()
+        row = _scoped_row(session, conv_id, scope)
         if row is None:
+            # conversation_id is globally unique. A row in another scope is
+            # deliberately indistinguishable from a missing row and must never
+            # be overwritten by a guessed cross-scope id.
+            existing = session.exec(
+                select(PlannerSession.id).where(PlannerSession.conversation_id == conv_id)
+            ).first()
+            if existing is not None:
+                raise HTTPException(status_code=404, detail="planner session not found")
             row = PlannerSession(
                 conversation_id=conv_id,
+                tenant_id=scope.tenant_id,
+                workspace_id=scope.workspace_id,
+                user_id=scope.user_id,
                 session_title=title,
                 stage=stage,
                 user_request=(messages[0]["content"] if messages else "")[:2000],
@@ -178,9 +304,9 @@ def _memory_from_row(row: PlannerSession) -> dict:
 
     # Richer-state blob (the 14 new fields). Tolerant: malformed JSON → defaults.
     try:
-        state = json.loads(getattr(row, "planning_state_json", "{}") or "{}")
-        if isinstance(state, dict):
-            for k, v in state.items():
+        richer_state = json.loads(getattr(row, "planning_state_json", "{}") or "{}")
+        if isinstance(richer_state, dict):
+            for k, v in richer_state.items():
                 if k in memory and v not in (None, "", [], {}):
                     memory[k] = v
     except (json.JSONDecodeError, TypeError):
@@ -203,6 +329,70 @@ def _memory_from_row(row: PlannerSession) -> dict:
             memory["apply_readiness"] = readiness
     except (json.JSONDecodeError, TypeError):
         pass
+
+    # Legacy rows predate goal-anchor metadata. Derive it lazily from durable,
+    # user-authored evidence (never from the model-authored summary). The next
+    # normal session persist writes this metadata into planning_state_json.
+    try:
+        persisted_messages = json.loads(getattr(row, "planner_messages", "[]") or "[]")
+        if not isinstance(persisted_messages, list):
+            persisted_messages = []
+    except (json.JSONDecodeError, TypeError):
+        persisted_messages = []
+    _ensure_goal_anchor(
+        memory,
+        persisted_messages,
+        user_request=getattr(row, "user_request", "") or "",
+        conversation_id=getattr(row, "conversation_id", "") or "",
+        transaction_time=getattr(row, "created_at", None),
+    )
+    # Query-friendly legacy columns can contain model-authored ``ready`` even
+    # though no validated proposal was ever persisted. Re-apply the policy at
+    # materialization time so restarts cannot resurrect hallucinated readiness.
+    proposal = memory.get("proposal_payload")
+    _, proposal_ok = _validate_proposal_payload(proposal)
+    if not proposal_ok:
+        # ``proposals`` is the authoritative artifact store. Sessions created
+        # before the full proposal mirror was persisted can be repaired from it
+        # on load without trusting model summaries or message counts.
+        try:
+            from app.core import proposal_store
+
+            stored = proposal_store.get_proposal_by_conversation(
+                getattr(row, "conversation_id", "") or ""
+            )
+            candidate = json.loads(stored.proposal_json or "{}") if stored else None
+            _, candidate_ok = _validate_proposal_payload(candidate)
+            candidate_has_identity = isinstance(candidate, dict) and any(
+                isinstance(candidate.get(key), str) and bool(candidate.get(key).strip())
+                for key in ("title", "goal", "architecture_summary")
+            )
+            if candidate_ok and candidate_has_identity:
+                proposal = candidate
+                proposal_ok = True
+                memory["proposal_payload"] = candidate
+        except Exception:
+            proposal_ok = False
+    if proposal_ok and isinstance(proposal, dict):
+        proposal_readiness = proposal.get("apply_readiness")
+        if isinstance(proposal_readiness, dict):
+            state._merge_memory_update(
+                memory,
+                {"apply_readiness": proposal_readiness},
+                source_turn={"kind": "proposal_store_recovery"},
+                has_validated_proposal=True,
+            )
+    if (
+        isinstance(memory.get("apply_readiness"), dict)
+        and memory["apply_readiness"].get("status") == "ready"
+        and not proposal_ok
+    ):
+        state._merge_memory_update(
+            memory,
+            {"apply_readiness": dict(memory["apply_readiness"])},
+            source_turn={"kind": "legacy_session_load"},
+            has_validated_proposal=False,
+        )
     return memory
 
 
@@ -257,12 +447,14 @@ def _pending_a2ui_from_memory(memory: dict) -> Optional[dict]:
     return None
 
 
-def _load_session_into_memory(conv_id: str) -> Optional[dict]:
+def _load_session_into_memory(
+    conv_id: str,
+    scope: PlannerScope = DEFAULT_PLANNER_SCOPE,
+) -> Optional[dict]:
     """Load PlannerSession row into the in-memory conv_data shape. Returns None if not found."""
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
-        row = session.exec(
-            select(PlannerSession).where(PlannerSession.conversation_id == conv_id)
-        ).first()
+        row = _scoped_row(session, conv_id, scope)
         if row is None:
             return None
         memory = _memory_from_row(row)
@@ -276,24 +468,42 @@ def _load_session_into_memory(conv_id: str) -> Optional[dict]:
             artifacts = artifacts if isinstance(artifacts, list) else []
         except (json.JSONDecodeError, TypeError):
             artifacts = []
+        proposal = memory.get("proposal_payload")
+        _, proposal_ok = _validate_proposal_payload(proposal)
+        proposal_ok = proposal_ok and isinstance(proposal, dict) and any(
+            isinstance(proposal.get(key), str) and bool(proposal.get(key).strip())
+            for key in ("title", "goal", "architecture_summary")
+        )
         conv_data = {
             "messages": messages,
             "memory": memory,
             "model": {"model_name": DEFAULT_CHAT_MODEL_ID, "provider": DEFAULT_CHAT_PROVIDER},
             "session_title": row.session_title or "",
-            "stage": row.stage or "clarifying",
             "linked_agent_id": row.linked_agent_id,
             "file_artifacts": artifacts,
             "mode": getattr(row, "mode", "create") or "create",
             "replan_context": getattr(row, "replan_context", "") or "",
+            "_scope": scope.as_dict(),
         }
+        if proposal_ok:
+            conv_data["proposal"] = proposal
         pending_a2ui = _pending_a2ui_from_memory(memory)
         if pending_a2ui:
             conv_data["pending_a2ui"] = pending_a2ui
+        conv_data["stage"] = _infer_stage(
+            memory,
+            proposal if proposal_ok else None,
+            row.linked_agent_id is not None,
+            pending_a2ui=pending_a2ui,
+        )
         return conv_data
 
 
-def start_planner(body: StartRequest = StartRequest()):
+def start_planner(
+    body: StartRequest = StartRequest(),
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
+    scope = coerce_planner_scope(scope)
     conv_id = str(uuid.uuid4())
     resolved = _resolve_model(body.model_id)
     conv_data = {
@@ -301,43 +511,58 @@ def start_planner(body: StartRequest = StartRequest()):
         "model": resolved,
         "memory": _new_memory(),
         "file_artifacts": [],
+        "_scope": scope.as_dict(),
     }
     state.store_conv(conv_id, conv_data)
     # Persist a stub row immediately so a refresh before the first turn still
     # finds the session (and the sidebar lists it). Best-effort — DB hiccups
     # must not break the start handshake.
     try:
-        _persist_session(conv_id, conv_data)
+        _persist_session(conv_id, conv_data, scope)
     except Exception:
         pass
     return StartResponse(conversation_id=conv_id, greeting=PLANNER_GREETING, resolved_model=resolved["model_name"])
 
 
-def list_planner_sessions(limit: int = 50):
+def list_planner_sessions(
+    limit: int = 50,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
         rows = session.exec(
-            select(PlannerSession).order_by(desc(PlannerSession.last_updated_at)).limit(limit)
+            scope_session_select(select(PlannerSession), scope)
+            .order_by(desc(PlannerSession.last_updated_at))
+            .limit(limit)
         ).all()
-        return [
-            PlannerSessionListItem(
-                conversation_id=r.conversation_id,
-                session_title=r.session_title or "未命名会话",
-                stage=r.stage or "clarifying",
-                linked_agent_id=r.linked_agent_id,
-                last_updated_at=r.last_updated_at,
-                created_at=r.created_at,
-            )
-            for r in rows
-        ]
+        items: list[PlannerSessionListItem] = []
+        for row in rows:
+            memory = _memory_from_row(row)
+            proposal = memory.get("proposal_payload")
+            pending_a2ui = _pending_a2ui_from_memory(memory)
+            items.append(PlannerSessionListItem(
+                conversation_id=row.conversation_id,
+                session_title=row.session_title or "未命名会话",
+                stage=_infer_stage(
+                    memory,
+                    proposal,
+                    row.linked_agent_id is not None,
+                    pending_a2ui=pending_a2ui,
+                ),
+                linked_agent_id=row.linked_agent_id,
+                last_updated_at=row.last_updated_at,
+                created_at=row.created_at,
+            ))
+        return items
 
 
-def get_planner_session(conversation_id: str):
+def get_planner_session(
+    conversation_id: str,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
-        row = session.exec(
-            select(PlannerSession).where(PlannerSession.conversation_id == conversation_id)
-        ).first()
-        if row is None:
-            raise HTTPException(status_code=404, detail="planner session not found")
+        row = _require_scoped_row(session, conversation_id, scope)
         memory = _memory_from_row(row)
         try:
             messages = json.loads(row.planner_messages or "[]")
@@ -349,10 +574,17 @@ def get_planner_session(conversation_id: str):
             artifacts = artifacts if isinstance(artifacts, list) else []
         except (json.JSONDecodeError, TypeError):
             artifacts = []
+        pending_a2ui = _pending_a2ui_from_memory(memory)
+        proposal = memory.get("proposal_payload")
         return PlannerSessionDetail(
             conversation_id=row.conversation_id,
             session_title=row.session_title or "未命名会话",
-            stage=row.stage or "clarifying",
+            stage=_infer_stage(
+                memory,
+                proposal,
+                row.linked_agent_id is not None,
+                pending_a2ui=pending_a2ui,
+            ),
             user_request=row.user_request or "",
             memory=memory,
             messages=messages,
@@ -360,22 +592,25 @@ def get_planner_session(conversation_id: str):
             linked_agent_id=row.linked_agent_id,
             mode=getattr(row, "mode", "create") or "create",
             replan_context=getattr(row, "replan_context", "") or "",
+            pending_continuation=_pending_continuation_from_memory(memory),
             last_updated_at=row.last_updated_at,
             created_at=row.created_at,
         )
 
 
-async def delete_planner_session(conversation_id: str):
+async def delete_planner_session(
+    conversation_id: str,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Delete a planner session: in-memory state, live socket, plan files, DB row.
 
     Order matters (design D4): drop the in-memory conv_data and close any live
     WebSocket *before* removing files so a mid-flight turn can't re-create the
     directory or re-persist the row we just deleted. rmtree is best-effort.
     """
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
-        row = session.exec(
-            select(PlannerSession).where(PlannerSession.conversation_id == conversation_id)
-        ).first()
+        row = _scoped_row(session, conversation_id, scope)
         if row is None:
             raise HTTPException(status_code=404, detail="session not found")
 
@@ -407,9 +642,7 @@ async def delete_planner_session(conversation_id: str):
 
     # 4. Delete the DB row.
     with Session(engine) as session:
-        row = session.exec(
-            select(PlannerSession).where(PlannerSession.conversation_id == conversation_id)
-        ).first()
+        row = _scoped_row(session, conversation_id, scope)
         if row is not None:
             session.delete(row)
             session.commit()
@@ -417,10 +650,17 @@ async def delete_planner_session(conversation_id: str):
     return {"ok": True, "removed": conversation_id}
 
 
-async def upload_planner_attachment(conversation_id: str, file: UploadFile = File(...)):
+async def upload_planner_attachment(
+    conversation_id: str,
+    file: UploadFile = File(...),
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Accept a single multipart attachment, validate, persist, return metadata."""
     if "/" in conversation_id or ".." in conversation_id:
         raise HTTPException(status_code=400, detail="invalid conversation_id")
+    scope = coerce_planner_scope(scope)
+    with Session(engine) as session:
+        _authorize_session_resource(session, conversation_id, scope)
 
     mime = (file.content_type or "").split(";")[0].strip().lower()
     if mime not in planner_attachments.ALLOWED_MIMES:
@@ -450,13 +690,20 @@ async def upload_planner_attachment(conversation_id: str, file: UploadFile = Fil
     )
 
 
-def get_planner_attachment(conversation_id: str, filename: str):
+def get_planner_attachment(
+    conversation_id: str,
+    filename: str,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Serve a stored attachment's bytes (used for image previews).
 
     Reads through object_storage so it works on both the disk and MinIO
     backends; with MinIO a presigned URL could be used directly by the client,
     but proxying keeps the existing same-origin ``preview_url`` contract.
     """
+    scope = coerce_planner_scope(scope)
+    with Session(engine) as session:
+        _authorize_session_resource(session, conversation_id, scope)
     try:
         data = planner_attachments.read_attachment_bytes(conversation_id, filename)
     except ValueError as e:
@@ -469,7 +716,10 @@ def get_planner_attachment(conversation_id: str, filename: str):
     return Response(content=data, media_type=media_type)
 
 
-def create_session_from_agent(agent_id: int):
+def create_session_from_agent(
+    agent_id: int,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Open (or resume) a Replan session for an existing agent.
 
     If a planner session is already linked to this agent (``linked_agent_id``)
@@ -485,6 +735,7 @@ def create_session_from_agent(agent_id: int):
     trace/eval evidence, then assembles a Replan context block that gets
     injected into the system prompt (design D1). Missing optional evidence is
     silently omitted (D4)."""
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
         agent = session.get(Agent, agent_id)
         if agent is None:
@@ -517,8 +768,10 @@ def create_session_from_agent(agent_id: int):
         # ledger, risks, strategies) is restored into memory and injected into
         # the context — replan should not forget prior decisions (task 6.4).
         existing = session.exec(
-            select(PlannerSession)
-            .where(PlannerSession.linked_agent_id == agent_id)
+            scope_session_select(
+                select(PlannerSession).where(PlannerSession.linked_agent_id == agent_id),
+                scope,
+            )
             .order_by(desc(PlannerSession.last_updated_at))
         ).first()
         if existing is not None:
@@ -584,6 +837,9 @@ def create_session_from_agent(agent_id: int):
         new_conv_id = str(uuid.uuid4())
         row = PlannerSession(
             conversation_id=new_conv_id,
+            tenant_id=scope.tenant_id,
+            workspace_id=scope.workspace_id,
+            user_id=scope.user_id,
             session_title=title,
             stage="clarifying",
             user_request=latest.user_request or "",
@@ -607,15 +863,28 @@ def create_session_from_agent(agent_id: int):
         return FromAgentResponse(conversation_id=new_conv_id, session_title=title, mode="replan")
 
 
-def list_planner_session_files(conversation_id: str):
+def list_planner_session_files(
+    conversation_id: str,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """List the plan-with-file artifacts the planner has written so far."""
+    scope = coerce_planner_scope(scope)
+    with Session(engine) as session:
+        _authorize_session_resource(session, conversation_id, scope)
     return [PlannerFileItem(**a) for a in planner_files.list_artifacts(conversation_id)]
 
 
-def get_planner_session_file(conversation_id: str, filename: str):
+def get_planner_session_file(
+    conversation_id: str,
+    filename: str,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Read one artifact. Markdown / JSON returned as text in a JSON wrapper so
     the frontend can render either raw or pretty-printed without sniffing
     Content-Type."""
+    scope = coerce_planner_scope(scope)
+    with Session(engine) as session:
+        _authorize_session_resource(session, conversation_id, scope)
     try:
         content = planner_files.read_artifact(conversation_id, filename)
     except ValueError as e:
@@ -625,7 +894,10 @@ def get_planner_session_file(conversation_id: str, filename: str):
     return {"filename": filename, "content": content}
 
 
-def list_planner_skills(conversation_id: Optional[str] = Query(None)):
+def list_planner_skills(
+    conversation_id: Optional[str] = Query(None),
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """List skill-type capabilities the planner can mount.
 
     When ``conversation_id`` is provided, each item carries ``attached_to_current``
@@ -633,11 +905,10 @@ def list_planner_skills(conversation_id: Optional[str] = Query(None)):
     lock_reason) derived from ``resolve_effective_skills()`` so the frontend shows
     the REAL effective set rather than treating selected as effective."""
     selected: set = set()
+    scope = coerce_planner_scope(scope)
     if conversation_id:
         with Session(engine) as session:
-            row = session.exec(
-                select(PlannerSession).where(PlannerSession.conversation_id == conversation_id)
-            ).first()
+            row = _require_scoped_row(session, conversation_id, scope)
             if row is not None:
                 selected = set(_parse_json_list(getattr(row, "selected_skills", "[]") or "[]"))
 

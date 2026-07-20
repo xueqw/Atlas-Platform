@@ -49,7 +49,7 @@ function PlannerPageInner() {
   const [showThinkDetail, setShowThinkDetail] = useState(false);
   const [showDoneSteps, setShowDoneSteps] = useState(false);
   const [mobileShowPanel, setMobileShowPanel] = useState(false);
-  const [models, setModels] = useState<Array<{ model_id: string; display_name: string; provider: string }>>([]);
+  const [models, setModels] = useState<Array<{ model_id: string; display_name: string; provider: string; configured: boolean }>>([]);
   const [platformCapabilities, setPlatformCapabilities] = useState<Array<{ id: number; type: string; name: string; description: string; config: string }>>([]);
   const [selectedPlatformCapabilityIds, setSelectedPlatformCapabilityIds] = useState<number[]>([]);
   // Proposal chip viewer state. Fetch happens in the click handler (not an
@@ -74,6 +74,7 @@ function PlannerPageInner() {
   } = view;
 
   const imageSupported = isMultimodalModel(selectedModel);
+  const selectedModelConfigured = models.find((model) => model.model_id === selectedModel)?.configured ?? false;
 
   // Open a proposal.json chip from the chat: fetch its content then show a modal.
   const openProposalFile = async (filename: string) => {
@@ -94,6 +95,10 @@ function PlannerPageInner() {
 
   const handleSend = () => {
     if (!input.trim() && pendingAttachments.length === 0) return;
+    if (!selectedModelConfigured) {
+      toast.error("当前模型渠道尚未配置，请先在能力库的模型配置中填写并测试渠道");
+      return;
+    }
     const selectedCapabilities = platformCapabilities.filter((item) => selectedPlatformCapabilityIds.includes(item.id));
     const capabilityContext = selectedCapabilities.length === 0 ? "" : [
       "[用户手动选择的本次规划能力]",
@@ -119,7 +124,7 @@ function PlannerPageInner() {
 
     (async () => {
       api.listModels().then((m) => {
-        if (!cancelled.current) setModels(m.map((x) => ({ model_id: x.model_id, display_name: x.display_name, provider: x.provider })));
+        if (!cancelled.current) setModels(m.map((x) => ({ model_id: x.model_id, display_name: x.display_name, provider: x.provider, configured: x.configured })));
       }).catch(() => {});
       api.listCapabilities().then((items) => {
         if (!cancelled.current) setPlatformCapabilities(items.filter((item) => item.config.includes("atlas_platform")));
@@ -164,7 +169,7 @@ function PlannerPageInner() {
       if (now - last < 3000) return;
       last = now;
       api.listModels()
-        .then((m) => setModels(m.map((x) => ({ model_id: x.model_id, display_name: x.display_name, provider: x.provider }))))
+        .then((m) => setModels(m.map((x) => ({ model_id: x.model_id, display_name: x.display_name, provider: x.provider, configured: x.configured }))))
         .catch(() => {});
     };
     window.addEventListener("focus", onFocus);
@@ -589,10 +594,21 @@ function PlannerPageInner() {
                   title="切换模型（仅影响当前会话）"
                 >
                   {models.map((m) => (
-                    <option key={m.model_id} value={m.model_id}>{m.display_name}</option>
+                    <option key={m.model_id} value={m.model_id} disabled={!m.configured}>
+                      {m.display_name}{m.configured ? "" : "（未配置）"}
+                    </option>
                   ))}
-                  {models.length === 0 && <option value="qwen3.6-27b">Qwen 3.6 27B</option>}
+                  {models.length === 0 && <option value="" disabled>暂无已配置模型</option>}
                 </select>
+                {!selectedModelConfigured && (
+                  <button
+                    type="button"
+                    onClick={() => router.push("/capabilities")}
+                    className="text-[10px] font-medium text-primary hover:underline whitespace-nowrap"
+                  >
+                    配置模型
+                  </button>
+                )}
                 <PlannerSelfSkills
                   conversationId={activeConvId}
                   selectedSkills={selectedSkills}
@@ -601,7 +617,7 @@ function PlannerPageInner() {
                 />
                 <Button
                   onClick={handleSend}
-                  disabled={!connected || (!input.trim() && pendingAttachments.length === 0) || isSending}
+                  disabled={!connected || !selectedModelConfigured || (!input.trim() && pendingAttachments.length === 0) || isSending}
                   size="icon"
                   className="h-9 w-9 rounded-lg shrink-0"
                 >

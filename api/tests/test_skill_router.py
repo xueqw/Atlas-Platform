@@ -5,8 +5,13 @@ from app.skill_router import (
     discover_skill_metadata,
     load_selected_skill_content,
     merge_selected_ids,
+    persisted_vector_scores,
+    persisted_vector_scores_from_db,
     route_skills,
+    validate_skill_metadata,
 )
+from app.models import Skill
+from sqlalchemy.dialects import postgresql
 
 
 SKILLS = [
@@ -38,6 +43,44 @@ def test_progressive_discovery_never_leaks_content():
     assert "content" not in metadata[0]
     assert "SECRET" not in str(metadata)
     assert load_selected_skill_content(SKILLS, ["minutes"])[0]["content"].startswith("SECRET")
+
+
+def test_postgresql_skill_vector_recall_orders_and_limits_inside_database():
+    captured = []
+
+    class Database:
+        def get_bind(self):
+            return type("Bind", (), {"dialect": postgresql.dialect()})()
+
+        def execute(self, statement):
+            captured.append(str(statement.compile(dialect=postgresql.dialect())))
+            return type("Rows", (), {"all": lambda self: []})()
+
+    assert persisted_vector_scores_from_db(
+        Database(), Skill, workspace_id="ws", query_vector=[1.0, 0.0],
+        permitted_ids=["skill-1", "skill-2"], limit=8,
+    ) == {}
+    sql = captured[0]
+    assert "<=>" in sql
+    assert "ORDER BY" in sql and "LIMIT" in sql
+    assert "skills.workspace_id" in sql and "skills.id IN" in sql
+
+
+def test_skill_vector_recall_fallback_is_sqlite_only():
+    class Database:
+        def __init__(self, name):
+            self.bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": name})()})()
+
+        def get_bind(self):
+            return self.bind
+
+    assert persisted_vector_scores_from_db(
+        Database("sqlite"), Skill, workspace_id="ws", query_vector=[1.0]
+    ) == {}
+    with pytest.raises(RuntimeError, match="PostgreSQL/pgvector or SQLite"):
+        persisted_vector_scores_from_db(
+            Database("mysql"), Skill, workspace_id="ws", query_vector=[1.0]
+        )
 
 
 def test_negative_scenario_is_not_selected():
@@ -103,3 +146,31 @@ def test_category_tree_has_three_level_limit():
         discover_skill_metadata(
             [{"id": "too-deep", "category_path": ["a", "b", "c", "d"]}]
         )
+
+
+def test_tree_first_routing_and_distinct_rerank_scores():
+    audit = route_skills(
+        SKILLS,
+        query="meeting notes",
+        permitted_ids={"minutes", "medical"},
+        keyword_scores={"minutes": 0.9, "medical": 0.2},
+        vector_scores={"minutes": 0.8, "medical": 0.7},
+    )
+    assert audit["tree_decision"]["selected"] == "work"
+    assert [candidate["id"] for candidate in audit["recall"]] == ["minutes"]
+    assert audit["recall"][0]["recall_score"] != audit["rerank"][0]["rerank_score"]
+
+
+def test_full_metadata_validation_and_persisted_vector_scoring():
+    valid = {**SKILLS[0], "input_schema": {"type": "object", "properties": {"notes": {"type": "string"}}, "required": ["notes"]}, "permissions": ["calendar.read"]}
+    assert validate_skill_metadata(valid)["id"] == "minutes"
+    with pytest.raises(ValueError, match="semantic versioning"):
+        validate_skill_metadata({**valid, "version": "latest"})
+    with pytest.raises(ValueError, match="declared properties"):
+        validate_skill_metadata({**valid, "input_schema": {"type": "object", "properties": {}, "required": ["missing"]}})
+
+    class Stored:
+        id = "minutes"
+        embedding = "[1.0, 0.0]"
+
+    assert persisted_vector_scores([Stored()], [1.0, 0.0]) == {"minutes": 1.0}

@@ -42,13 +42,15 @@ _EXPECTED_FIELDS = {
     "decisions_pending", "decisions_confirmed", "tradeoffs", "risks",
     "architecture_pattern", "runtime_strategy", "memory_strategy",
     "knowledge_strategy", "evaluation_strategy", "apply_readiness",
+    # planner memory integrity metadata
+    "goal_anchor", "memory_update_audit", "pending_continuation",
 }
 
 
-def test_new_memory_has_all_20_fields_with_safe_defaults():
+def test_new_memory_has_all_fields_with_safe_defaults():
     mem = _new_memory()
     assert set(mem.keys()) == _EXPECTED_FIELDS
-    assert len(mem) == 20
+    assert len(mem) == 23
     # list fields default to []
     for k in ("confirmed_constraints", "user_feedback", "open_questions",
               "assumptions", "non_goals", "success_metrics", "decisions_pending",
@@ -64,6 +66,9 @@ def test_new_memory_has_all_20_fields_with_safe_defaults():
         assert mem[k] == "", k
     # apply_readiness default status
     assert mem["apply_readiness"] == {"status": "not_ready", "missing": [], "recommendation": ""}
+    assert mem["goal_anchor"] == {}
+    assert mem["memory_update_audit"] == []
+    assert mem["pending_continuation"] == {}
 
 
 # ─── 7.1 tolerant merge ─────────────────────────────────────────────────────
@@ -75,7 +80,7 @@ def test_merge_updates_produced_fields_keeps_missing():
     _merge_memory_update(mem, {"task_classification": "简单RAG", "risks": ["新风险A", "新风险B"]})
     # produced fields updated
     assert mem["task_classification"] == "简单RAG"
-    assert mem["risks"] == ["新风险A", "新风险B"]
+    assert mem["risks"] == ["旧风险", "新风险A", "新风险B"]
     # missing fields keep old value
     assert mem["requirement_summary"] == "旧需求"
 
@@ -115,7 +120,11 @@ def test_merge_malformed_field_is_skipped_not_fatal():
 
 def test_merge_apply_readiness_merges_onto_default():
     mem = _new_memory()
-    _merge_memory_update(mem, {"apply_readiness": {"status": "ready"}})
+    _merge_memory_update(
+        mem,
+        {"apply_readiness": {"status": "ready"}},
+        has_validated_proposal=True,
+    )
     # status overridden, other keys keep safe defaults
     assert mem["apply_readiness"]["status"] == "ready"
     assert mem["apply_readiness"]["missing"] == []
@@ -208,7 +217,10 @@ def test_persist_and_load_round_trip_preserves_richer_state():
     assert len(lm["decisions_confirmed"]) == 1
     assert lm["decisions_confirmed"][0]["topic"] == "知识库"
     assert lm["decisions_confirmed"][0]["effect_on_plan"] == "新增 K 节点"
-    assert lm["apply_readiness"]["status"] == "ready"
+    # A legacy/model-authored ready flag is revalidated on load and cannot
+    # survive without a persisted validated proposal.
+    assert lm["apply_readiness"]["status"] == "not_ready"
+    assert "validated_proposal" in lm["apply_readiness"]["missing"]
 
 
 def test_load_session_reconstructs_pending_a2ui_from_decisions_pending():

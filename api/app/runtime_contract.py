@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 import json
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 RUNTIME_EVENT_SCHEMA = "atlas.runtime-event.v1"
@@ -27,6 +27,15 @@ class RuntimeSource(str, Enum):
     PREVIEW = "preview"
     API = "api"
     EVALUATION = "evaluation"
+
+
+class ExecutionStrategy(str, Enum):
+    """Requested/selected execution policy; AUTO is never a terminal selection."""
+
+    AUTO = "auto"
+    REACT = "react"
+    PLAN_EXECUTE_REVIEW = "plan-execute-review"
+    MULTI_AGENT_PLAN_EXECUTE_REVIEW = "multi-agent-plan-execute-review"
 
 
 class RuntimeStatus(str, Enum):
@@ -80,6 +89,7 @@ class RuntimeStartRequest(RuntimeContractModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     conversation_id: str | None = Field(default=None, max_length=128)
     requested_resources: tuple[str, ...] = ()
+    execution_strategy: ExecutionStrategy = ExecutionStrategy.AUTO
 
     @field_validator("requested_resources")
     @classmethod
@@ -107,6 +117,7 @@ class RuntimeHandle(RuntimeContractModel):
     thread_id: str
     status: RuntimeStatus
     execution_mode: str
+    execution_strategy: str = ExecutionStrategy.AUTO.value
     created_at: datetime
 
 
@@ -114,6 +125,57 @@ class RuntimeResumeRequest(RuntimeContractModel):
     run_id: str = Field(min_length=1, max_length=128)
     workspace_id: str = Field(min_length=1, max_length=128)
     user_id: str = Field(min_length=1, max_length=128)
+    interrupt_id: str | None = Field(default=None, min_length=1, max_length=128)
+    nonce: str | None = Field(default=None, min_length=1, max_length=128)
+    decision: Literal["approve", "deny"] | None = None
+    parameter_digest: str | None = Field(default=None, min_length=1, max_length=128)
+    resource_version: str | None = Field(default=None, min_length=1, max_length=128)
+    escalation_decision: Literal["approve", "deny"] | None = None
+
+    @model_validator(mode="after")
+    def interrupt_fields_are_complete(self) -> "RuntimeResumeRequest":
+        fields = (
+            self.interrupt_id, self.nonce, self.decision,
+            self.parameter_digest, self.resource_version,
+        )
+        if any(item is not None for item in fields) and not all(item is not None for item in fields):
+            raise ValueError("interrupt resume fields must be provided together")
+        return self
+
+
+class RuntimeInterruptCreate(RuntimeContractModel):
+    """JSON-only, actor-bound authorization envelope persisted before pausing."""
+
+    run_id: str = Field(min_length=1, max_length=128)
+    workspace_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=128)
+    parameter_digest: str = Field(min_length=1, max_length=128)
+    resource_version: str = Field(min_length=1, max_length=128)
+    scope: tuple[str, ...] = ()
+    nonce: str = Field(min_length=16, max_length=128)
+    expires_at: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def interrupt_payload_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        RuntimeTransition(event_type="interrupt.validation", payload=value)
+        return value
+
+
+class RuntimeInterruptRecord(RuntimeContractModel):
+    interrupt_id: str
+    run_id: str
+    workspace_id: str
+    user_id: str
+    status: Literal["pending", "approved", "denied", "expired"]
+    parameter_digest: str
+    resource_version: str
+    scope: tuple[str, ...] = ()
+    nonce: str
+    expires_at: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+    resolved_at: datetime | None = None
 
 
 class RuntimeTransition(RuntimeContractModel):
@@ -154,6 +216,12 @@ class RuntimeEvent(RuntimeContractModel):
 class RuntimeState(RuntimeContractModel):
     identity: RuntimeIdentity
     status: RuntimeStatus
+    execution_strategy: str = ""
+    plan_version: int = 0
+    review_round: int = 0
+    revision_round: int = 0
+    replan_count: int = 0
+    review_result: dict[str, Any] = Field(default_factory=dict)
     node_status: dict[str, str] = Field(default_factory=dict)
     retry_counters: dict[str, int] = Field(default_factory=dict)
     errors: tuple[dict[str, Any], ...] = ()

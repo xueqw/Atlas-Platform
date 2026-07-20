@@ -5,7 +5,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 from .config import settings
 
@@ -31,6 +33,35 @@ def _may_fallback_to_local() -> bool:
     return not settings.code_runner_required and settings.environment != "production"
 
 
+def _remove_container(*, name: str, cidfile: Path) -> None:
+    """Best-effort removal for a Docker run interrupted before ``--rm`` fires.
+
+    Killing the local ``docker run`` client does not necessarily stop the
+    daemon-managed container. Prefer the cid recorded by Docker, while keeping
+    the unique name as a fallback for failures before the cidfile is written.
+    """
+
+    identifier = name
+    try:
+        candidate = cidfile.read_text(encoding="utf-8").strip()
+        if candidate:
+            identifier = candidate
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", identifier],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Preserve the original runner exception. Health checks and the release
+        # probe surface a daemon that cannot complete forced cleanup.
+        pass
+
+
 def run_python(project_dir: Path, timeout: int) -> subprocess.CompletedProcess[str]:
     if settings.code_runner_backend != "docker":
         if settings.code_runner_required or settings.environment == "production":
@@ -41,22 +72,36 @@ def run_python(project_dir: Path, timeout: int) -> subprocess.CompletedProcess[s
     if runner_uid == 0:
         raise RuntimeError("Atlas service must not run code-agent containers as root")
 
-    command = [
-        "docker", "run", "--rm", "--network", "none", "--read-only",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--memory", settings.code_runner_memory, "--cpus", str(settings.code_runner_cpus),
-        "--pids-limit", str(settings.code_runner_pids_limit),
-        "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m",
-        "--user", f"{runner_uid}:{runner_gid}",
-        "--mount", f"type=bind,src={project_dir.resolve()},dst=/workspace,readonly",
-        settings.code_runner_image,
-    ]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    except OSError:
-        if _may_fallback_to_local():
-            return _run_local(project_dir, timeout)
-        raise
+    container_name = f"atlas-runner-{uuid.uuid4().hex}"
+    with tempfile.TemporaryDirectory(prefix="atlas-runner-control-") as control_dir:
+        cidfile = Path(control_dir) / "container.cid"
+        command = [
+            "docker", "run", "--rm", "--name", container_name,
+            "--cidfile", str(cidfile), "--label", "com.atlas.runner=true",
+            "--init", "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", settings.code_runner_memory,
+            "--memory-swap", settings.code_runner_memory,
+            "--cpus", str(settings.code_runner_cpus),
+            "--pids-limit", str(settings.code_runner_pids_limit),
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m",
+            "--user", f"{runner_uid}:{runner_gid}",
+            "--mount", f"type=bind,src={project_dir.resolve()},dst=/workspace,readonly",
+            settings.code_runner_image,
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _remove_container(name=container_name, cidfile=cidfile)
+            raise
+        except OSError:
+            _remove_container(name=container_name, cidfile=cidfile)
+            if _may_fallback_to_local():
+                return _run_local(project_dir, timeout)
+            raise
+        except BaseException:
+            _remove_container(name=container_name, cidfile=cidfile)
+            raise
     if result.returncode and _may_fallback_to_local() and any(
         marker in (result.stderr or "").lower()
         for marker in ("cannot connect", "no such image", "not recognized", "is not running")

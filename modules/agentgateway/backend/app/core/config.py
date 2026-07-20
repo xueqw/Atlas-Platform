@@ -5,20 +5,37 @@ from pathlib import Path
 from typing import Optional
 
 
+def _read_dotenv(env_path: Path) -> dict[str, str]:
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    with open(env_path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
 def _load_dotenv():
-    """Load .env file from the backend directory."""
+    """Load local overrides, then a shared worktree-safe secret source."""
     env_path = Path(__file__).parent.parent.parent / ".env"
-    if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key not in os.environ:
-                    os.environ[key] = value
+    local = _read_dotenv(env_path)
+    shared_value = os.environ.get("ATLAS_SHARED_ENV_FILE") or local.get("ATLAS_SHARED_ENV_FILE", "")
+    sources = (local, _read_dotenv(Path(shared_value).expanduser()) if shared_value else {})
+    for values in sources:
+        for key, value in values.items():
+            if key not in os.environ:
+                os.environ[key] = value
+
+    # Atlas names its 智谱 channel ZHIPU_* while AgentGateway names the same
+    # OpenAI-compatible provider GLM_*. Keep the public configs compatible.
+    if not os.environ.get("GLM_API_KEY") and os.environ.get("ZHIPU_API_KEY"):
+        os.environ["GLM_API_KEY"] = os.environ["ZHIPU_API_KEY"]
+    if not os.environ.get("GLM_BASE_URL") and os.environ.get("ZHIPU_BASE_URL"):
+        os.environ["GLM_BASE_URL"] = os.environ["ZHIPU_BASE_URL"]
 
 
 _load_dotenv()

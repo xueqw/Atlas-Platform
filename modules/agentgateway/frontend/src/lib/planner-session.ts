@@ -96,6 +96,16 @@ export interface A2UIRequestData {
   allow_free_text?: boolean;
 }
 
+export interface PendingContinuationData {
+  request_id: string;
+  choice: string;
+  choice_label?: string;
+  token: string;
+  content: string;
+  status: "pending" | "processing";
+  created_at?: string;
+}
+
 // Whether an A2UI choice expresses "proceed" intent (confirm / create / apply /
 // yes …). When true, submitting it should auto-continue the planner turn so the
 // proposal / JSON is generated without the user having to type a follow-up.
@@ -113,8 +123,10 @@ const A2UI_NEGATIVE_RE = /(修改|调整|重新|再想|换成|取消|放弃|返�
 
 export function isAdvanceChoice(choiceId: string, label: string): boolean {
   const hay = `${label} ${choiceId}`.trim();
+  if (!hay) return false;
   if (A2UI_NEGATIVE_RE.test(hay)) return false;
-  // Explicit advance keyword → advance. Otherwise default to advance (planner is
+  if (A2UI_ADVANCE_RE.test(hay)) return true;
+  // Otherwise default to advance (planner is
   // waiting for ANY selection to continue — only negative choices need follow-up).
   return true;
 }
@@ -252,6 +264,11 @@ export interface SessionRuntime {
   files: PlanFileItemData[];
   finalSummary: string | null;
   a2uiRequest: A2UIRequestData | null;
+  // Guards duplicate card submissions while the backend durably records the
+  // decision. Continuation is dispatched only after a matching ACK.
+  pendingA2UIResponseId: string | null;
+  pendingContinuation: PendingContinuationData | null;
+  dispatchedContinuationToken: string | null;
   pendingAttachments: AttachmentMeta[];
   selectedSkills: string[];
   linkedAgentId: number | null;
@@ -304,10 +321,13 @@ export function blankRuntime(cid: string): SessionRuntime {
     files: [],
     finalSummary: null,
     a2uiRequest: null,
+    pendingA2UIResponseId: null,
+    pendingContinuation: null,
+    dispatchedContinuationToken: null,
     pendingAttachments: [],
     selectedSkills: [],
     linkedAgentId: null,
-    model: "qwen3.6-27b",
+    model: "glm-4-flash",
     provider: "glm",
     msgId: 0,
     lastActivity: 0,
@@ -346,12 +366,10 @@ export function inferStage(messages: Message[], proposal: Proposal | null): Plan
   if (proposal) return "ready_to_apply";
   const assistantMsgs = messages.filter((m) => m.role === "assistant");
   if (assistantMsgs.length <= 1) return "clarifying";
-  const lastAssistant = assistantMsgs[assistantMsgs.length - 1]?.content || "";
-  if (lastAssistant.includes("是否符合") || lastAssistant.includes("确认后") || lastAssistant.includes("需要调整")) {
-    return "awaiting_confirmation";
-  }
-  if (assistantMsgs.length >= 4) return "drafting";
-  return "clarifying";
+  // Confirmation/readiness stages are controlled by structured A2UI/proposal
+  // evidence. Text heuristics and assistant-message counts cannot prove that a
+  // resumable confirmation exists (and previously made empty turns look stuck).
+  return "drafting";
 }
 
 // Shape of a decoded WebSocket message from the planner backend.
@@ -407,6 +425,8 @@ export interface PlannerWsEvent {
   // plan_update fields (planner-plan-loop-refactor). Carries full Plan snapshot.
   plan?: Record<string, unknown>;
   stop_reason?: string | null;
+  pending_continuation?: PendingContinuationData | null;
+  continuation_token?: string;
 }
 
 // Side-effects the page component must perform after a reduce (the reducer itself
@@ -416,6 +436,7 @@ export interface ReduceEffects {
   refreshSessions?: boolean; // a turn completed → refresh sidebar
   refreshSkills?: boolean;   // skills mounted/unmounted → refresh skills popover
   toast?: string;            // surface an error toast (only if this is the active session)
+  resumeContinuation?: PendingContinuationData;
 }
 
 // Apply one decoded WS event to its owning runtime, in place. Returns which
@@ -450,9 +471,29 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
     const thinkText = rt.thinkBuf;
     rt.streamBuf = "";
     rt.thinkBuf = "";
+    const proposalFile = rt.pendingProposalFile;
+    // A provider/older backend can close a successful-looking stream without
+    // visible content. Treat that as a recoverable failure: reasoning alone is
+    // not a usable assistant answer, and must not create an empty persisted/UI
+    // turn or advance the stage.
+    if (!content.trim() && !proposalFile && !rt.a2uiRequest) {
+      rt.thinkBuf = "";
+      rt.pendingTriggeredSkills = null;
+      return {
+        changed: true,
+        toast: "模型未返回可用内容，本轮未保存。请重试。",
+      };
+    }
+    if (!content.trim() && rt.a2uiRequest) {
+      // A structured confirmation card is itself a usable control result. It
+      // deliberately does not create a blank chat bubble; the pending request
+      // remains the stage evidence and waits for the user's decision.
+      rt.thinkBuf = "";
+      rt.pendingTriggeredSkills = null;
+      return { changed: true, refreshSessions: true };
+    }
     rt.msgId++;
     const fullContent = thinkText ? `<think>${thinkText}</think>\n${content}` : content;
-    const proposalFile = rt.pendingProposalFile;
     // Stamp the skills this turn ACTUALLY triggered onto the message (result
     // attribution). Prefer the explicit done payload; fall back to what the
     // skill-attributed activities accumulated this turn.
@@ -504,6 +545,15 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
     rt.activities = [];
     rt.runEvents = [];
     rt.pendingTriggeredSkills = null;
+    rt.pendingA2UIResponseId = null;
+    const pendingContinuation = msg.pending_continuation;
+    rt.pendingContinuation = (
+      (pendingContinuation?.status === "pending" || pendingContinuation?.status === "processing")
+      && !!pendingContinuation.request_id
+      && !!pendingContinuation.choice
+      && !!pendingContinuation.token
+      && !!pendingContinuation.content
+    ) ? pendingContinuation : null;
     if (msg.memory) {
       rt.memory = msg.memory;
       const sk = (msg.memory as PlannerMemory & { selected_skills?: string[] }).selected_skills;
@@ -519,9 +569,12 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
     // is what produced duplicate React keys. Ids come from the monotonic, never-reused
     // counter (D1), so a later hydrate can never land back on an id already in use.
     if (Array.isArray(msg.messages) && msg.messages.length > 0 && rt.messages.length === 0) {
-      const hydrated: Message[] = msg.messages.map((m) => {
+      const hydrated: Message[] = msg.messages.flatMap((m) => {
         const role = m.role === "user" ? "user" : "assistant";
         const { content, proposalFile } = extractProposalFile(m.content || "");
+        // Defensive migration for sessions created before the backend stopped
+        // persisting empty assistant completions.
+        if (role === "assistant" && !content.trim() && !proposalFile) return [];
         const msgItem: Message = { id: ++rt.msgId, role, content: stripMemoryUpdate(content) };
         if (role === "assistant" && proposalFile) msgItem.proposalFile = proposalFile;
         // Restore the result-attribution badge from persisted message metadata
@@ -529,12 +582,17 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
         if (role === "assistant" && Array.isArray(m.triggered_skills) && m.triggered_skills.length) {
           msgItem.triggeredSkills = m.triggered_skills;
         }
-        return msgItem;
+        return [msgItem];
       });
       rt.messages = hydrated;
     }
     if (Array.isArray(msg.file_artifacts)) rt.files = msg.file_artifacts;
-    return { changed: true };
+    return {
+      changed: true,
+      ...(rt.pendingContinuation
+        ? { resumeContinuation: rt.pendingContinuation }
+        : {}),
+    };
   }
   if (msg.type === "plan_file_updated" && msg.filename) {
     const item: PlanFileItemData = {
@@ -550,6 +608,11 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
   }
   if (msg.type === "final_summary") {
     rt.finalSummary = msg.text || "";
+    // Some Plan+Loop paths deliver the user-visible answer only in the
+    // structured final_summary event. Preserve it as this turn's visible
+    // content so the following done is meaningful without inventing an empty
+    // proposal artifact.
+    if (msg.text?.trim() && !rt.streamBuf.trim()) rt.streamBuf = msg.text.trim();
     if (Array.isArray(msg.files)) rt.files = msg.files;
     // Result attribution: a proposal turn's final_summary carries the skills it
     // actually triggered; prime them so the upcoming assistant message is stamped.
@@ -559,12 +622,15 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
     // The structured proposal now rides on this event (the chat no longer
     // carries the JSON). Drive PlannerPanel + apply from it, and mark the
     // upcoming assistant turn to render a proposal.json file chip.
-    if (msg.proposal && typeof msg.proposal === "object") {
+    const hasStructuredProposal = !!msg.proposal && typeof msg.proposal === "object";
+    if (hasStructuredProposal) {
       rt.proposal = msg.proposal as Proposal;
       rt.stage = "ready_to_apply";
     }
     const propFile = (msg.files || []).find((f) => (f.filename || f.path || "").endsWith("proposal.json"));
-    rt.pendingProposalFile = propFile ? (propFile.filename || propFile.path.split("/").pop() || "proposal.json") : "proposal.json";
+    rt.pendingProposalFile = propFile
+      ? (propFile.filename || propFile.path.split("/").pop() || "proposal.json")
+      : hasStructuredProposal ? "proposal.json" : null;
     return { changed: true };
   }
   if (msg.type === "a2ui_request" && Array.isArray(msg.options) && msg.options.length > 0) {
@@ -580,10 +646,16 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
       options: msg.options,
       allow_free_text: !!msg.allow_free_text,
     };
+    rt.stage = "awaiting_confirmation";
     return { changed: true };
   }
   if (msg.type === "a2ui_recorded") {
     rt.a2uiRequest = null;
+    rt.pendingA2UIResponseId = null;
+    return { changed: true };
+  }
+  if (msg.type === "continuation_completed") {
+    rt.pendingContinuation = null;
     return { changed: true };
   }
   if (msg.type === "skill_attached_ok" || msg.type === "skill_detached_ok") {
@@ -768,6 +840,7 @@ export function reduceWsEvent(rt: SessionRuntime, msg: PlannerWsEvent, now: numb
     rt.thinking = false;
     rt.streamBuf = "";
     rt.thinkBuf = "";
+    rt.pendingA2UIResponseId = null;
     // Finalize any in-progress timeline steps so an errored turn doesn't leave
     // a step spinning forever.
     if (rt.activities.some((a) => a.status === "active")) {
@@ -853,4 +926,3 @@ export async function runPlannerBootstrap(p: BootstrapParams): Promise<void> {
     }
   }
 }
-

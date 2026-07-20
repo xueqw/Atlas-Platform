@@ -1,11 +1,12 @@
 "use client";
-import { useState } from "react";
-import { X, Play, Clock } from "lucide-react";
+import { useRef, useState } from "react";
+import { Play, Clock, Square, ShieldCheck, ShieldX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { getApiBase } from "@/lib/runtime-env";
+import { useAtlasRuntimeExecution } from "@/lib/atlas-runtime";
 
 interface Props {
   nodeId: string;
@@ -30,6 +31,35 @@ export default function NodeDebugDialog({
   const [running, setRunning] = useState(false);
   const [duration, setDuration] = useState<number | null>(null);
   const [tokens, setTokens] = useState<number>(0);
+  const startedAtRef = useRef(0);
+  const streamedOutputRef = useRef("");
+  const runtime = useAtlasRuntimeExecution(agentId, {
+    onEvent: (event) => {
+      if ((event.type === "token.delta" || event.type === "response.token") && typeof event.payload.token === "string") {
+        streamedOutputRef.current += event.payload.token;
+        setOutput(streamedOutputRef.current);
+      }
+      if (event.type === "interrupt.requested") setRunning(false);
+      if (event.type === "run.completed") {
+        const finalOutput = event.payload.output;
+        if (typeof finalOutput === "string" && finalOutput) setOutput(finalOutput);
+        setDuration(Math.round(performance.now() - startedAtRef.current));
+        setRunning(false);
+      } else if (event.type === "run.failed") {
+        setError(String(event.payload.message || event.payload.error || "Atlas Runtime 执行失败"));
+        setDuration(Math.round(performance.now() - startedAtRef.current));
+        setRunning(false);
+      } else if (event.type === "run.cancelled") {
+        setError("运行已取消");
+        setDuration(Math.round(performance.now() - startedAtRef.current));
+        setRunning(false);
+      }
+    },
+    onError: (message) => {
+      setError(message);
+      setRunning(false);
+    },
+  });
 
   const handleRun = async () => {
     setRunning(true);
@@ -37,6 +67,25 @@ export default function NodeDebugDialog({
     setError("");
     setDuration(null);
     const t0 = performance.now();
+    startedAtRef.current = t0;
+    streamedOutputRef.current = "";
+
+    if (runtime.embedded) {
+      if (runtime.mappingError) {
+        setError(runtime.mappingError);
+        setRunning(false);
+        return;
+      }
+      const started = runtime.start(JSON.stringify({ node_id: nodeId, node_type: nodeType, config, inputs }), [
+        `agentgateway:agent:${agentId}`,
+        `agentgateway:dag-node:${nodeId}`,
+      ]);
+      if (!started) {
+        setError("Atlas Runtime Bridge 尚未就绪");
+        setRunning(false);
+      }
+      return;
+    }
 
     try {
       // Send debug request via WebSocket or REST
@@ -95,10 +144,33 @@ export default function NodeDebugDialog({
           )}
 
           {/* Run button */}
-          <Button onClick={handleRun} disabled={running} className="w-full">
+          <Button onClick={handleRun} disabled={running || Boolean(runtime.pendingInterrupt)} className="w-full">
             <Play className="w-4 h-4 mr-2" />
             {running ? "执行中..." : "运行"}
           </Button>
+
+          {runtime.embedded && runtime.running && (
+            <Button type="button" variant="outline" onClick={runtime.cancel} className="w-full">
+              <Square className="w-4 h-4 mr-2" />取消运行
+            </Button>
+          )}
+
+          {runtime.pendingInterrupt && (
+            <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+              <p className="text-sm font-medium">工具写操作等待用户授权</p>
+              <p className="text-xs text-muted-foreground">
+                授权范围：{runtime.pendingInterrupt.scope.join("、") || "未声明"}
+              </p>
+              <div className="flex gap-2">
+                <Button type="button" size="sm" onClick={() => runtime.resolveInterrupt("approve")}>
+                  <ShieldCheck className="w-4 h-4 mr-1" />授权并继续
+                </Button>
+                <Button type="button" size="sm" variant="destructive" onClick={() => runtime.resolveInterrupt("deny")}>
+                  <ShieldX className="w-4 h-4 mr-1" />拒绝
+                </Button>
+              </div>
+            </div>
+          )}
 
           {/* Duration & tokens */}
           {duration !== null && (

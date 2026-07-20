@@ -16,7 +16,7 @@ import os
 # Default runtime model for newly created planner sessions / agent nodes. Keep this
 # on a model that is available through the configured GLM gateway and verified for
 # planner/function-calling flows.
-DEFAULT_CHAT_MODEL_ID = "glm-4-flash"
+DEFAULT_CHAT_MODEL_ID = "glm-4.7-flash"
 DEFAULT_CHAT_PROVIDER = "glm"
 
 # Model ids (or id prefixes) that accept image input via the OpenAI-compatible
@@ -52,7 +52,7 @@ def is_multimodal(model_id: str) -> bool:
 # gateway's model roster is small and known. Extend after verifying a new model
 # actually emits `finish_reason: tool_calls`.
 FUNCTION_CALLING_MODELS: frozenset[str] = frozenset({
-    "glm-4-flash",
+    "glm-4.7-flash",
 })
 
 
@@ -83,7 +83,7 @@ _PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("o4", "openai"),
     ("claude", "anthropic"),
     ("deepseek", "deepseek"),
-    ("qwen", "openai"),
+    ("qwen", "glm"),
     ("glm", "glm"),
     ("doubao", "glm"),
     ("kimi", "glm"),

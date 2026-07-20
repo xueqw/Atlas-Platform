@@ -37,6 +37,13 @@
 - API Key、额度、来源限制、调用日志、版本对比与回滚
 - 高风险写连接器需要工作空间所有者批准
 
+### 自适应 Agent 执行
+- 简单任务自动使用有界 ReAct，复杂任务使用 Plan-Execute-Review
+- 可拆解任务由 Orchestrator 创建隔离 Worker，并按 DAG 并行执行
+- 复杂任务必须经过独立、只读 Reviewer Subagent 才能成功
+- Agent 间只交换版本化 Plan/Task/Result/Review JSON Schema
+- Review 支持 PASS、REVISE、REPLAN、REJECT 与 ESCALATE，并限制返工轮次
+
 ## 一键启动
 
 ```powershell
@@ -67,6 +74,6 @@ React - TypeScript - FastAPI - SQLAlchemy - PostgreSQL/pgvector - Redis - MinIO 
 - 代码型 Agent 在禁网、只读、限 CPU/内存/PID 的一次性 Docker 容器中运行。
 - HTML 预览使用无同源权限的 sandbox iframe，并注入限制性 CSP。
 - 连接器凭据加密入库，平台密钥支持通过 `*_FILE` 挂载注入。
-- `scripts/backup.sh` 提供 PostgreSQL、MinIO、Redis 和 Agent 代码的每日备份。
+- `scripts/backup.sh` 提供 PostgreSQL、MinIO 对象和 Agent 代码的每日备份；Redis 仅承载非权威热状态，不进入备份，恢复时会被清空并由 PostgreSQL 重建。
 
 完整准备、迁移、上线、回滚和离线镜像步骤见 [生产部署手册](docs/deployment/production.md)。

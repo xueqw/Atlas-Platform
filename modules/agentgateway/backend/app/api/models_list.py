@@ -2,8 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from typing import List
 import json
+import os
 
 from app.core.database import get_session
+from app.core.config import credential_gap
+from app.core.model_caps import resolve_model_endpoint
 from app.models.db import CapabilityItem
 from app.models.schemas import ModelRegistryResponse
 
@@ -43,6 +46,26 @@ def _capability_to_model(item: CapabilityItem) -> ModelRegistryResponse | None:
     )
 
 
+def _with_configuration_status(
+    model: ModelRegistryResponse,
+    session: Session,
+) -> ModelRegistryResponse:
+    """Annotate a catalog model without exposing any credential values."""
+    endpoint = resolve_model_endpoint(model.model_id, session=session)
+    provider = str(endpoint.get("provider") or model.provider)
+    configured = credential_gap(provider, endpoint) is None
+    allowlist = {
+        item.strip()
+        for item in os.environ.get("AGENTGATEWAY_MODEL_ALLOWLIST", "").split(",")
+        if item.strip()
+    }
+    if allowlist and model.model_id not in allowlist:
+        configured = False
+    return model.model_copy(
+        update={"configured": configured}
+    )
+
+
 @router.get("", response_model=List[ModelRegistryResponse])
 def list_models(session: Session = Depends(get_session)):
     """List all available models from the single source of truth.
@@ -64,7 +87,7 @@ def list_models(session: Session = Depends(get_session)):
         if projected.model_id in seen:
             continue
         seen.add(projected.model_id)
-        out.append(projected)
+        out.append(_with_configuration_status(projected, session))
     return out
 
 
@@ -77,4 +100,4 @@ def get_model(model_id: int, session: Session = Depends(get_session)):
     projected = _capability_to_model(item)
     if projected is None:
         raise HTTPException(status_code=404, detail="Model not found")
-    return projected
+    return _with_configuration_status(projected, session)

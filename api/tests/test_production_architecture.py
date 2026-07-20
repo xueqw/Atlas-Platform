@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import subprocess
 
+import pytest
 from sqlalchemy import select
 
 
@@ -20,6 +21,27 @@ def test_knowledge_upload_persists_original(auth_client):
         row = db.scalar(select(Document).where(Document.id == response.json()["id"]))
         assert row and row.object_key.startswith("workspaces/")
         assert object_storage.get(row.object_key) == b"Atlas production knowledge document"
+
+
+def test_production_required_object_storage_fails_closed_without_minio(monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main.settings, "environment", "production")
+    monkeypatch.setattr(main.settings, "secret_encryption_key", "acceptance-key")
+    monkeypatch.setattr(main.settings, "object_storage_required", True)
+    monkeypatch.setattr(main.settings, "object_storage_backend", "local")
+
+    with pytest.raises(RuntimeError, match="OBJECT_STORAGE_BACKEND=minio"):
+        main.startup()
+
+
+def test_unknown_object_storage_backend_is_never_treated_as_local(monkeypatch):
+    from app import object_storage as storage_module
+
+    monkeypatch.setattr(storage_module.settings, "object_storage_backend", "minoi-typo")
+    storage = storage_module.ObjectStorage()
+
+    assert storage.ping() is False
 
 
 def test_agent_memory_is_private_per_user(auth_client, monkeypatch):
@@ -94,8 +116,34 @@ def test_docker_runner_has_security_limits(tmp_path, monkeypatch):
     assert "--read-only" in command
     assert ["--cap-drop", "ALL"] == command[command.index("--cap-drop"):command.index("--cap-drop") + 2]
     assert "no-new-privileges" in command
+    assert "--init" in command
+    assert command[command.index("--memory-swap") + 1] == code_runner.settings.code_runner_memory
+    assert command[command.index("--name") + 1].startswith("atlas-runner-")
+    assert command[command.index("--cidfile") + 1].endswith("container.cid")
     assert command[command.index("--user") + 1] == f"{getattr(os, 'getuid', lambda: 1000)()}:{getattr(os, 'getgid', lambda: 1000)()}"
     assert command[command.index("--mount") + 1].endswith("readonly")
+
+
+def test_docker_runner_force_removes_container_after_timeout(tmp_path, monkeypatch):
+    from app import code_runner
+
+    (tmp_path / ".atlas_runner.py").write_text("while True: pass", encoding="utf-8")
+    monkeypatch.setattr(code_runner.settings, "code_runner_backend", "docker")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["docker", "run"]:
+            Path(command[command.index("--cidfile") + 1]).write_text("a" * 64, encoding="utf-8")
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(code_runner.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.TimeoutExpired):
+        code_runner.run_python(tmp_path, 1)
+
+    _, cleanup_command = calls
+    assert cleanup_command == ["docker", "rm", "-f", "a" * 64]
 
 
 def test_preview_html_injects_restrictive_csp():

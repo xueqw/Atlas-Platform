@@ -107,6 +107,13 @@ class AgentNode(BaseNode):
         model only hits the DB once. Returns an empty dict on any failure so the
         caller falls back to the node's static config.provider.
         """
+        # A debug-node run is intentionally isolated from a persisted DAG and
+        # must honour the provider explicitly supplied in the debug payload.
+        # The API marks that context so a model with the same name in the
+        # capability registry cannot silently replace the requested endpoint.
+        if isinstance(state, dict) and state.get("_isolated_debug"):
+            return {}
+
         cache = state.setdefault("_model_endpoint_cache", {}) if isinstance(state, dict) else {}
         if model_name in cache:
             return cache[model_name]
@@ -121,4 +128,3 @@ class AgentNode(BaseNode):
             endpoint = {}
         cache[model_name] = endpoint
         return endpoint
-

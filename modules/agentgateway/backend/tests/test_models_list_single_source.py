@@ -49,6 +49,28 @@ class TestListModelsSingleSource:
         assert row is not None
         assert row["provider"] == "openai"
         assert row["id"] == cap_id and row["id"] > 0  # positive capability id, no negative synthetic
+        assert isinstance(row["configured"], bool)
+
+    def test_unconfigured_provider_is_reported_truthfully(self, client, monkeypatch):
+        mid = f"unconfigured-{uuid.uuid4().hex[:8]}"
+        monkeypatch.delenv("CUSTOM_API_KEY", raising=False)
+        monkeypatch.delenv("CUSTOM_BASE_URL", raising=False)
+        with Session(engine) as s:
+            _add_cap_model(s, mid, provider="custom")
+        body = client.get("/api/models").json()
+        row = next(m for m in body if m["model_id"] == mid)
+        assert row["configured"] is False
+
+    def test_configured_only_reflects_backend_credentials(self, client, monkeypatch):
+        mid = f"configured-{uuid.uuid4().hex[:8]}"
+        monkeypatch.delenv("AGENTGATEWAY_MODEL_ALLOWLIST", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-real-test-key-that-is-long-enough")
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        with Session(engine) as s:
+            _add_cap_model(s, mid, provider="openai")
+        body = client.get("/api/models").json()
+        row = next(m for m in body if m["model_id"] == mid)
+        assert row["configured"] is True
 
     def test_registry_row_alone_is_not_listed(self, client):
         # A model only in model_registry (no capability) must NOT appear — the

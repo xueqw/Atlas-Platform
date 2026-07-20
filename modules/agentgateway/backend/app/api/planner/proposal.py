@@ -32,9 +32,14 @@ def _try_extract_proposal(text: str) -> Optional[dict]:
     if not text:
         return None
     candidates: List[str] = []
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence:
-        candidates.append(fence.group(1).strip())
+    # A confirmation turn may echo one JSON memory snapshot before the actual
+    # proposal. Inspect every fence in order; stopping at the first fence made
+    # valid second-block proposals look like plain text and left the UI drafting.
+    candidates.extend(
+        block.strip()
+        for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if block.strip()
+    )
     # As a fallback, try the largest brace-balanced block in the text.
     candidates.append(text.strip())
     for raw in candidates:

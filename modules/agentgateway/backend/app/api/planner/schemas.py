@@ -60,6 +60,7 @@ class PlannerSessionDetail(BaseModel):
     linked_agent_id: Optional[int]
     mode: str = "create"
     replan_context: str = ""
+    pending_continuation: Optional[dict] = None
     last_updated_at: datetime
     created_at: datetime
 

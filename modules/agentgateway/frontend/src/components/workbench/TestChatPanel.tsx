@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { MessageSquare, X, Loader2, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
+import { useAtlasRuntimeExecution, type AtlasRuntimeEvent } from "@/lib/atlas-runtime";
+import MultiAgentRuntimePanel from "@/components/workbench/MultiAgentRuntimePanel";
 
 interface Message {
   id: number;
@@ -17,6 +19,16 @@ interface NodeStatus {
   nodeId: string;
   nodeType: string;
   status: "running" | "complete" | "error";
+}
+
+interface GatewaySocketEvent {
+  type?: string;
+  content?: string;
+  message?: string;
+  node_id?: string;
+  node_type?: string;
+  error?: string;
+  status?: string;
 }
 
 interface Props {
@@ -33,11 +45,44 @@ export default function TestChatPanel({ agentId }: Props) {
   const [wsStatus, setWsStatus] = useState<"connected" | "disconnected" | "reconnecting">("disconnected");
   const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
   const [runTraceUrl, setRunTraceUrl] = useState<string>("");
+  const [runtimeEvents, setRuntimeEvents] = useState<AtlasRuntimeEvent[]>([]);
   const socketRef = useRef<ReturnType<typeof createChatSocket> | null>(null);
   const msgIdRef = useRef(0);
   const streamRef = useRef("");
   const thinkRef = useRef("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const atlasRuntime = useAtlasRuntimeExecution(agentId, {
+    onEvent: (event) => {
+      setRuntimeEvents((previous) => [...previous, event].slice(-160));
+      if (event.type === "node.started") {
+        const nodeId = String(event.payload.node || event.payload.name || "runtime");
+        setNodeStatuses((previous) => [...previous.filter((item) => item.nodeId !== nodeId), { nodeId, nodeType: "runtime", status: "running" }]);
+      } else if (event.type === "node.completed") {
+        const nodeId = String(event.payload.node || event.payload.name || "runtime");
+        setNodeStatuses((previous) => previous.map((item) => item.nodeId === nodeId ? { ...item, status: "complete" } : item));
+      } else if (event.type === "token.delta" || event.type === "response.token") {
+        const token = typeof event.payload.token === "string" ? event.payload.token : typeof event.payload.content === "string" ? event.payload.content : "";
+        streamRef.current += token;
+        setStreaming(streamRef.current);
+        setThinking(false);
+      } else if (event.type === "run.completed") {
+        const content = typeof event.payload.output === "string" ? event.payload.output : streamRef.current;
+        streamRef.current = "";
+        setStreaming("");
+        setThinking(false);
+        msgIdRef.current += 1;
+        setMessages((previous) => [...previous, { id: msgIdRef.current, role: "assistant", content }]);
+        setNodeStatuses([]);
+      } else if (event.type === "run.failed") {
+        setThinking(false);
+        toast.error(String(event.payload.message || event.payload.error || "Atlas Runtime 执行失败"));
+      }
+    },
+    onError: (message) => {
+      setThinking(false);
+      toast.error(message);
+    },
+  });
 
   const connect = useCallback(() => {
     socketRef.current?.disconnect();
@@ -45,10 +90,17 @@ export default function TestChatPanel({ agentId }: Props) {
     setStreaming("");
     setNodeStatuses([]);
     setRunTraceUrl("");
+    setRuntimeEvents([]);
     streamRef.current = "";
 
+    if (atlasRuntime.embedded) {
+      setWsStatus(atlasRuntime.mappingError ? "disconnected" : "connected");
+      if (atlasRuntime.mappingError) toast.error(atlasRuntime.mappingError);
+      return;
+    }
+
     const socket = createChatSocket(agentId);
-    socket.onMessage((data: any) => {
+    socket.onMessage((data: GatewaySocketEvent) => {
       if (data.type === "thinking") {
         setThinking(true);
       } else if (data.type === "thinking_content" && data.content) {
@@ -86,9 +138,11 @@ export default function TestChatPanel({ agentId }: Props) {
         setThinkingContent("");
         toast.error(data.message || "对话出错");
       } else if (data.type === "node_start") {
+        const nodeId = data.node_id || "runtime";
+        const nodeType = data.node_type || "runtime";
         setNodeStatuses((prev) => [
-          ...prev.filter((n) => n.nodeId !== data.node_id),
-          { nodeId: data.node_id, nodeType: data.node_type, status: "running" },
+          ...prev.filter((n) => n.nodeId !== nodeId),
+          { nodeId, nodeType, status: "running" },
         ]);
       } else if (data.type === "node_complete") {
         setNodeStatuses((prev) =>
@@ -120,7 +174,7 @@ export default function TestChatPanel({ agentId }: Props) {
     socket.onStatus(setWsStatus);
     socket.connect();
     socketRef.current = socket;
-  }, [agentId]);
+  }, [agentId, atlasRuntime.embedded, atlasRuntime.mappingError]);
 
   useEffect(() => {
     return () => { socketRef.current?.disconnect(); };
@@ -141,13 +195,20 @@ export default function TestChatPanel({ agentId }: Props) {
     setMessages([]);
     setStreaming("");
     setNodeStatuses([]);
+    setRuntimeEvents([]);
   };
 
   const handleSend = () => {
     if (!input.trim() || wsStatus !== "connected") return;
     msgIdRef.current++;
     setMessages((prev) => [...prev, { id: msgIdRef.current, role: "user", content: input }]);
-    socketRef.current?.send(input);
+    if (atlasRuntime.embedded) {
+      setThinking(true);
+      setRuntimeEvents([]);
+      if (!atlasRuntime.start(input, [`agentgateway:agent:${agentId}`, "agentgateway:dag-test-chat"])) setThinking(false);
+    } else {
+      socketRef.current?.send(input);
+    }
     setInput("");
   };
 
@@ -164,13 +225,13 @@ export default function TestChatPanel({ agentId }: Props) {
   }
 
   return (
-    <div className="absolute right-0 top-0 bottom-0 w-80 z-40 bg-card border-l border-border flex flex-col shadow-xl">
+    <div className="absolute right-0 top-0 bottom-0 w-[420px] max-w-[92%] z-40 bg-card border-l border-border flex flex-col shadow-xl">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-border shrink-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium">测试对话</span>
           <Badge variant={wsStatus === "connected" ? "default" : "destructive"} className="text-xs px-1.5 py-0">
-            {wsStatus === "connected" ? "已连接" : "断开"}
+            {atlasRuntime.embedded && wsStatus === "connected" ? "Atlas Runtime" : wsStatus === "connected" ? "已连接" : "断开"}
           </Badge>
         </div>
         <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleClose}>
@@ -198,6 +259,9 @@ export default function TestChatPanel({ agentId }: Props) {
       )}
 
       {/* Messages */}
+      {atlasRuntime.embedded && (
+        <MultiAgentRuntimePanel events={runtimeEvents} runId={atlasRuntime.runId} running={atlasRuntime.running} />
+      )}
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-2">
         {messages.length === 0 && !streaming && !thinking && !thinkingContent && (
           <p className="text-xs text-muted-foreground text-center mt-8">发送消息开始测试当前 DAG</p>
@@ -239,6 +303,15 @@ export default function TestChatPanel({ agentId }: Props) {
 
       {/* Input */}
       <div className="flex flex-col gap-1 px-3 py-2 border-t border-border shrink-0">
+        {atlasRuntime.pendingInterrupt && (
+          <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
+            <p className="mb-2 font-medium">工具写操作等待授权</p>
+            <div className="flex gap-2">
+              <Button size="sm" onClick={() => atlasRuntime.resolveInterrupt("approve")}>授权</Button>
+              <Button size="sm" variant="destructive" onClick={() => atlasRuntime.resolveInterrupt("deny")}>拒绝</Button>
+            </div>
+          </div>
+        )}
         {runTraceUrl && (
           <a
             href={runTraceUrl}
@@ -256,10 +329,10 @@ export default function TestChatPanel({ agentId }: Props) {
             onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
             placeholder="输入消息..."
             className="flex-1 text-sm bg-transparent border border-border rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring"
-            disabled={wsStatus !== "connected"}
+            disabled={wsStatus !== "connected" || atlasRuntime.running || Boolean(atlasRuntime.pendingInterrupt)}
           />
-          <Button size="sm" className="h-7 px-2" onClick={handleSend} disabled={wsStatus !== "connected" || !input.trim()}>
-            发送
+          <Button size="sm" className="h-7 px-2" onClick={atlasRuntime.running ? atlasRuntime.cancel : handleSend} disabled={wsStatus !== "connected" || (!atlasRuntime.running && !input.trim())}>
+            {atlasRuntime.running ? "取消" : "发送"}
           </Button>
         </div>
       </div>

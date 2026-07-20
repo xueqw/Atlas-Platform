@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Toaster } from "@/components/ui/sonner";
 import { Header } from "@/components/shared/Header";
+import { AtlasRuntimeBridge } from "@/components/shared/AtlasRuntimeBridge";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -19,6 +20,7 @@ export default function RootLayout({
         className="min-h-full flex flex-col"
         style={{ ["--app-header-height" as string]: "56px" }}
       >
+        <AtlasRuntimeBridge />
         <Header />
         <main className="flex-1 flex flex-col">{children}</main>
         <Toaster />

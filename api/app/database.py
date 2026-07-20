@@ -29,6 +29,9 @@ def ensure_schema():
     # available during the migration window.
     from .governance_models import GovernanceBase
     GovernanceBase.metadata.create_all(engine)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            _ensure_postgresql_additive_schema(conn)
     if engine.dialect.name == "sqlite":
         with engine.begin() as conn:
             cols = {row[1] for row in conn.execute(text("PRAGMA table_info(document_chunks)"))}
@@ -76,10 +79,28 @@ def ensure_schema():
                 "requirements": "TEXT DEFAULT '[]'",
                 "permissions": "TEXT DEFAULT '[]'",
                 "version": "VARCHAR(40) DEFAULT '1.0.0'",
+                "embedding": "TEXT",
+                "embedding_model": "VARCHAR(160) DEFAULT ''",
             }
             for name, ddl in skill_columns.items():
                 if scols and name not in scols:
                     conn.execute(text(f"ALTER TABLE skills ADD COLUMN {name} {ddl}"))
+            mfcols = {row[1] for row in conn.execute(text("PRAGMA table_info(memory_semantic_facts)"))}
+            if mfcols and "embedding" not in mfcols:
+                conn.execute(text("ALTER TABLE memory_semantic_facts ADD COLUMN embedding TEXT"))
+            if mfcols and "embedding_model" not in mfcols:
+                conn.execute(text("ALTER TABLE memory_semantic_facts ADD COLUMN embedding_model VARCHAR(160) DEFAULT ''"))
+            cpcols = {row[1] for row in conn.execute(text("PRAGMA table_info(memory_checkpoints)"))}
+            if cpcols and "scope_key" not in cpcols:
+                conn.execute(text("ALTER TABLE memory_checkpoints ADD COLUMN scope_key VARCHAR(160) DEFAULT '-:-'"))
+                conn.execute(text(
+                    "UPDATE memory_checkpoints SET scope_key = COALESCE(run_id, '-') || ':' || COALESCE(worker_id, '-')"
+                ))
+            if cpcols:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_checkpoint_scope_key_v2 "
+                    "ON memory_checkpoints (workspace_id, user_id, agent_id, scope_key, state_kind, state_key)"
+                ))
             # 统一评测迁移：旧 agent_eval_runs 保留，补评测集、版本和摘要关联。
             ecols = {row[1] for row in conn.execute(text("PRAGMA table_info(agent_eval_runs)"))}
             if ecols and "suite_id" not in ecols:
@@ -97,6 +118,32 @@ def ensure_schema():
     from .skills_seed import seed_builtin_skills
     seed_test_accounts()
     seed_builtin_skills()
+
+
+def _ensure_postgresql_additive_schema(conn) -> None:
+    """Idempotently upgrade existing PostgreSQL data without removing legacy columns."""
+    statements = (
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS category_path VARCHAR(240) DEFAULT 'general'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS summary TEXT DEFAULT ''",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS use_when TEXT DEFAULT '[]'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS do_not_use_when TEXT DEFAULT '[]'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS examples TEXT DEFAULT '[]'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS input_schema TEXT DEFAULT '{}'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS output_schema TEXT DEFAULT '{}'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS requirements TEXT DEFAULT '[]'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS permissions TEXT DEFAULT '[]'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS version VARCHAR(40) DEFAULT '1.0.0'",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS embedding vector(1024)",
+        "ALTER TABLE skills ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(160) DEFAULT ''",
+        "ALTER TABLE memory_semantic_facts ADD COLUMN IF NOT EXISTS embedding vector(1024)",
+        "ALTER TABLE memory_semantic_facts ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(160) DEFAULT ''",
+        "ALTER TABLE memory_checkpoints ADD COLUMN IF NOT EXISTS scope_key VARCHAR(160) DEFAULT '-:-'",
+        "UPDATE memory_checkpoints SET scope_key = COALESCE(run_id, '-') || ':' || COALESCE(worker_id, '-') WHERE scope_key = '-:-'",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_checkpoint_scope_key_v2 ON memory_checkpoints "
+        "(workspace_id, user_id, agent_id, scope_key, state_kind, state_key)",
+    )
+    for statement in statements:
+        conn.execute(text(statement))
 
 
 def _drop_stale_auth_tables() -> None:

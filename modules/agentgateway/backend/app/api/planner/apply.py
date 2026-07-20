@@ -2,7 +2,7 @@
 
 import json
 from typing import Dict, List, Optional
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from sqlmodel import Session, select, desc
 from app.core.database import engine
 from app.core import redis_client
@@ -20,6 +20,12 @@ from . import state
 from .state import _REQUIRED_CONFIG_BY_TYPE
 from .proposal import _parse_json_list
 from .schemas import ApplyRequest, ApplyReplanRequest, PlannerSnapshotResponse
+from .scope import (
+    PlannerScope,
+    coerce_planner_scope,
+    resolve_planner_scope,
+    scope_session_select,
+)
 from app.core.model_caps import DEFAULT_CHAT_MODEL_ID, DEFAULT_CHAT_PROVIDER
 
 
@@ -336,7 +342,32 @@ def _merge_partial_graph(existing_graph_json: str, proposal: dict, selected_node
     return {"nodes": list(existing_nodes.values()), "edges": kept_edges}
 
 
-def apply_proposal(body: ApplyRequest):
+def _assert_conversation_scope(conversation_id: Optional[str], scope: PlannerScope) -> None:
+    """Reject a conversation id owned by another scope before side effects."""
+    if not conversation_id:
+        return
+    with Session(engine) as session:
+        any_row = session.exec(
+            select(PlannerSession.id).where(PlannerSession.conversation_id == conversation_id)
+        ).first()
+        if any_row is None:
+            return
+        scoped = session.exec(
+            scope_session_select(
+                select(PlannerSession.id).where(PlannerSession.conversation_id == conversation_id),
+                scope,
+            )
+        ).first()
+        if scoped is None:
+            raise HTTPException(status_code=404, detail="planner session not found")
+
+
+def apply_proposal(
+    body: ApplyRequest,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
+    scope = coerce_planner_scope(scope)
+    _assert_conversation_scope(body.conversation_id, scope)
     proposal = body.proposal
     nodes = proposal.get("nodes", [])
     edges = proposal.get("edges", [])
@@ -418,7 +449,12 @@ def apply_proposal(body: ApplyRequest):
             # shows "applied" status and the from-agent reverse lookup can find it.
             if body.conversation_id:
                 ps_row = session.exec(
-                    select(PlannerSession).where(PlannerSession.conversation_id == body.conversation_id)
+                    scope_session_select(
+                        select(PlannerSession).where(
+                            PlannerSession.conversation_id == body.conversation_id
+                        ),
+                        scope,
+                    )
                 ).first()
                 if ps_row is not None:
                     ps_row.linked_agent_id = agent.id
@@ -433,7 +469,10 @@ def apply_proposal(body: ApplyRequest):
             # state on next turn (store_conv flushes on the Redis backend).
             if body.conversation_id:
                 cd = state.load_conv(body.conversation_id)
-                if cd is not None:
+                if (
+                    cd is not None
+                    and coerce_planner_scope(cd.get("_scope")) == scope
+                ):
                     cd["linked_agent_id"] = agent.id
                     cd["stage"] = "applied"
                     state.store_conv(body.conversation_id, cd)
@@ -454,7 +493,10 @@ def apply_proposal(body: ApplyRequest):
         return {"id": agent.id, "name": agent.name}
 
 
-def apply_replan(body: ApplyReplanRequest):
+def apply_replan(
+    body: ApplyReplanRequest,
+    scope: PlannerScope = Depends(resolve_planner_scope),
+):
     """Land a Replan proposal onto an existing agent in one of three modes.
 
     All writes happen inside a single transaction; any failure rolls back so no
@@ -464,6 +506,8 @@ def apply_replan(body: ApplyReplanRequest):
     ``(agent_id, conversation_id)`` are serialised by a TTL lock — only one runs,
     the rest get HTTP 409「处理中」rather than each landing a duplicate version.
     """
+    scope = coerce_planner_scope(scope)
+    _assert_conversation_scope(body.conversation_id, scope)
     proposal = body.proposal
     nodes = proposal.get("nodes", []) or []
     edges = proposal.get("edges", []) or []
@@ -472,18 +516,22 @@ def apply_replan(body: ApplyReplanRequest):
     if landing not in {"save_new_version", "override_draft", "partial"}:
         raise HTTPException(status_code=400, detail={"error": "invalid_landing", "landing": landing})
 
-    lock_name = f"replan:{body.agent_id}:{body.conversation_id or '-'}"
+    lock_name = (
+        f"replan:{scope.tenant_id}:{scope.workspace_id}:{scope.user_id}:"
+        f"{body.agent_id}:{body.conversation_id or '-'}"
+    )
     lock_token = redis_client.acquire_lock(lock_name, ttl=60)
     if lock_token is None:
         raise HTTPException(status_code=409, detail={"error": "replan_in_progress", "message": "该方案正在落地中，请稍候"})
 
     try:
-        return _apply_replan_locked(body, proposal, nodes, edges, memory, landing)
+        return _apply_replan_locked(body, proposal, nodes, edges, memory, landing, scope)
     finally:
         redis_client.release_lock(lock_name, lock_token)
 
 
-def _apply_replan_locked(body, proposal, nodes, edges, memory, landing):
+def _apply_replan_locked(body, proposal, nodes, edges, memory, landing, scope=None):
+    scope = coerce_planner_scope(scope)
     with Session(engine) as session:
         agent = session.get(Agent, body.agent_id)
         if agent is None:
@@ -573,7 +621,12 @@ def _apply_replan_locked(body, proposal, nodes, edges, memory, landing):
 
             if body.conversation_id:
                 ps_row = session.exec(
-                    select(PlannerSession).where(PlannerSession.conversation_id == body.conversation_id)
+                    scope_session_select(
+                        select(PlannerSession).where(
+                            PlannerSession.conversation_id == body.conversation_id
+                        ),
+                        scope,
+                    )
                 ).first()
                 if ps_row is not None:
                     ps_row.linked_agent_id = body.agent_id
@@ -586,7 +639,10 @@ def _apply_replan_locked(body, proposal, nodes, edges, memory, landing):
 
             if body.conversation_id:
                 cd = state.load_conv(body.conversation_id)
-                if cd is not None:
+                if (
+                    cd is not None
+                    and coerce_planner_scope(cd.get("_scope")) == scope
+                ):
                     cd["linked_agent_id"] = body.agent_id
                     cd["stage"] = "applied"
                     state.store_conv(body.conversation_id, cd)

@@ -1,4 +1,5 @@
 api/.venv/
+.venv/
 api/data/
 **/__pycache__/
 *.py[cod]
@@ -28,6 +29,7 @@ modules/agentgateway/frontend/*.tsbuildinfo
 .web.pid
 .server.pid
 .playwright-cli/
+.acceptance/
 .idea/
 **/.idea/
 .claude/

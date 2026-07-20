@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   configureFeishu,
   configureGithub,
   configureMcp,
+  configureModelProvider,
   createConversation,
   createKnowledgeBase,
   createSkill,
@@ -52,6 +53,7 @@ import type {
 import AgentStudio from "./AgentStudio";
 import AppBuilder from "./AppBuilder";
 import RuntimeTracePanel from "./RuntimeTracePanel";
+import { selectRuntimeTransport, type RuntimeRunProjection } from "./runtime-events";
 
 const groups = [
   {
@@ -64,6 +66,7 @@ const groups = [
   {
     label: "构建智能体",
     items: [
+      ["A", "Agent Studio", "agents"],
       ["◇", "应用开发", "builder"],
       ["▦", "应用模板", "templates"],
     ],
@@ -85,13 +88,6 @@ const groups = [
       ["⚙", "权限管理", "settings"],
     ],
   },
-];
-const MODELS = [
-  "glm-4-flash",
-  "glm-4.5-flash",
-  "qwen-turbo",
-  "qwen-plus",
-  "qwen-max",
 ];
 type Attachment = { name: string; text: string };
 const runtimeWorkbenchEnabled =
@@ -231,8 +227,8 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     [selectedKb, setSelectedKb] = useState(""),
     [agents, setAgents] = useState<Agent[]>([]),
     [selectedAgent, setSelectedAgent] = useState(""),
-    [selectedModel, setSelectedModel] = useState(MODELS[0]),
-    [models, setModels] = useState<string[]>(MODELS),
+    [selectedModel, setSelectedModel] = useState(""),
+    [models, setModels] = useState<string[]>([]),
     [providers, setProviders] = useState<ModelProvider[]>([]),
     [attachment, setAttachment] = useState<Attachment | null>(null),
     [connectors, setConnectors] = useState<Connector[]>([]),
@@ -255,19 +251,17 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
       content: "",
     });
   const end = useRef<HTMLDivElement>(null);
+  const runtimeAssistantId = useRef("");
+  const finalizedRuntimeRun = useRef("");
   const refreshConversations = () => listConversations().then(setConversations);
   const refreshKnowledge = () => listKnowledgeBases().then(setKnowledge);
   const refreshAgents = () => listAgents().then(setAgents);
   const refreshModels = () =>
     listModels().then((data) => {
       setProviders(data.providers);
-      const flat = data.providers.flatMap((p) => p.models);
-      if (flat.length) {
-        setModels(flat);
-        setSelectedModel((prev) =>
-          flat.includes(prev) ? prev : data.default || flat[0],
-        );
-      }
+      const flat = data.providers.filter((p) => p.configured).flatMap((p) => p.models);
+      setModels(flat);
+      setSelectedModel((prev) => flat.includes(prev) ? prev : flat.includes(data.default) ? data.default : flat[0] || "");
     });
   const refreshConnectors = () => listConnectors().then(setConnectors);
   const toggleConnector = (id: string) =>
@@ -364,15 +358,13 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
     setAppliedSkills([]);
     setToolCalls([]);
     setRuntimeRun(null);
+    let runtimeDeferred = false;
     try {
-      if (
-        runtimeWorkbenchEnabled &&
-        selectedAgent &&
-        !sent &&
-        !selectedKb &&
-        selectedSkills.length === 0 &&
-        selectedConnectors.length === 0
-      ) {
+      const runtimeEligible = Boolean(
+        selectedAgent && !sent && !selectedKb && selectedSkills.length === 0 && selectedConnectors.length === 0,
+      );
+      if (selectRuntimeTransport(runtimeWorkbenchEnabled, runtimeEligible) === "langgraph") {
+        runtimeAssistantId.current = assistant.id;
         const handle = await startRuntimeRun({
           agent_id: selectedAgent,
           input: content,
@@ -381,14 +373,7 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
           source: "workbench",
         });
         setRuntimeRun(handle);
-        const result = await getRuntimeRun(handle.run_id);
-        setMessages((old) =>
-          old.map((m) =>
-            m.id === assistant.id
-              ? { ...m, content: result.output || "运行没有返回内容。" }
-              : m,
-          ),
-        );
+        runtimeDeferred = true;
       } else {
         await streamMessage(
         task.id,
@@ -441,13 +426,33 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
         ),
       );
     } finally {
-      setBusy(false);
+      if (!runtimeDeferred) setBusy(false);
       setStep("");
       setPlan(null);
       setAppliedSkills([]);
       setToolCalls([]);
     }
   }
+  const projectRuntime = useCallback((projection: RuntimeRunProjection) => {
+    if (projection.tokens) {
+      setMessages((old) => old.map((message) =>
+        message.id === runtimeAssistantId.current && message.content !== projection.tokens
+          ? { ...message, content: projection.tokens }
+          : message,
+      ));
+    }
+    if (!["succeeded", "failed", "cancelled"].includes(projection.status)) return;
+    setBusy(false);
+    if (projection.tokens || finalizedRuntimeRun.current === projection.runId) return;
+    finalizedRuntimeRun.current = projection.runId;
+    void getRuntimeRun(projection.runId).then((state) => {
+      setMessages((old) => old.map((message) =>
+        message.id === runtimeAssistantId.current
+          ? { ...message, content: state.output || (state.status === "failed" ? "运行失败，请查看执行轨迹。" : "运行没有返回内容。") }
+          : message,
+      ));
+    });
+  }, []);
   async function attachFile(file?: File) {
     if (!file) return;
     try {
@@ -465,15 +470,17 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
   const title =
     view === "knowledge"
       ? "知识库"
-      : view === "builder"
-        ? "智能体开发"
-        : view === "models"
-          ? "模型管理"
-          : view === "tools"
-            ? "连接器与工具"
-            : view === "skills"
-              ? "Skills 技能"
-              : "智能工作台";
+      : view === "agents"
+        ? "Agent Studio"
+        : view === "builder"
+          ? "智能体开发"
+          : view === "models"
+            ? "模型管理"
+            : view === "tools"
+              ? "连接器与工具"
+              : view === "skills"
+                ? "Skills 技能"
+                : "智能工作台";
   return (
     <div className="shell">
       <aside className="global-nav">
@@ -495,6 +502,7 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
                     [
                       "workbench",
                       "knowledge",
+                      "agents",
                       "builder",
                       "models",
                       "tools",
@@ -528,6 +536,15 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
             refresh={refreshKnowledge}
             notice={showNotice}
           />
+        ) : view === "agents" ? (
+          <AgentStudio
+            agents={agents}
+            knowledge={knowledge}
+            providers={providers}
+            refresh={refreshAgents}
+            notice={showNotice}
+            onConfigureModels={() => setView("models")}
+          />
         ) : view === "builder" ? (
           <AppBuilder
             agents={agents}
@@ -541,6 +558,7 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
             providers={providers}
             defaultModel={models[0] || ""}
             notice={showNotice}
+            refresh={refreshModels}
           />
         ) : view === "tools" ? (
           <ConnectorsView
@@ -601,6 +619,7 @@ function AppShell({ me, onLogout }: { me: Me; onLogout: () => void }) {
             deleteTask={deleteTask}
             submit={submit}
             runtimeRun={runtimeRun}
+            onRuntimeProjection={projectRuntime}
             end={end}
           />
         )}
@@ -857,6 +876,7 @@ function Workbench({
   deleteTask,
   submit,
   runtimeRun,
+  onRuntimeProjection,
   end,
 }: {
   conversations: Conversation[];
@@ -897,6 +917,7 @@ function Workbench({
   deleteTask: (id: string) => void;
   submit: (e: FormEvent) => void;
   runtimeRun: RuntimeRunHandle | null;
+  onRuntimeProjection: (projection: RuntimeRunProjection) => void;
   end: React.RefObject<HTMLDivElement | null>;
 }) {
   const quick = (text: string) => {
@@ -986,7 +1007,7 @@ function Workbench({
               />
             ))
           )}
-          {runtimeRun && <RuntimeTracePanel run={runtimeRun} />}
+          {runtimeRun && <RuntimeTracePanel run={runtimeRun} onProjection={onRuntimeProjection} />}
           {busy && plan && (
             <div className="run-plan">
               <div className="run-plan-head">
@@ -1105,7 +1126,9 @@ function Workbench({
                   value={selectedModel}
                   onChange={(event) => setSelectedModel(event.target.value)}
                   title="选择模型"
+                  disabled={models.length === 0}
                 >
+                  {models.length === 0 && <option value="">请先配置模型</option>}
                   {models.map((m) => (
                     <option value={m} key={m}>
                       ◈ {m}
@@ -1271,12 +1294,18 @@ function ModelsView({
   providers,
   defaultModel,
   notice,
+  refresh,
 }: {
   providers: ModelProvider[];
   defaultModel: string;
   notice: (v: string) => void;
+  refresh: () => Promise<void> | void;
 }) {
   const [testing, setTesting] = useState("");
+  const [configuring, setConfiguring] = useState<ModelProvider | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [saving, setSaving] = useState(false);
   const [results, setResults] = useState<
     Record<string, { ok: boolean; latency_ms?: number; message?: string }>
   >({});
@@ -1294,6 +1323,21 @@ function ModelsView({
       notice("测试请求失败");
     } finally {
       setTesting("");
+    }
+  }
+  async function saveProvider() {
+    if (!configuring || !apiKey.trim()) return notice("请输入 API Key");
+    setSaving(true);
+    try {
+      await configureModelProvider(configuring.id, apiKey.trim(), baseUrl.trim());
+      await refresh();
+      setConfiguring(null);
+      setApiKey("");
+      notice(`${configuring.name} 已配置，可以开始测试和运行 Agent`);
+    } catch (error) {
+      notice(error instanceof Error ? error.message : "模型配置失败");
+    } finally {
+      setSaving(false);
     }
   }
   const total = providers.reduce((sum, p) => sum + p.models.length, 0);
@@ -1334,6 +1378,9 @@ function ModelsView({
               >
                 {p.configured ? "● 已配置" : "○ 未配置 Key"}
               </span>
+              <button className="provider-config-button" onClick={() => { setConfiguring(p); setBaseUrl(p.base_url); setApiKey(""); }}>
+                {p.configured ? "更新配置" : "配置"}
+              </button>
             </div>
             <div className="model-rows">
               {p.models.map((m) => {
@@ -1370,6 +1417,15 @@ function ModelsView({
           <p className="models-empty">正在加载模型供应商…</p>
         )}
       </div>
+      {configuring && <div className="model-config-mask" role="dialog" aria-modal="true" aria-label={`配置 ${configuring.name}`}>
+        <div className="model-config-dialog">
+          <header><div><small>MODEL PROVIDER</small><strong>配置 {configuring.name}</strong></div><button onClick={() => setConfiguring(null)}>×</button></header>
+          <p>密钥只提交给 Atlas API，并写入本地 <code>api/.env</code>；页面不会回显已保存的 Key。</p>
+          <label>API Key<input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="输入供应商 API Key" /></label>
+          <label>Base URL<input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
+          <footer><button onClick={() => setConfiguring(null)}>取消</button><button className="solid" disabled={saving || !apiKey.trim()} onClick={saveProvider}>{saving ? "保存中…" : "保存并启用"}</button></footer>
+        </div>
+      </div>}
     </section>
   );
 }

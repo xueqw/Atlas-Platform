@@ -29,6 +29,8 @@ import type {
   WorkspaceMember,
   GovernedMemory,
   SkillDiscovery,
+  OrchestrationPlan,
+  OrchestrationExecution,
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
@@ -72,6 +74,10 @@ export const createGovernedMemory = (agentId: string, payload: { subject: string
   json<{ id: string; created: boolean }>(`/api/agents/${agentId}/memory/facts`, { method: 'POST', body: JSON.stringify({ ...payload, idempotency_key: crypto.randomUUID() }) })
 export const deleteGovernedMemory = (agentId: string, factId: string) =>
   json<{ id: string; tombstoned: boolean }>(`/api/agents/${agentId}/memory/facts/${factId}`, { method: 'DELETE', body: JSON.stringify({ idempotency_key: crypto.randomUUID(), reason: 'manual_workspace_delete' }) })
+export const planOrchestration = (agentId: string, goal: string) =>
+  json<OrchestrationPlan>('/api/orchestrations/plan', { method: 'POST', body: JSON.stringify({ agent_id: agentId, goal, max_workers: 4, concurrency: 3, max_replans: 2 }) })
+export const executeOrchestration = (runId: string) =>
+  json<OrchestrationExecution>(`/api/orchestrations/${runId}/execute`, { method: 'POST' })
 export const listKnowledgeBases = () => json<KnowledgeBase[]>('/api/knowledge-bases')
 export const createKnowledgeBase = (name: string, description: string) =>
   json<KnowledgeBase>('/api/knowledge-bases', { method: 'POST', body: JSON.stringify({ name, description }) })

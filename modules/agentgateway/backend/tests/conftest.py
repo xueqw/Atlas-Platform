@@ -69,6 +69,11 @@ os.environ["ENABLE_MEM0"] = "false"
 # Tests that exercise the *missing*-credential path set their own provider env.
 os.environ.setdefault("GLM_API_KEY", "test-glm-key")
 os.environ.setdefault("GLM_BASE_URL", "http://test-gateway/v1")
+# Keep the OpenAI provider credential-complete for tests that explicitly route
+# GPT/O-series models; model calls themselves are still replaced by per-test
+# stubs. Qwen/GLM models use the GLM gateway configured above.
+os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
+os.environ.setdefault("OPENAI_BASE_URL", "http://test-gateway/v1")
 # Pin the planner agentic flags OFF for the suite. The dev .env may enable them
 # (PLANNER_AGENTIC / PLANNER_AGENTIC_ALL for manual QA); if that leaked in, every
 # planner ws-integration test would route to the agentic ReAct loop, hit the real
@@ -76,6 +81,11 @@ os.environ.setdefault("GLM_BASE_URL", "http://test-gateway/v1")
 # Tests that exercise the agentic path opt in explicitly via monkeypatch.setenv.
 os.environ["PLANNER_AGENTIC"] = "off"
 os.environ["PLANNER_AGENTIC_ALL"] = "off"
+# Plan+Loop is opt-in as well.  A dedicated test module enables it at import
+# time with ``setdefault``; pinning the suite baseline here prevents that
+# collection-time mutation from rerouting unrelated WebSocket tests. Tests for
+# the feature flag override this value explicitly with ``monkeypatch``.
+os.environ["PLANNER_PLAN_LOOP"] = "off"
 
 # Build a fresh engine bound to the temp file. Both planner_files._ROOT and
 # planner.engine are reassigned so anything imported afterwards sees the

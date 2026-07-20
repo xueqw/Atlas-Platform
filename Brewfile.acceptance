@@ -1,0 +1,10 @@
+brew "aria2"
+brew "colima"
+brew "docker"
+brew "docker-compose"
+brew "minio"
+brew "minio-mc"
+brew "pgvector"
+brew "postgresql@16", link: false
+brew "redis"
+brew "shellcheck"

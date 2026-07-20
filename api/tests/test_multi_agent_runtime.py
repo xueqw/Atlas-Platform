@@ -3,7 +3,8 @@ from datetime import timedelta
 import pytest
 
 from app.multi_agent_runtime import (
-    DagScheduler, DagTask, WorkerSpec, consume_ticket, effective_tools, issue_ticket,
+    DagScheduler, DagTask, OrchestratorTeam, ResultEnvelope, WorkerSpec,
+    consume_ticket, effective_tools, issue_ticket,
     utcnow, validate_ticket,
 )
 
@@ -52,3 +53,47 @@ def test_dag_retries_and_replan_limit():
 def test_worker_cap_rejects_unbounded_team():
     with pytest.raises(ValueError, match="worker cap"):
         DagScheduler([DagTask(str(i), "w") for i in range(7)])
+
+
+def test_worker_task_and_result_schemas_are_recursively_enforced():
+    nested = {
+        "type": "object",
+        "required": ["profile"],
+        "properties": {
+            "profile": {
+                "type": "object",
+                "required": ["must_exist"],
+                "properties": {"must_exist": {"type": "string", "minLength": 1}},
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    }
+    team = OrchestratorTeam("run", "ws", "user", "agent")
+    team.create_worker(WorkerSpec(
+        "worker", "v1", "role", "objective", nested, nested,
+    ))
+    with pytest.raises(ValueError, match="input_schema"):
+        team.make_task(task_id="missing", worker_id="worker", payload={"profile": {}})
+    with pytest.raises(ValueError, match="input_schema"):
+        team.make_task(
+            task_id="extra", worker_id="worker",
+            payload={"profile": {"must_exist": "ok", "unexpected": True}},
+        )
+
+    task = team.make_task(
+        task_id="valid", worker_id="worker",
+        payload={"profile": {"must_exist": "ok"}},
+    )
+    with pytest.raises(ValueError, match="output_schema"):
+        team.accept_result(ResultEnvelope(
+            envelope_id="result-invalid", run_id="run", task_id=task.task_id,
+            worker_id="worker", workspace_id="ws", user_id="user", agent_id="agent",
+            status="succeeded", result={"profile": {}},
+        ))
+    accepted = team.accept_result(ResultEnvelope(
+        envelope_id="result-valid", run_id="run", task_id=task.task_id,
+        worker_id="worker", workspace_id="ws", user_id="user", agent_id="agent",
+        status="succeeded", result={"profile": {"must_exist": "done"}},
+    ))
+    assert accepted.result["profile"]["must_exist"] == "done"

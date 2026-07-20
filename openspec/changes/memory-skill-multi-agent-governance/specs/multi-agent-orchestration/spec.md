@@ -16,3 +16,7 @@ The effective worker tool authority SHALL be the intersection of user grant, orc
 
 ### Requirement: Candidate assets are not automatically public
 The system SHALL create Agent and Skill assets from successful trajectories only as candidates. It SHALL require redaction, evaluation, explicit approval, versioned publishing, rollback, and complete audit before availability.
+
+#### Scenario: Candidate generated from a successful trajectory
+- **WHEN** an orchestrator proposes an Agent or Skill from a successful worker trajectory
+- **THEN** the asset SHALL remain in candidate state and SHALL NOT be discoverable or executable before explicit approval and versioned publication

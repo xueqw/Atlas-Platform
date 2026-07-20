@@ -41,6 +41,7 @@ from app.core.planner_step_handlers import (
     build_step_handler_registry,
     get_waiting_step,
     handle_compile_draft,
+    handle_design_architecture,
     handle_understand_requirement,
     is_plan_waiting_user,
     resolve_a2ui_response,
@@ -48,6 +49,7 @@ from app.core.planner_step_handlers import (
 )
 from app.core.planner_loop import StepResult
 from app.core.planner_tool_executor import execute_tool_react_step
+from app.api.planner.state import _ensure_goal_anchor, _merge_memory_update, _new_memory
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -298,6 +300,73 @@ class TestHandlerIndependence:
         assert isinstance(result, dict)
         assert result["compile_success"] is True
 
+    @pytest.mark.asyncio
+    async def test_design_proposal_applies_same_turn_memory_with_policy_evidence(self):
+        """A structured proposal must not skip its accompanying memory delta."""
+        proposal = {
+            "architecture_summary": "售后客服架构",
+            "nodes": [{"id": "agent1", "type": "agent", "config": {}}],
+            "edges": [],
+            "rationale": "用户显式调整了目标",
+        }
+        memory = _new_memory()
+        _ensure_goal_anchor(
+            memory,
+            [{"id": "m1", "role": "user", "content": "创建股票筛选智能体"}],
+            conversation_id="conv-memory-evidence",
+        )
+        memory["requirement_summary"] = "股票筛选智能体"
+
+        async def fake_stream(_agent, _input):
+            yield ("done", "")
+
+        deps = PlannerStepDeps(
+            conversation_id="conv-memory-evidence",
+            run_id="run-memory-evidence",
+            user_content="需求改成售后客服智能体",
+            conv_data={
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "创建股票筛选智能体"},
+                    {"id": "m2", "role": "user", "content": "需求改成售后客服智能体"},
+                ]
+            },
+            memory=memory,
+            model_cfg={"model_name": "fake", "provider": "fake"},
+            websocket=None,
+            create_agent=lambda **_kwargs: object(),
+            run_conversation=fake_stream,
+            try_extract_proposal=lambda _text: dict(proposal),
+            extract_memory_update=lambda _text: (
+                "",
+                {
+                    "requirement_summary": "售后客服智能体",
+                    "apply_readiness": {"status": "ready", "missing": []},
+                },
+            ),
+            merge_memory_update=_merge_memory_update,
+            validate_proposal_payload=lambda value: (value, True),
+        )
+
+        result = await handle_design_architecture(
+            PlanStep(id="design_architecture", title="设计架构"),
+            deps,
+        )
+
+        assert isinstance(result, StepResult)
+        assert result.status == "success"
+        assert deps.memory["requirement_summary"] == "售后客服智能体"
+        assert deps.memory["apply_readiness"]["status"] == "ready"
+        assert [item["field"] for item in deps.memory["memory_update_audit"][-2:]] == [
+            "requirement_summary",
+            "apply_readiness",
+        ]
+        assert deps.memory["memory_update_audit"][-1]["source_turn"] == {
+            "run_id": "run-memory-evidence",
+            "step_id": "design_architecture",
+            "message_index": 1,
+            "message_id": "m2",
+        }
+
 
 # ─── Test: build_step_handler_registry ────────────────────────────────────────
 
@@ -408,4 +477,3 @@ class TestSingleAssistantMessage:
         step = PlanStep(id="understand_requirement", title="理解需求")
         await handle_understand_requirement(step, deps)
         assert len(deps.conv_data["messages"]) == initial_msg_count
-

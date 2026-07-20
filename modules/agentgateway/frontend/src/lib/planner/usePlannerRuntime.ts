@@ -109,7 +109,7 @@ export function usePlannerRuntime(): PlannerRuntimeStore {
   const [connected, setConnected] = useState(false);
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [stage, setStage] = useState<PlannerStage>("clarifying");
-  const [selectedModel, setSelectedModel] = useState("qwen3.6-27b");
+  const [selectedModel, setSelectedModel] = useState("glm-4-flash");
   const [memory, setMemory] = useState<PlannerMemory | null>(null);
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [sessionsRefreshKey, setSessionsRefreshKey] = useState(0);
@@ -235,6 +235,9 @@ export function usePlannerRuntime(): PlannerRuntimeStore {
       const r = runtimeRef.current.get(convId);
       if (!r || r.ws !== ws) return;
       r.connected = false;
+      // A reconnect may need to replay a frame that never reached the backend.
+      // The durable token keeps that replay exactly-once server-side.
+      r.dispatchedContinuationToken = null;
       projectIfActive(convId);
     };
     ws.onerror = () => {
@@ -257,6 +260,34 @@ export function usePlannerRuntime(): PlannerRuntimeStore {
       // Pure reduce into the *owning* runtime, then run the returned effects.
       // The active view repaints only when this event's session is focused.
       const eff = reduceWsEvent(r, msg);
+      if (
+        eff.resumeContinuation
+        && r.dispatchedContinuationToken !== eff.resumeContinuation.token
+        && ws.readyState === WebSocket.OPEN
+      ) {
+        const continuation = eff.resumeContinuation;
+        r.dispatchedContinuationToken = continuation.token;
+        r.pendingContinuation = null;
+        ws.send(JSON.stringify({
+          type: "message",
+          content: continuation.content,
+          a2ui_request_id: continuation.request_id,
+          a2ui_choice: continuation.choice,
+          continuation_token: continuation.token,
+        }));
+        r.msgId++;
+        r.messages = [
+          ...r.messages,
+          { id: r.msgId, role: "user", content: continuation.content },
+        ];
+        r.thinking = true;
+        r.thinkBuf = "";
+        r.streamBuf = "";
+        r.activities = [];
+        r.runEvents = [];
+        r.pendingTriggeredSkills = null;
+        r.lastActivity = Date.now();
+      }
       if (eff.refreshSessions) setSessionsRefreshKey((k) => k + 1);
       if (eff.refreshSkills) setSkillsRefreshKey((k) => k + 1);
       if (eff.toast && convId === activeConvIdRef.current) toast.error(eff.toast);

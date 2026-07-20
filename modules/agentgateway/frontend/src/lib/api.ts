@@ -324,6 +324,15 @@ export const api = {
       linked_agent_id: number | null;
       mode: string;
       replan_context: string;
+      pending_continuation: {
+        request_id: string;
+        choice: string;
+        choice_label?: string;
+        token: string;
+        content: string;
+        status: "pending" | "processing";
+        created_at?: string;
+      } | null;
       last_updated_at: string;
       created_at: string;
     }>(`/api/planner/sessions/${encodeURIComponent(conversationId)}`),

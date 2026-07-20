@@ -1,6 +1,69 @@
 from typing import AsyncIterator, Tuple, Optional, List
 
 
+class EmptyModelResponse(RuntimeError):
+    """A successful provider request that produced no planner-usable content.
+
+    This is deliberately distinct from transport/HTTP failures: planner
+    orchestration may retry it exactly once while attributing the retry to the
+    same logical run.  Metadata is safe to expose in run events and never
+    contains credentials or prompt text.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        finish_reason: Optional[str] = None,
+        response_mode: str = "sse",
+        reason: str = "empty_content",
+    ) -> None:
+        self.model_name = model_name
+        self.finish_reason = finish_reason
+        self.response_mode = response_mode
+        self.reason = reason
+        super().__init__("模型未返回可用内容，请重试")
+
+
+def _completion_text(value) -> str:
+    """Normalize OpenAI-compatible string/content-block completion payloads."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            str(part.get("text") or part.get("content") or "")
+            if isinstance(part, dict)
+            else str(part)
+            for part in value
+        )
+    return ""
+
+
+def _extract_json_completion(payload: dict) -> Tuple[str, str, Optional[str]]:
+    """Return ``(thinking, content, finish_reason)`` from a JSON completion."""
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return "", "", None
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+    thinking = (
+        message.get("reasoning_content")
+        or message.get("thinking")
+        or delta.get("reasoning_content")
+        or delta.get("thinking")
+        or ""
+    )
+    content = (
+        message.get("content")
+        if message.get("content") is not None
+        else choice.get("text")
+    )
+    if content is None:
+        content = delta.get("content")
+    return str(thinking or ""), _completion_text(content), choice.get("finish_reason")
+
+
 async def _run_openai_compatible_stream(
     *,
     base_url: str,
@@ -40,32 +103,81 @@ async def _run_openai_compatible_stream(
             json=payload,
         ) as response:
             response.raise_for_status()
+            visible_chars = 0
+            finish_reason: Optional[str] = None
+            response_mode = "sse"
+            saw_sse_frame = False
+            malformed_frames = 0
+            raw_lines: List[str] = []
             async for line in response.aiter_lines():
-                if not line or not line.startswith("data:"):
+                if not line:
                     continue
+                if not line.startswith("data:"):
+                    raw_lines.append(line)
+                    continue
+                saw_sse_frame = True
                 raw = line[5:].strip()
                 if raw == "[DONE]":
                     break
                 try:
                     chunk = json.loads(raw)
                 except json.JSONDecodeError:
+                    malformed_frames += 1
                     continue
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
-                delta = choices[0].get("delta") or {}
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
                 thinking = delta.get("reasoning_content") or delta.get("thinking") or ""
                 if thinking:
                     yield ("thinking_content", str(thinking))
-                content = delta.get("content") or ""
-                if isinstance(content, list):
-                    content = "".join(
-                        part.get("text", "") if isinstance(part, dict) else str(part)
-                        for part in content
-                    )
+                content = _completion_text(delta.get("content"))
                 if content:
+                    visible_chars += len(content.strip())
                     yield ("token", str(content))
-    yield ("done", "")
+
+            # Some nominally OpenAI-compatible providers ignore stream=true and
+            # return a regular JSON completion.  httpx still exposes it through
+            # aiter_lines(), so recover it instead of treating HTTP 200 as empty.
+            if visible_chars == 0 and raw_lines:
+                response_mode = "json"
+                try:
+                    completion = json.loads("\n".join(raw_lines))
+                except json.JSONDecodeError:
+                    malformed_frames += 1
+                else:
+                    thinking, content, json_finish_reason = _extract_json_completion(completion)
+                    finish_reason = json_finish_reason or finish_reason
+                    if thinking:
+                        yield ("thinking_content", thinking)
+                    if content:
+                        visible_chars += len(content.strip())
+                        yield ("token", content)
+
+            if visible_chars == 0:
+                reason = "malformed_response" if malformed_frames else "empty_content"
+                if not saw_sse_frame and not raw_lines:
+                    response_mode = "empty"
+                raise EmptyModelResponse(
+                    model_name=model_name,
+                    finish_reason=finish_reason,
+                    response_mode=response_mode,
+                    reason=reason,
+                )
+
+    yield (
+        "done",
+        json.dumps(
+            {
+                "finish_reason": finish_reason,
+                "response_mode": response_mode,
+                "visible_chars": visible_chars,
+            },
+            ensure_ascii=False,
+        ),
+    )
 
 
 def _split_attachment_path(path: str) -> Optional[Tuple[str, str]]:
@@ -337,4 +449,10 @@ async def run_conversation(
                 pass
         record_generation_usage(usage_in, usage_out)
 
+    if not full_text.strip():
+        raise EmptyModelResponse(
+            model_name=model_name,
+            response_mode="agentscope",
+            reason="empty_content",
+        )
     yield ("done", "")

@@ -386,6 +386,8 @@ class Skill(Base):
     requirements: Mapped[str] = mapped_column(Text, default="[]")
     permissions: Mapped[str] = mapped_column(Text, default="[]")
     version: Mapped[str] = mapped_column(String(40), default="1.0.0")
+    embedding: Mapped[list[float] | str | None] = mapped_column(Vector(1024).with_variant(Text(), "sqlite"), nullable=True)
+    embedding_model: Mapped[str] = mapped_column(String(160), default="")
     builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(30), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

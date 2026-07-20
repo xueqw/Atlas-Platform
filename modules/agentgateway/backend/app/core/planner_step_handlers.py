@@ -94,6 +94,47 @@ class PlannerStepDeps:
     emitter: Any = None
 
 
+def _apply_memory_candidate(
+    deps: PlannerStepDeps,
+    step: PlanStep,
+    memory_update: Optional[dict],
+    *,
+    has_validated_proposal: bool,
+) -> None:
+    """Apply one Plan+Loop memory candidate with turn/proposal evidence.
+
+    The fallback preserves compatibility with older injected test doubles and
+    external adapters that still implement the historical two-argument merge
+    callable. The platform merge policy accepts the keyword evidence.
+    """
+    if not memory_update or not deps.merge_memory_update:
+        return
+    user_messages = [
+        message
+        for message in deps.conv_data.get("messages", [])
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    latest_user = user_messages[-1] if user_messages else {}
+    source_turn = {
+        "run_id": deps.run_id,
+        "step_id": step.id,
+        "message_index": max(0, len(deps.conv_data.get("messages", [])) - 1),
+    }
+    if latest_user.get("id") not in (None, ""):
+        source_turn["message_id"] = latest_user["id"]
+    try:
+        deps.merge_memory_update(
+            deps.memory,
+            memory_update,
+            recent_user_text=deps.user_content,
+            source_turn=source_turn,
+            has_validated_proposal=has_validated_proposal,
+        )
+    except TypeError:
+        deps.merge_memory_update(deps.memory, memory_update)
+    deps.conv_data["memory"] = deps.memory
+
+
 # ─── A2UI Confirmation Resolution ─────────────────────────────────────────────
 
 class A2UIResolutionError(Exception):
@@ -455,6 +496,10 @@ async def handle_design_architecture(step: PlanStep, deps: PlannerStepDeps) -> d
             break
 
     # ── Three-way classification ──
+    memory_update = None
+    if deps.extract_memory_update:
+        _, memory_update = deps.extract_memory_update(full_response)
+
     # 1. Try to extract structured proposal
     if deps.try_extract_proposal:
         structured = deps.try_extract_proposal(full_response)
@@ -467,6 +512,19 @@ async def handle_design_architecture(step: PlanStep, deps: PlannerStepDeps) -> d
             if not isinstance(structured.get(_lk), list):
                 structured[_lk] = []
         deps.conv_data["proposal"] = structured
+        proposal_validated = False
+        if deps.validate_proposal_payload:
+            try:
+                _validated_payload, proposal_validated = deps.validate_proposal_payload(structured)
+                proposal_validated = bool(proposal_validated)
+            except Exception:
+                proposal_validated = False
+        _apply_memory_candidate(
+            deps,
+            step,
+            memory_update,
+            has_validated_proposal=proposal_validated,
+        )
 
         # Write proposal as file artifact
         artifact_ref = None
@@ -531,14 +589,21 @@ async def handle_design_architecture(step: PlanStep, deps: PlannerStepDeps) -> d
                     })
                     deps.conv_data["pending_a2ui"] = a2ui_data
 
+            _apply_memory_candidate(
+                deps,
+                step,
+                memory_update,
+                has_validated_proposal=False,
+            )
             return StepResult(status="waiting_user", outputs={"missing_info": True})
 
     # 3. Extract and apply memory_update regardless of proposal outcome
-    if deps.extract_memory_update:
-        _, memory_update = deps.extract_memory_update(full_response)
-        if memory_update and deps.merge_memory_update:
-            deps.merge_memory_update(deps.memory, memory_update)
-            deps.conv_data["memory"] = deps.memory
+    _apply_memory_candidate(
+        deps,
+        step,
+        memory_update,
+        has_validated_proposal=False,
+    )
 
     # 4. No proposal and no missing_info → failed (or store text response)
     # If there's meaningful text but no structured output, it's a parse failure
@@ -658,5 +723,4 @@ def build_step_handler_registry(
         "design_architecture": _llm_design,
     }
     return det_services, llm_handlers
-
 

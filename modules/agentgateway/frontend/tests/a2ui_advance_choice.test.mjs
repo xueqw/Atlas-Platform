@@ -45,15 +45,14 @@ check(isAdvanceChoice("opt", "取消创建") === false, "negative wins: 取消�
 check(isAdvanceChoice("modify", "修改后确认") === false, "negative wins: 修改后确认");
 check(isAdvanceChoice("no", "no, change it") === false, "negative wins: 'no, change it'");
 
-// 5) neutral / unknown choices stay record-only (safe default) -----------------
-check(isAdvanceChoice("a", "选项 A") === false, "unknown label → record-only");
-check(isAdvanceChoice("b", "") === false, "empty label → record-only");
+// 5) valid neutral choices advance; only an entirely empty choice is invalid ---
+check(isAdvanceChoice("a", "选项 A") === true, "unknown valid label → advance");
+check(isAdvanceChoice("b", "") === true, "id-only choice → advance");
 check(isAdvanceChoice("", "") === false, "all empty → record-only");
 
-// 6) substring false-positive guards -------------------------------------------
-// "yes" must match as a word but "eyes"/"keyboard" must not flip a neutral label.
-check(isAdvanceChoice("opt", "eyes only") === false, "'eyes' is not 'yes'");
-check(isAdvanceChoice("opt", "keyboard") === false, "'go' substring in word does not match");
+// 6) neutral words still follow the documented non-negative default ------------
+check(isAdvanceChoice("opt", "eyes only") === true, "neutral 'eyes' choice advances by default");
+check(isAdvanceChoice("opt", "keyboard") === true, "neutral 'keyboard' choice advances by default");
 
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);

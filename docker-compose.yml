@@ -1,14 +1,12 @@
-version: "3.8"
-
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
     environment:
       POSTGRES_DB: atlas
       POSTGRES_USER: atlas
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     ports:
-      - "127.0.0.1:5432:5432"
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - atlas_postgres:/var/lib/postgresql/data
     secrets:
@@ -20,10 +18,10 @@ services:
       timeout: 3s
       retries: 10
   redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:-redis:7-alpine}
     command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$(cat /run/secrets/redis_password)\""]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - atlas_redis:/data
     secrets:
@@ -35,14 +33,14 @@ services:
       retries: 10
     restart: unless-stopped
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
     entrypoint: ["sh", "-c"]
     command: ["export MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_root_password); exec minio server /data --console-address ':9001'"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-atlas}
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "${MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_HOST_PORT:-9000}:9000"
+      - "${MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - atlas_minio:/data
     secrets:

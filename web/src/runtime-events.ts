@@ -12,6 +12,19 @@ export type KnownRuntimeEventType =
   | 'run.completed'
   | 'run.failed'
   | 'run.cancelled'
+  | 'run.paused'
+  | 'run.escalated'
+  | 'strategy.selected'
+  | 'plan.created'
+  | 'plan.updated'
+  | 'worker.created'
+  | 'worker.completed'
+  | 'review.requested'
+  | 'review.completed'
+  | 'review.revision_requested'
+  | 'review.replan_requested'
+  | 'escalation.resolved'
+  | 'side_effect.boundary_started'
   | 'node.started'
   | 'node.completed'
   | 'node.failed'
@@ -22,6 +35,7 @@ export type KnownRuntimeEventType =
   | 'tool.failed'
   | 'retry.scheduled'
   | 'interrupt.requested'
+  | 'interrupt.resolved'
   | 'runtime.fallback'
 
 export type RuntimeEventType = KnownRuntimeEventType | (string & {})
@@ -58,6 +72,15 @@ export type RuntimeRetryState = Readonly<{
   sequence: number
 }>
 
+export type RuntimeWorkerState = Readonly<{
+  workerId: string
+  role?: string
+  status: string
+  taskId?: string
+  runtimeRunId?: string
+  updatedSequence: number
+}>
+
 export type RuntimeConnectionState = Readonly<{
   status: RuntimeConnectionStatus
   attempt: number
@@ -70,7 +93,11 @@ export type RuntimeRunProjection = Readonly<{
   lastSequence: number
   seenEventIds: Readonly<Record<string, true>>
   connection: RuntimeConnectionState
+  strategy: RuntimeEventPayload | null
   plan: RuntimeEventPayload | null
+  workers: Readonly<Record<string, RuntimeWorkerState>>
+  reviews: readonly RuntimeEventPayload[]
+  escalation: RuntimeEventPayload | null
   nodes: Readonly<Record<string, RuntimeNodeState>>
   tokens: string
   sources: readonly JsonValue[]
@@ -78,6 +105,8 @@ export type RuntimeRunProjection = Readonly<{
   retries: Readonly<Record<string, RuntimeRetryState>>
   errors: readonly RuntimeEventPayload[]
   pendingInterrupt: RuntimeEventPayload | null
+  sideEffectBoundary: RuntimeEventPayload | null
+  fallback: RuntimeEventPayload | null
 }>
 
 export type RuntimeRunAction =
@@ -96,7 +125,11 @@ export function createRuntimeRunProjection(runId: string, cursor = 0): RuntimeRu
     lastSequence: cursor,
     seenEventIds: {},
     connection: { status: 'idle', attempt: 0 },
+    strategy: null,
     plan: null,
+    workers: {},
+    reviews: [],
+    escalation: null,
     nodes: {},
     tokens: '',
     sources: [],
@@ -104,6 +137,8 @@ export function createRuntimeRunProjection(runId: string, cursor = 0): RuntimeRu
     retries: {},
     errors: [],
     pendingInterrupt: null,
+    sideEffectBoundary: null,
+    fallback: null,
   }
 }
 
@@ -144,6 +179,19 @@ export function runtimeRunReducer(state: RuntimeRunProjection, action: RuntimeRu
     case 'run.cancelled':
       next = { ...next, status: 'cancelled', pendingInterrupt: null }
       break
+    case 'run.paused':
+    case 'run.escalated':
+      next = { ...next, status: 'paused', escalation: event.payload }
+      break
+    case 'escalation.resolved':
+      next = { ...next, status: 'running', escalation: null }
+      break
+    case 'side_effect.boundary_started':
+      next = { ...next, sideEffectBoundary: event.payload }
+      break
+    case 'strategy.selected':
+      next = { ...next, strategy: event.payload }
+      break
     case 'node.started':
       next = withNode(next, event, 'running')
       break
@@ -161,6 +209,18 @@ export function runtimeRunReducer(state: RuntimeRunProjection, action: RuntimeRu
     case 'plan.updated':
       next = { ...next, plan: event.payload }
       break
+    case 'worker.created':
+      next = withWorker(next, event, 'created')
+      break
+    case 'worker.completed':
+      next = withWorker(next, event, stringFrom(event.payload.status) || 'succeeded')
+      break
+    case 'review.requested':
+    case 'review.completed':
+    case 'review.revision_requested':
+    case 'review.replan_requested':
+      next = { ...next, reviews: [...next.reviews, { ...event.payload, event_type: event.type }] }
+      break
     case 'tool.started':
       next = withTool(next, event, 'running')
       break
@@ -176,6 +236,12 @@ export function runtimeRunReducer(state: RuntimeRunProjection, action: RuntimeRu
     case 'interrupt.requested':
       next = { ...next, status: 'paused', pendingInterrupt: event.payload }
       break
+    case 'interrupt.resolved':
+      next = { ...next, status: 'running', pendingInterrupt: null }
+      break
+    case 'runtime.fallback':
+      next = { ...next, fallback: event.payload }
+      break
     case 'source.added':
       next = { ...next, sources: [...next.sources, event.payload] }
       break
@@ -187,8 +253,32 @@ export function runtimeRunReducer(state: RuntimeRunProjection, action: RuntimeRu
   return next
 }
 
+function withWorker(state: RuntimeRunProjection, event: RuntimeEvent, status: string): RuntimeRunProjection {
+  const workerId = stringFrom(event.payload.worker_id) || 'unknown'
+  const previous = state.workers[workerId]
+  return {
+    ...state,
+    workers: {
+      ...state.workers,
+      [workerId]: {
+        workerId,
+        status,
+        updatedSequence: event.sequence,
+        ...(previous?.role ? { role: previous.role } : {}),
+        ...(stringFrom(event.payload.role) ? { role: stringFrom(event.payload.role) } : {}),
+        ...(stringFrom(event.payload.task_id) ? { taskId: stringFrom(event.payload.task_id) } : {}),
+        ...(stringFrom(event.payload.runtime_run_id) ? { runtimeRunId: stringFrom(event.payload.runtime_run_id) } : {}),
+      },
+    },
+  }
+}
+
 export function isTerminalRuntimeStatus(status: RuntimeStatus): boolean {
   return terminalStatuses.has(status)
+}
+
+export function selectRuntimeTransport(featureEnabled: boolean, requestEligible: boolean): 'langgraph' | 'legacy' {
+  return featureEnabled && requestEligible ? 'langgraph' : 'legacy'
 }
 
 function withNode(state: RuntimeRunProjection, event: RuntimeEvent, fallbackStatus: string): RuntimeRunProjection {

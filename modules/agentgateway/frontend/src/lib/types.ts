@@ -51,6 +51,7 @@ export interface ModelRegistryItem {
   supports_streaming: boolean;
   supports_vision: boolean;
   is_available: boolean;
+  configured: boolean;
 }
 
 export interface Conversation {

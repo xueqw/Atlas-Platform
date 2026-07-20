@@ -4,8 +4,11 @@ import json
 import os
 import re
 import uuid
+from typing import Optional
+from datetime import datetime, timedelta, timezone
 from fastapi import WebSocket, WebSocketDisconnect
-from app.core.agentscope_runner import create_agent, run_conversation
+from app.core.agentscope_runner import EmptyModelResponse, create_agent, run_conversation
+from app.core import redis_client
 from app.core.observability import (
     _get_langfuse,
     set_active_span,
@@ -15,6 +18,7 @@ from app.core import planner_files
 from . import state
 from .state import (
     _new_memory,
+    _ensure_goal_anchor,
     _merge_memory_update,
     _normalize_pending_a2ui,
     _build_decision_entry,
@@ -45,7 +49,15 @@ from .prompts import (
     resolve_effective_skills,
     resolve_action_skill,
 )
-from .sessions import _load_session_into_memory, _infer_stage, _persist_session, _pending_a2ui_from_memory
+from .sessions import (
+    _load_session_into_memory,
+    _infer_stage,
+    _persist_session,
+    _pending_a2ui_from_memory,
+    _pending_continuation_from_memory,
+)
+from .sessions import _session_exists_any_scope
+from .scope import coerce_planner_scope, scope_from_websocket
 from app.core.model_caps import DEFAULT_CHAT_MODEL_ID, DEFAULT_CHAT_PROVIDER
 
 
@@ -61,6 +73,94 @@ _ACTIVITY_LABELS = {
     "tool_call": "工具调用",
     "step_text": "推理过程",
 }
+
+_A2UI_ADVANCE_RE = re.compile(
+    r"(确认|创建|生成|同意|继续|批准|采纳|就这样|没问题|可以了|开始|^是$|"
+    r"\b(?:yes|confirm|create|apply|proceed|approve|ok|go)\b)",
+    re.IGNORECASE,
+)
+_A2UI_NEGATIVE_RE = re.compile(
+    r"(修改|调整|重新|再想|换成|取消|放弃|返回|^不|^否|"
+    r"\b(?:cancel|modify|change|edit|no|back)\b)",
+    re.IGNORECASE,
+)
+_CONTINUATION_LEASE_SECONDS = 300
+_active_continuation_runs: set[str] = set()
+
+
+def _is_advancing_a2ui_choice(choice_id: str, choice_label: str) -> bool:
+    """Mirror the public A2UI proceed/modify contract on the authoritative side."""
+    text = f"{choice_label} {choice_id}".strip()
+    if not text or _A2UI_NEGATIVE_RE.search(text):
+        return False
+    # Explicit positive cues advance; all other non-negative options also
+    # advance because selection cards commonly use domain labels only.
+    return True
+
+
+def _record_pending_continuation(
+    memory: dict,
+    *,
+    request_id: str,
+    choice_id: str,
+    choice_label: str,
+    continuation_token: str,
+    free_text: str = "",
+) -> Optional[dict]:
+    """Create (or retain) the durable, exactly-once continuation hand-off."""
+    if not _is_advancing_a2ui_choice(choice_id, choice_label):
+        memory.pop("pending_continuation", None)
+        return None
+    current = memory.get("pending_continuation")
+    if (
+        isinstance(current, dict)
+        and current.get("request_id") == request_id
+        and current.get("choice") == choice_id
+        and current.get("token") == continuation_token
+        and current.get("status") in {"pending", "processing", "completed"}
+    ):
+        return current
+    user_line = (
+        f"已选择「{choice_label}」：{free_text.strip()}"
+        if free_text.strip()
+        else f"已选择「{choice_label}」"
+    )
+    pending = {
+        "request_id": request_id,
+        "choice": choice_id,
+        "choice_label": choice_label,
+        "token": continuation_token,
+        "content": user_line,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    memory["pending_continuation"] = pending
+    return pending
+
+
+def _complete_continuation(memory: dict, continuation_token: str) -> bool:
+    """Move the claimed command to completed after its result is durable."""
+    item = memory.get("pending_continuation")
+    if not isinstance(item, dict) or item.get("token") != continuation_token:
+        return False
+    completed = dict(item)
+    completed["status"] = "completed"
+    completed["completed_at"] = datetime.now(timezone.utc).isoformat()
+    completed.pop("lease_expires_at", None)
+    memory["pending_continuation"] = completed
+    _active_continuation_runs.discard(continuation_token)
+    return True
+
+
+def _continuation_lease_expired(item: dict) -> bool:
+    raw = str(item.get("lease_expires_at") or "")
+    try:
+        expires_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return True
 
 
 def _planning_context_enabled() -> bool:
@@ -224,21 +324,38 @@ def _persist_and_store(conversation_id: str, conv_data: dict) -> None:
 
 async def planner_websocket(websocket: WebSocket, conversation_id: str):
     await websocket.accept()
+    try:
+        request_scope = scope_from_websocket(websocket)
+    except Exception:
+        await websocket.close(code=4400, reason="invalid planner scope")
+        return
     state._active_websockets[conversation_id] = websocket
 
     restored_from_db = False
     conv_data = state.load_conv(conversation_id)
+    if (
+        conv_data is not None
+        and coerce_planner_scope(conv_data.get("_scope")) != request_scope
+    ):
+        state._active_websockets.pop(conversation_id, None)
+        await websocket.close(code=4404, reason="planner session not found")
+        return
     if conv_data is None:
-        loaded = _load_session_into_memory(conversation_id)
+        loaded = _load_session_into_memory(conversation_id, request_scope)
         if loaded is not None:
             conv_data = loaded
             restored_from_db = True
         else:
+            if _session_exists_any_scope(conversation_id):
+                state._active_websockets.pop(conversation_id, None)
+                await websocket.close(code=4404, reason="planner session not found")
+                return
             conv_data = {
                 "messages": [],
                 "model": {"model_name": DEFAULT_CHAT_MODEL_ID, "provider": DEFAULT_CHAT_PROVIDER},
                 "memory": _new_memory(),
                 "file_artifacts": [],
+                "_scope": request_scope.as_dict(),
             }
         state.store_conv(conversation_id, conv_data)
 
@@ -266,12 +383,18 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
         await websocket.send_json({
             "type": "session_restored",
             "memory": memory,
-            "stage": conv_data.get("stage") or _infer_stage(memory, conv_data.get("proposal"), conv_data.get("linked_agent_id") is not None),
+            "stage": _infer_stage(
+                memory,
+                conv_data.get("proposal"),
+                conv_data.get("linked_agent_id") is not None,
+                pending_a2ui=conv_data.get("pending_a2ui"),
+            ),
             "messages": conv_data.get("messages", []),
             "file_artifacts": conv_data.get("file_artifacts", []),
             "mode": conv_data.get("mode") or "create",
             "replan_context": conv_data.get("replan_context") or "",
             "linked_agent_id": conv_data.get("linked_agent_id"),
+            "pending_continuation": _pending_continuation_from_memory(memory),
         })
         pending_a2ui = conv_data.get("pending_a2ui")
         if isinstance(pending_a2ui, dict) and pending_a2ui.get("options"):
@@ -326,6 +449,125 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                 attachments = msg.get("attachments") or []
                 if not isinstance(attachments, list):
                     attachments = []
+                continuation_token = str(msg.get("continuation_token") or "").strip()
+                continuation_run_id = ""
+                if continuation_token:
+                    # Claim a durable command under the shared working-state lock.
+                    # ``processing`` is leased, not terminal: if the socket/process
+                    # disappears before a result is durable, a later replay can
+                    # recover it with the same token/run_id.
+                    lock_token = redis_client.acquire_lock(
+                        f"planner-continuation:{conversation_id}", ttl=30
+                    )
+                    if not lock_token:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "continuation_busy",
+                            "message": "确认续跑正在处理中，请稍后重试",
+                            "recoverable": True,
+                        })
+                        continue
+                    claim_error = ""
+                    completed_continuation = False
+                    busy_continuation = False
+                    claimed_continuation: dict = {}
+                    try:
+                        # Redis working state is JSON round-tripped, so reload
+                        # inside the distributed lock before checking the token.
+                        latest = state.load_conv(conversation_id)
+                        if isinstance(latest, dict):
+                            conv_data = latest
+                            memory = conv_data.setdefault("memory", _new_memory())
+                        candidate = memory.get("pending_continuation")
+                        request_id = str(msg.get("a2ui_request_id") or "").strip()
+                        choice_id = str(msg.get("a2ui_choice") or "").strip()
+                        if not isinstance(candidate, dict):
+                            claim_error = "missing"
+                        elif (
+                            candidate.get("token") != continuation_token
+                            or candidate.get("request_id") != request_id
+                            or candidate.get("choice") != choice_id
+                        ):
+                            claim_error = "mismatch"
+                        elif candidate.get("status") == "completed":
+                            completed_continuation = True
+                            claimed_continuation = dict(candidate)
+                        else:
+                            # A live local run owns its lease. A processing record
+                            # without a live local owner is a crash/restart orphan
+                            # and is safely reclaimed with the same run_id.
+                            if (
+                                candidate.get("status") == "processing"
+                                and continuation_token in _active_continuation_runs
+                                and not _continuation_lease_expired(candidate)
+                            ):
+                                busy_continuation = True
+                                claimed_continuation = dict(candidate)
+                            elif candidate.get("status") not in {
+                                "pending", "processing", "consumed"
+                            }:
+                                claim_error = "invalid_status"
+                            else:
+                                _active_continuation_runs.discard(continuation_token)
+                                claimed_continuation = dict(candidate)
+                                now = datetime.now(timezone.utc)
+                                continuation_run_id = str(
+                                    claimed_continuation.get("run_id")
+                                    or uuid.uuid5(
+                                        uuid.NAMESPACE_URL,
+                                        f"atlas-planner-continuation:{continuation_token}",
+                                    ).hex
+                                )
+                                claimed_continuation.update({
+                                    "status": "processing",
+                                    "run_id": continuation_run_id,
+                                    "claimed_at": now.isoformat(),
+                                    "lease_expires_at": (
+                                        now + timedelta(seconds=_CONTINUATION_LEASE_SECONDS)
+                                    ).isoformat(),
+                                })
+                                claimed_continuation.pop("consumed_at", None)
+                                memory["pending_continuation"] = claimed_continuation
+                                conv_data["memory"] = memory
+                                _persist_and_store(conversation_id, conv_data)
+                                _active_continuation_runs.add(continuation_token)
+                    finally:
+                        redis_client.release_lock(
+                            f"planner-continuation:{conversation_id}", lock_token
+                        )
+                    if claim_error:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "invalid_continuation",
+                            "message": "确认续跑凭证无效或已失效",
+                            "recoverable": False,
+                        })
+                        continue
+                    if completed_continuation:
+                        await websocket.send_json({
+                            "type": "continuation_completed",
+                            "continuation_token": continuation_token,
+                            "duplicate": True,
+                        })
+                        continue
+                    if busy_continuation:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "continuation_busy",
+                            "message": "确认续跑正在处理中，请等待当前运行完成",
+                            "recoverable": True,
+                        })
+                        continue
+                    # Canonical content comes from the durable decision record,
+                    # preventing a valid token from being paired with new text.
+                    user_content = str(claimed_continuation.get("content") or "")
+                    attachments = []
+                    await websocket.send_json({
+                        "type": "continuation_claimed",
+                        "continuation_token": continuation_token,
+                        "run_id": continuation_run_id,
+                        "duplicate": False,
+                    })
                 # Per-turn caps (design D7): count + total bytes. Reject loudly
                 # rather than silently truncating.
                 if len(attachments) > MAX_ATTACHMENTS_PER_TURN:
@@ -341,7 +583,46 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                         "message": "附件总大小超过上限（12 MiB）",
                     })
                     continue
-                conv_data["messages"].append({"role": "user", "content": user_content})
+                existing_continuation_result = False
+                if continuation_token:
+                    existing_continuation_result = any(
+                        isinstance(item, dict)
+                        and item.get("role") == "assistant"
+                        and item.get("continuation_token") == continuation_token
+                        for item in conv_data["messages"]
+                    )
+                    if not any(
+                        isinstance(item, dict)
+                        and item.get("role") == "user"
+                        and item.get("continuation_token") == continuation_token
+                        for item in conv_data["messages"]
+                    ):
+                        conv_data["messages"].append({
+                            "role": "user",
+                            "content": user_content,
+                            "continuation_token": continuation_token,
+                            "continuation_run_id": continuation_run_id,
+                        })
+                else:
+                    conv_data["messages"].append({"role": "user", "content": user_content})
+                if existing_continuation_result:
+                    _complete_continuation(memory, continuation_token)
+                    conv_data["memory"] = memory
+                    _persist_and_store(conversation_id, conv_data)
+                    await websocket.send_json({
+                        "type": "continuation_completed",
+                        "continuation_token": continuation_token,
+                        "run_id": continuation_run_id,
+                        "duplicate": True,
+                    })
+                    continue
+                # Anchor user-authored goal evidence before any model-authored
+                # memory candidate is allowed to update the materialized view.
+                _ensure_goal_anchor(
+                    memory,
+                    conv_data["messages"],
+                    conversation_id=conversation_id,
+                )
 
                 # Per-turn activity tracking. ``turn_seq`` namespaces this turn's
                 # activity ids so start/done pairs never collide across turns.
@@ -371,12 +652,151 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                 # pushes a real-time ``run_event`` (alongside the unchanged
                 # ``activity`` stream). All emits are best-effort.
                 from app.core.run_events import RunEventEmitter
-                run_emitter = RunEventEmitter(run_id=uuid.uuid4().hex, websocket=websocket)
+                run_emitter = RunEventEmitter(
+                    run_id=continuation_run_id or uuid.uuid4().hex,
+                    websocket=websocket,
+                )
 
                 # Re-read the model config each turn so a mid-session set_model
                 # takes effect on the next turn. Credentials (if any) come from
                 # the capability-library config and stay backend-only.
                 model_cfg = conv_data.get("model", {"model_name": DEFAULT_CHAT_MODEL_ID, "provider": DEFAULT_CHAT_PROVIDER})
+
+                # One retry budget per logical planner turn, shared by every
+                # execution family.  This prevents an agentic empty response
+                # from falling back to a single-call path that then retries
+                # twice (three provider attempts total).
+                _model_attempt_count = 0
+                _MODEL_ATTEMPT_LIMIT = 2
+                _empty_response_exhausted = False
+
+                def _reserve_model_attempt(path: str) -> int:
+                    nonlocal _model_attempt_count
+                    if _model_attempt_count >= _MODEL_ATTEMPT_LIMIT:
+                        raise EmptyModelResponse(
+                            model_name=str(model_cfg.get("model_name") or ""),
+                            response_mode=path,
+                            reason="retry_budget_exhausted",
+                        )
+                    _model_attempt_count += 1
+                    return _model_attempt_count
+
+                async def _emit_model_failure(
+                    exc: EmptyModelResponse,
+                    *,
+                    attempt: int,
+                    path: str,
+                ) -> bool:
+                    nonlocal _empty_response_exhausted
+                    retrying = _model_attempt_count < _MODEL_ATTEMPT_LIMIT
+                    await run_emitter.emit(
+                        "model_response",
+                        "failed",
+                        message=(
+                            "模型返回空响应，正在重试"
+                            if retrying
+                            else "模型连续返回空响应"
+                        ),
+                        details={
+                            "attempt": attempt,
+                            "retrying": retrying,
+                            "reason": exc.reason,
+                            "finish_reason": exc.finish_reason,
+                            "response_mode": exc.response_mode,
+                            "model": exc.model_name,
+                            "path": path,
+                        },
+                    )
+                    if retrying:
+                        await run_emitter.emit(
+                            "model_response_retry",
+                            "running",
+                            message="正在重试模型请求",
+                            details={
+                                "attempt": _model_attempt_count + 1,
+                                "cause": exc.reason,
+                                "from_path": path,
+                            },
+                        )
+                    else:
+                        _empty_response_exhausted = True
+                        await run_emitter.emit(
+                            "model_response_retry",
+                            "failed",
+                            message="模型重试仍为空响应",
+                            details={
+                                "attempt": attempt,
+                                "reason": exc.reason,
+                                "finish_reason": exc.finish_reason,
+                                "path": path,
+                            },
+                        )
+                    return retrying
+
+                async def _budgeted_run_conversation(
+                    agent,
+                    content: str,
+                    attachments=None,
+                    *,
+                    path: str = "plan_loop",
+                ):
+                    """Run a model stream under the turn-wide two-attempt budget."""
+                    while _model_attempt_count < _MODEL_ATTEMPT_LIMIT:
+                        attempt = _reserve_model_attempt(path)
+                        saw_usable_content = False
+                        try:
+                            async for ev in run_conversation(
+                                agent,
+                                content,
+                                attachments=attachments,
+                            ):
+                                event_kind, event_content = ev
+                                if (
+                                    event_kind == "token"
+                                    and str(event_content or "").strip()
+                                ):
+                                    saw_usable_content = True
+                                if event_kind == "done":
+                                    try:
+                                        done_meta = json.loads(event_content or "{}")
+                                    except (json.JSONDecodeError, TypeError):
+                                        done_meta = {}
+                                    if not isinstance(done_meta, dict):
+                                        done_meta = {}
+                                    if not saw_usable_content:
+                                        raise EmptyModelResponse(
+                                            model_name=str(model_cfg.get("model_name") or ""),
+                                            finish_reason=done_meta.get("finish_reason"),
+                                            response_mode=str(
+                                                done_meta.get("response_mode")
+                                                or "orchestration_contract"
+                                            ),
+                                            reason="empty_content",
+                                        )
+                                    done_meta.update({"attempt": attempt, "path": path})
+                                    await run_emitter.emit(
+                                        "model_response",
+                                        "completed",
+                                        message="模型响应完成",
+                                        details=done_meta,
+                                    )
+                                    if attempt > 1:
+                                        await run_emitter.emit(
+                                            "model_response_retry",
+                                            "completed",
+                                            message="模型重试成功",
+                                            details={"attempt": attempt, "path": path},
+                                        )
+                                yield ev
+                            return
+                        except EmptyModelResponse as exc:
+                            retrying = await _emit_model_failure(
+                                exc,
+                                attempt=attempt,
+                                path=path,
+                            )
+                            if not retrying:
+                                raise
 
                 # Decide the execution path UP FRONT (planner-agentic-react-loop):
                 # agentic ReAct runs when the flag is on AND the model supports
@@ -614,7 +1034,10 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
 
                         # Use real session row for persistence
                         from app.core.planner_session_repo import get_or_create_planner_session
-                        _session_row = await get_or_create_planner_session(conversation_id)
+                        _session_row = await get_or_create_planner_session(
+                            conversation_id,
+                            request_scope,
+                        )
 
                         # Load or create plan from real session
                         plan = load_plan(_session_row)
@@ -644,9 +1067,18 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                         # This handles the case where frontend auto-continues after
                         # a confirmation but the plan finished in the same turn.
                         if plan.status == PlanStatus.completed:
-                            conv_data["messages"].append({"role": "user", "content": user_content})
-                            await websocket.send_json({"type": "done"})
+                            if continuation_token:
+                                _complete_continuation(memory, continuation_token)
+                                conv_data["memory"] = memory
                             _persist_and_store(conversation_id, conv_data)
+                            if continuation_token:
+                                await websocket.send_json({
+                                    "type": "continuation_completed",
+                                    "continuation_token": continuation_token,
+                                    "run_id": continuation_run_id,
+                                    "duplicate": False,
+                                })
+                            await websocket.send_json({"type": "done"})
                             continue
 
                         # ── Handle waiting_user state ──
@@ -673,7 +1105,9 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                         "message": "请通过确认卡操作（确认/修改/拒绝），或补充信息后再试",
                                     })
                                     # Persist user message for context
-                                    conv_data["messages"].append({"role": "user", "content": user_content})
+                                    if continuation_token:
+                                        _complete_continuation(memory, continuation_token)
+                                        conv_data["memory"] = memory
                                     _persist_and_store(conversation_id, conv_data)
                                     await websocket.send_json({"type": "done"})
                                     continue
@@ -704,7 +1138,7 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                             write_proposal_json=planner_files.write_proposal_json,
                             merge_artifacts=planner_files.merge_artifacts,
                             create_agent=create_agent,
-                            run_conversation=run_conversation,
+                            run_conversation=_budgeted_run_conversation,
                             create_strippers=lambda: (_MemoryTagStripper(), _A2UITagStripper(), _ProposalJsonStripper()),
                             emitter=None,  # Set after emitter creation below
                         )
@@ -791,6 +1225,23 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                         # Persist plan state to conv_data for compatibility
                         conv_data["planning_state_json"] = _session_row.planning_state_json
 
+                        if _empty_response_exhausted:
+                            # The loop runner converts executor exceptions into a
+                            # failed StepResult. Preserve that durable plan state,
+                            # but do not turn an exhausted empty model response
+                            # into a successful assistant summary/done frame.
+                            if continuation_token:
+                                _complete_continuation(memory, continuation_token)
+                                conv_data["memory"] = memory
+                            _persist_and_store(conversation_id, conv_data)
+                            await websocket.send_json({
+                                "type": "error",
+                                "code": "empty_model_response",
+                                "message": "模型未返回可用内容，请重试",
+                                "recoverable": True,
+                            })
+                            continue
+
                         # If loop paused at waiting_user, push confirmation as a2ui_request
                         if loop_result.stop_reason.value == "waiting_user":
                             if not conv_data.get("pending_a2ui"):
@@ -821,16 +1272,33 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                             summary_msg += f" — {loop_result.error}"
 
                         # Append ONE assistant message
-                        conv_data["messages"].append({"role": "assistant", "content": summary_msg})
+                        plan_loop_assistant = {"role": "assistant", "content": summary_msg}
+                        if continuation_token:
+                            plan_loop_assistant.update({
+                                "continuation_token": continuation_token,
+                                "continuation_run_id": continuation_run_id,
+                            })
+                        conv_data["messages"].append(plan_loop_assistant)
+                        if continuation_token:
+                            _complete_continuation(memory, continuation_token)
+                            conv_data["memory"] = memory
+                        _persist_and_store(conversation_id, conv_data)
+                        if continuation_token:
+                            await websocket.send_json({
+                                "type": "continuation_completed",
+                                "continuation_token": continuation_token,
+                                "run_id": continuation_run_id,
+                                "duplicate": False,
+                            })
                         await websocket.send_json({"type": "token", "content": summary_msg})
                         await websocket.send_json({"type": "done"})
-
-                        _persist_and_store(conversation_id, conv_data)
                     except _PlanLoopSkip:
                         # User message is not a creation intent — fall through
                         # to the normal single-call LLM path below.
                         pass
                     except Exception as exc:
+                        if continuation_token:
+                            _active_continuation_runs.discard(continuation_token)
                         import logging as _log
                         _log.getLogger(__name__).exception("Plan+Loop turn failed")
                         await websocket.send_json({
@@ -885,6 +1353,7 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                     async def _event_source():
                         nonlocal _agentic_turn_state
                         if _use_agentic:
+                            agentic_attempt = _reserve_model_attempt("agentic")
                             try:
                                 from app.core.planner_agent_loop import run_agentic_turn
                                 result = await run_agentic_turn(
@@ -901,14 +1370,67 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 # events; hand the assembled text to the done-branch
                                 # via a single synthetic done event.
                                 _agentic_turn_state = result.get("turn_state") or {}
-                                yield ("token", result.get("full_response", ""))
+                                _agentic_text = str(result.get("full_response") or "")
+                                if not _agentic_text.strip() and not any(
+                                    _agentic_turn_state.get(key)
+                                    for key in ("a2ui", "proposal")
+                                ):
+                                    raise EmptyModelResponse(
+                                        model_name=str(model_cfg.get("model_name") or ""),
+                                        response_mode="agentic",
+                                        reason="empty_content",
+                                    )
+                                await run_emitter.emit(
+                                    "model_response",
+                                    "completed",
+                                    message="模型响应完成",
+                                    details={
+                                        "attempt": agentic_attempt,
+                                        "path": "agentic",
+                                    },
+                                )
+                                yield ("token", _agentic_text)
                                 yield ("done", "")
                                 return
-                            except Exception as exc:
+                            except EmptyModelResponse as exc:
+                                retrying = await _emit_model_failure(
+                                    exc,
+                                    attempt=agentic_attempt,
+                                    path="agentic",
+                                )
                                 _agent_log = __import__("logging").getLogger(__name__)
-                                _agent_log.warning("agentic turn failed (%s); falling back to single-call", exc)
+                                _agent_log.warning(
+                                    "agentic turn returned empty (%s); falling back to single-call",
+                                    exc,
+                                )
+                                if not retrying:
+                                    raise
+                            except Exception as exc:
+                                attributed = EmptyModelResponse(
+                                    model_name=str(model_cfg.get("model_name") or ""),
+                                    response_mode="agentic",
+                                    reason="agentic_error",
+                                )
+                                retrying = await _emit_model_failure(
+                                    attributed,
+                                    attempt=agentic_attempt,
+                                    path="agentic",
+                                )
+                                _agent_log = __import__("logging").getLogger(__name__)
+                                _agent_log.warning(
+                                    "agentic turn failed (%s); falling back to single-call",
+                                    exc,
+                                )
+                                if not retrying:
+                                    raise
                         # Single-call fallback (existing behaviour).
-                        async for ev in run_conversation(planner_agent, user_content, attachments=attachments):
+                        fallback_path = "agentic_fallback" if _use_agentic else "single_call"
+                        async for ev in _budgeted_run_conversation(
+                            planner_agent,
+                            user_content,
+                            attachments=attachments,
+                            path=fallback_path,
+                        ):
                             yield ev
 
                     async for event_type, content in _event_source():
@@ -960,10 +1482,30 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                     clean_text,
                                 ).rstrip()
                             if memory_update:
+                                _candidate_proposal = _try_extract_proposal(clean_text)
+                                if (
+                                    _candidate_proposal is None
+                                    and _agentic_turn_state.get("proposal")
+                                ):
+                                    _candidate_proposal = _agentic_turn_state["proposal"]
+                                _, _candidate_proposal_ok = _validate_proposal_payload(
+                                    _candidate_proposal
+                                )
+                                _, _existing_proposal_ok = _validate_proposal_payload(
+                                    conv_data.get("proposal")
+                                )
                                 # Tolerant per-field merge (design D4): partial /
                                 # unknown fields never wipe accumulated state, and
                                 # a malformed field is skipped, not fatal.
-                                _merge_memory_update(memory, memory_update)
+                                _merge_memory_update(
+                                    memory,
+                                    memory_update,
+                                    recent_user_text=user_content,
+                                    source_turn=turn_seq,
+                                    has_validated_proposal=(
+                                        _candidate_proposal_ok or _existing_proposal_ok
+                                    ),
+                                )
                                 conv_data["memory"] = memory
                                 await websocket.send_json({"type": "memory_update", "memory": memory})
                             # Plan-with-file: requirements.md follows memory updates,
@@ -1006,6 +1548,7 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 and a2ui_payload is None
                                 and any(p in clean_text for p in _NARRATED_COMPLETION)
                                 and not conv_data.get("_agentic_retry_done")
+                                and _model_attempt_count < _MODEL_ATTEMPT_LIMIT
                             ):
                                 conv_data["_agentic_retry_done"] = True
                                 # Persist the fake-completion as context, then
@@ -1021,6 +1564,19 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                     "content": "\n\n⏳ 正在重试提交方案...\n",
                                 })
                                 # Re-run agentic turn with the nudge
+                                await run_emitter.emit(
+                                    "model_response_retry",
+                                    "running",
+                                    message="正在重试提交结构化方案",
+                                    details={
+                                        "attempt": _model_attempt_count + 1,
+                                        "cause": "missing_emit_proposal",
+                                        "from_path": "agentic",
+                                    },
+                                )
+                                retry_attempt = _reserve_model_attempt(
+                                    "agentic_emit_proposal_retry"
+                                )
                                 try:
                                     from app.core.planner_agent_loop import run_agentic_turn
                                     retry_result = await run_agentic_turn(
@@ -1033,14 +1589,77 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                         run_emitter=run_emitter,
                                         memory=memory,
                                     )
-                                    retry_text = retry_result.get("full_response", "")
+                                    retry_state = retry_result.get("turn_state") or {}
+                                    retry_text = str(
+                                        retry_result.get("full_response") or ""
+                                    )
                                     retry_structured = _try_extract_proposal(retry_text)
+                                    if (
+                                        retry_structured is None
+                                        and retry_state.get("proposal")
+                                    ):
+                                        retry_structured = retry_state["proposal"]
+                                    if not retry_text.strip() and retry_structured is None:
+                                        raise EmptyModelResponse(
+                                            model_name=str(
+                                                model_cfg.get("model_name") or ""
+                                            ),
+                                            response_mode="agentic",
+                                            reason="empty_content",
+                                        )
                                     if retry_structured is not None:
                                         structured = retry_structured
                                         clean_text = retry_text
                                         full_response = retry_text
+                                        _agentic_turn_state = retry_state
+                                        await run_emitter.emit(
+                                            "model_response",
+                                            "completed",
+                                            message="模型响应完成",
+                                            details={
+                                                "attempt": retry_attempt,
+                                                "path": "agentic_emit_proposal_retry",
+                                            },
+                                        )
+                                        await run_emitter.emit(
+                                            "model_response_retry",
+                                            "completed",
+                                            message="结构化方案重试成功",
+                                            details={"attempt": retry_attempt},
+                                        )
+                                    else:
+                                        await run_emitter.emit(
+                                            "model_response_retry",
+                                            "failed",
+                                            message="重试后仍未提交结构化方案",
+                                            details={
+                                                "attempt": retry_attempt,
+                                                "reason": "missing_emit_proposal",
+                                            },
+                                        )
+                                except EmptyModelResponse as exc:
+                                    retrying = await _emit_model_failure(
+                                        exc,
+                                        attempt=retry_attempt,
+                                        path="agentic_emit_proposal_retry",
+                                    )
+                                    if not retrying:
+                                        raise
                                 except Exception:
-                                    pass  # retry failed, fall through to normal path
+                                    attributed = EmptyModelResponse(
+                                        model_name=str(
+                                            model_cfg.get("model_name") or ""
+                                        ),
+                                        response_mode="agentic",
+                                        reason="agentic_error",
+                                    )
+                                    retrying = await _emit_model_failure(
+                                        attributed,
+                                        attempt=retry_attempt,
+                                        path="agentic_emit_proposal_retry",
+                                    )
+                                    if not retrying:
+                                        raise attributed
 
                             # Normalize shape so downstream consumers (final_summary,
                             # proposal.json, PlannerPanel) never see missing list
@@ -1202,6 +1821,21 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                     _persist_proposal_to_memory(
                                         memory, _payload, conv_data.get("planning_context")
                                     )
+                                    # Keep the validated, executable proposal
+                                    # shape as the durable session mirror. The
+                                    # ProposalPayload view is intentionally
+                                    # smaller and model_dump() may omit DAG/UI
+                                    # fields such as architecture_summary.
+                                    memory["proposal_payload"] = structured
+                                    proposal_readiness = structured.get("apply_readiness")
+                                    if isinstance(proposal_readiness, dict):
+                                        _merge_memory_update(
+                                            memory,
+                                            {"apply_readiness": proposal_readiness},
+                                            recent_user_text=user_content,
+                                            source_turn=turn_seq,
+                                            has_validated_proposal=True,
+                                        )
                                     conv_data["memory"] = memory
 
                                     # Persist as a first-class proposal (T5). The
@@ -1240,6 +1874,12 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                         "planner proposal failed schema validation; "
                                         "degrading (keeping reply, no structured mirror)"
                                     )
+                                    # The raw proposal is not authoritative evidence.
+                                    # Keep any surrounding prose, but do not let an
+                                    # invalid payload create proposal artifacts or a
+                                    # ready-to-apply stage.
+                                    clean_text = _strip_proposal_text(clean_text)
+                                    structured = None
 
                             # Compute which skills this turn ACTUALLY triggered (an
                             # observable backend action ran for them). This — not
@@ -1268,10 +1908,15 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 prose = _strip_proposal_text(clean_text)
                                 persisted = (prose + "\n\n" + _PROPOSAL_FILE_MARKER).strip() if prose else _PROPOSAL_FILE_MARKER
                                 _asst = {"role": "assistant", "content": persisted}
+                                if continuation_token:
+                                    _asst.update({
+                                        "continuation_token": continuation_token,
+                                        "continuation_run_id": continuation_run_id,
+                                    })
                                 if turn_triggered:
                                     _asst["triggered_skills"] = list(turn_triggered)
                                 conv_data["messages"].append(_asst)
-                            else:
+                            elif clean_text.strip():
                                 # No proposal — the JSON stripper may have held a
                                 # legitimate (non-proposal) code block; emit it now
                                 # so it is not silently lost.
@@ -1279,9 +1924,24 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 if held:
                                     await websocket.send_json({"type": "token", "content": held})
                                 _asst = {"role": "assistant", "content": clean_text}
+                                if continuation_token:
+                                    _asst.update({
+                                        "continuation_token": continuation_token,
+                                        "continuation_run_id": continuation_run_id,
+                                    })
                                 if turn_triggered:
                                     _asst["triggered_skills"] = list(turn_triggered)
                                 conv_data["messages"].append(_asst)
+                            elif a2ui_payload is None and not memory_update:
+                                # Last-line invariant: a successful turn must carry
+                                # visible text or a structured control result.
+                                # Normally the adapter catches this before ``done``;
+                                # retain the guard for agentic/legacy producers.
+                                raise EmptyModelResponse(
+                                    model_name=str(model_cfg.get("model_name") or ""),
+                                    response_mode="planner_done",
+                                    reason="empty_assistant",
+                                )
 
                             # When a proposal is found, write proposal.json + final.md
                             # and send a final_summary event so the frontend renders a
@@ -1394,10 +2054,20 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 )
 
                             # Persist this turn so the session survives restart and shows up in /sessions list
+                            if continuation_token:
+                                _complete_continuation(memory, continuation_token)
+                                conv_data["memory"] = memory
                             try:
                                 _persist_and_store(conversation_id, conv_data)
                             except Exception:
                                 pass
+                            if continuation_token:
+                                await websocket.send_json({
+                                    "type": "continuation_completed",
+                                    "continuation_token": continuation_token,
+                                    "run_id": continuation_run_id,
+                                    "duplicate": False,
+                                })
                             # Finalize any phase still open this turn before `done`
                             # so the timeline never leaves a step "in progress":
                             # drafting if tokens were produced, else processing.
@@ -1428,11 +2098,38 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                     _lg.getLogger(__name__).error(
                         "planner turn exception:\n%s", _tb.format_exc(),
                     )
+                    is_empty_response = isinstance(e, EmptyModelResponse)
+                    if is_empty_response:
+                        # Retain the user turn, keep the artifact-derived stage,
+                        # and close the coarse activity instead of leaving the UI
+                        # spinner open.  Never append/persist an assistant here.
+                        try:
+                            if continuation_token:
+                                _complete_continuation(memory, continuation_token)
+                                conv_data["memory"] = memory
+                            _persist_and_store(conversation_id, conv_data)
+                        except Exception:
+                            pass
+                        try:
+                            if drafting_started:
+                                await _activity(websocket, act_drafting, "drafting", "done")
+                            else:
+                                await _activity(websocket, act_processing, "processing", "done")
+                        except Exception:
+                            pass
                     try:
-                        await websocket.send_json({"type": "error", "message": str(e)})
+                        payload = {"type": "error", "message": str(e)}
+                        if is_empty_response:
+                            payload.update({
+                                "code": "empty_model_response",
+                                "recoverable": True,
+                            })
+                        await websocket.send_json(payload)
                     except Exception:
                         pass
                 finally:
+                    if continuation_token:
+                        _active_continuation_runs.discard(continuation_token)
                     if span_token is not None:
                         reset_active_span(span_token)
                     if planner_span is not None and _lf:
@@ -1455,11 +2152,86 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                     if isinstance(opt, dict) and str(opt.get("id")) == choice_id:
                         choice_label = str(opt.get("label") or choice_id)
                         break
+                continuation_token = uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"atlas-planner:{conversation_id}:{req_id}:{choice_id}",
+                ).hex
+
+                if not req_id or not choice_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "code": "invalid_a2ui_response",
+                        "message": "确认请求缺少 id 或 choice",
+                        "recoverable": True,
+                    })
+                    continue
+
+                # Durable decision ledger is also the idempotency record.  A
+                # duplicate of the exact frame is acknowledged without touching
+                # files, memory, plan state, or consuming another model turn.
+                existing_decision = next(
+                    (
+                        item for item in (memory.get("decisions_confirmed") or [])
+                        if isinstance(item, dict) and str(item.get("id") or "") == req_id
+                    ),
+                    None,
+                )
+                if existing_decision is not None:
+                    selected = existing_decision.get("selected_option") or {}
+                    existing_choice = str(
+                        selected.get("id") if isinstance(selected, dict) else ""
+                    )
+                    if existing_choice == choice_id:
+                        if isinstance(selected, dict):
+                            choice_label = str(selected.get("label") or choice_label)
+                        _record_pending_continuation(
+                            memory,
+                            request_id=req_id,
+                            choice_id=choice_id,
+                            choice_label=choice_label,
+                            continuation_token=continuation_token,
+                            free_text=(
+                                str(existing_decision.get("free_text") or "")
+                                if isinstance(existing_decision, dict)
+                                else ""
+                            ),
+                        )
+                        conv_data.pop("pending_a2ui", None)
+                        pending_items = memory.get("decisions_pending") or []
+                        if isinstance(pending_items, list):
+                            memory["decisions_pending"] = [
+                                item for item in pending_items
+                                if not (
+                                    isinstance(item, dict)
+                                    and str(item.get("id") or "") == req_id
+                                )
+                            ]
+                        conv_data["memory"] = memory
+                        try:
+                            _persist_and_store(conversation_id, conv_data)
+                        except Exception:
+                            pass
+                        await websocket.send_json({
+                            "type": "a2ui_recorded",
+                            "id": req_id,
+                            "choice": choice_id,
+                            "continuation_token": continuation_token,
+                            "duplicate": True,
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "a2ui_decision_conflict",
+                            "message": "该确认请求已记录不同选择，不能重复改写",
+                            "recoverable": False,
+                        })
+                    continue
 
                 # ── Plan+Loop: precise A2UI resolution ──
                 # If a Plan+Loop session is waiting_user, resolve via the
                 # structured protocol (request_id + choice validation).
                 _plan_loop_resolved = False
+                _plan_loop_detected = False
                 try:
                     from app.core.planner_plan import (
                         load_plan, save_plan, PlanStatus, determine_session_mode,
@@ -1474,10 +2246,63 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                         type("_S", (), {"planning_state_json": conv_data.get("planning_state_json", "{}")})()
                     )
                     if _pl_mode == "plan_loop":
+                        _plan_loop_detected = True
                         # Use real DB session for persistence
-                        _pl_row = await get_or_create_planner_session(conversation_id)
+                        _pl_row = await get_or_create_planner_session(
+                            conversation_id,
+                            request_scope,
+                        )
                         _pl_plan = load_plan(_pl_row)
-                        if _pl_plan and _pl_plan.status == PlanStatus.waiting_user:
+                        # Backward-compatible duplicate detection for Plan+Loop
+                        # rows created before decisions_confirmed became the
+                        # shared idempotency ledger.
+                        _resolved_from_plan = None
+                        if _pl_plan is not None:
+                            for _pl_step in _pl_plan.steps:
+                                _confirmation = getattr(_pl_step, "confirmation", None)
+                                if (
+                                    _confirmation is not None
+                                    and str(getattr(_confirmation, "request_id", "") or "") == req_id
+                                    and getattr(_confirmation, "selected", None)
+                                ):
+                                    _resolved_from_plan = str(_confirmation.selected)
+                                    break
+                        if _resolved_from_plan is not None:
+                            if _resolved_from_plan == choice_id:
+                                _record_pending_continuation(
+                                    memory,
+                                    request_id=req_id,
+                                    choice_id=choice_id,
+                                    choice_label=choice_label,
+                                    continuation_token=continuation_token,
+                                    free_text=(
+                                        free_text
+                                        if isinstance(free_text, str)
+                                        else ""
+                                    ),
+                                )
+                                conv_data["memory"] = memory
+                                _persist_and_store(conversation_id, conv_data)
+                                await websocket.send_json({
+                                    "type": "a2ui_recorded",
+                                    "id": req_id,
+                                    "choice": choice_id,
+                                    "continuation_token": continuation_token,
+                                    "duplicate": True,
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "error",
+                                    "code": "a2ui_decision_conflict",
+                                    "message": "该确认请求已记录不同选择，不能重复改写",
+                                    "recoverable": False,
+                                })
+                            _plan_loop_resolved = True
+                        if (
+                            not _plan_loop_resolved
+                            and _pl_plan
+                            and _pl_plan.status == PlanStatus.waiting_user
+                        ):
                             try:
                                 _pl_plan, _resolved_choice = resolve_a2ui_response(
                                     _pl_plan, msg
@@ -1488,12 +2313,42 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                 # Also sync conv_data for in-memory consistency
                                 conv_data["planning_state_json"] = _pl_row.planning_state_json
                                 conv_data.pop("pending_a2ui", None)
+                                _decision_pending = pending or {
+                                    "id": req_id,
+                                    "prompt": prompt_text,
+                                    "options": [],
+                                }
+                                _decision_pending["id"] = req_id
+                                _plan_decision = _build_decision_entry(
+                                    _decision_pending,
+                                    choice_id=choice_id,
+                                    choice_label=choice_label,
+                                    free_text=free_text if isinstance(free_text, str) else "",
+                                )
+                                _plan_ledger = list(memory.get("decisions_confirmed") or [])
+                                _plan_ledger.append(_plan_decision)
+                                memory["decisions_confirmed"] = _plan_ledger[-30:]
+                                _record_pending_continuation(
+                                    memory,
+                                    request_id=req_id,
+                                    choice_id=choice_id,
+                                    choice_label=choice_label,
+                                    continuation_token=continuation_token,
+                                    free_text=(
+                                        free_text
+                                        if isinstance(free_text, str)
+                                        else ""
+                                    ),
+                                )
+                                conv_data["memory"] = memory
                                 _persist_and_store(conversation_id, conv_data)
                                 # Acknowledge
                                 await websocket.send_json({
                                     "type": "a2ui_recorded",
                                     "id": req_id,
                                     "choice": choice_id,
+                                    "continuation_token": continuation_token,
+                                    "duplicate": False,
                                 })
                                 _plan_loop_resolved = True
                             except A2UIResolutionError as e:
@@ -1506,8 +2361,25 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                                     "message": str(e),
                                 })
                                 _plan_loop_resolved = True  # Don't fall through to legacy
-                except Exception:
-                    pass
+                        if not _plan_loop_resolved:
+                            await websocket.send_json({
+                                "type": "run_event",
+                                "step": "confirm_proposal",
+                                "event_kind": "a2ui_error",
+                                "status": "failed",
+                                "message": "当前 Plan+Loop 没有可处理的确认步骤",
+                            })
+                            _plan_loop_resolved = True
+                except Exception as exc:
+                    if _plan_loop_detected:
+                        await websocket.send_json({
+                            "type": "run_event",
+                            "step": "confirm_proposal",
+                            "event_kind": "a2ui_error",
+                            "status": "failed",
+                            "message": f"Plan+Loop 确认处理失败：{exc}",
+                        })
+                        _plan_loop_resolved = True
 
                 if _plan_loop_resolved:
                     continue  # Skip legacy a2ui handling
@@ -1558,6 +2430,14 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                     feedback = list(memory.get("user_feedback") or [])
                     feedback.append(free_text.strip())
                     memory["user_feedback"] = feedback[-10:]
+                _record_pending_continuation(
+                    memory,
+                    request_id=req_id,
+                    choice_id=choice_id,
+                    choice_label=choice_label,
+                    continuation_token=continuation_token,
+                    free_text=free_text if isinstance(free_text, str) else "",
+                )
                 conv_data["memory"] = memory
                 conv_data.pop("pending_a2ui", None)
                 try:
@@ -1572,7 +2452,13 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
                 # planner continuation itself is user-driven: the frontend can
                 # now choose to send a follow-up message, but the backend should
                 # not secretly consume extra model turns on card submit.
-                await websocket.send_json({"type": "a2ui_recorded", "id": req_id, "choice": choice_id})
+                await websocket.send_json({
+                    "type": "a2ui_recorded",
+                    "id": req_id,
+                    "choice": choice_id,
+                    "continuation_token": continuation_token,
+                    "duplicate": False,
+                })
             elif msg.get("type") in ("skill_attached", "skill_detached"):
                 # Mount / unmount a skill onto this session. Updates
                 # memory.selected_skills (dedup / remove) so the next turn's
@@ -1649,6 +2535,9 @@ async def planner_websocket(websocket: WebSocket, conversation_id: str):
             _tb.format_exc(),
         )
     finally:
+        token = locals().get("continuation_token")
+        if isinstance(token, str) and token:
+            _active_continuation_runs.discard(token)
         # Only clear if we're still the registered socket — a concurrent DELETE
         # may have already popped (and closed) us.
         if state._active_websockets.get(conversation_id) is websocket:

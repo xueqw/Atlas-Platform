@@ -56,6 +56,7 @@ function tryParseRecommendation(text: string): Recommendation | null {
 
 export default function WorkbenchPage() {
   const router = useRouter();
+  const [atlasRuntimeQuery, setAtlasRuntimeQuery] = useState("");
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -89,11 +90,25 @@ export default function WorkbenchPage() {
   const builderConvIdRef = useRef("");
 
   useEffect(() => {
+    const source = new URLSearchParams(window.location.search);
+    const forwarded = new URLSearchParams();
+    for (const key of ["atlas_agent_id", "atlas_agent_version_id"]) {
+      const value = source.get(key);
+      if (value) forwarded.set(key, value);
+    }
+    setAtlasRuntimeQuery(forwarded.toString());
     api.listAgents()
       .then(setAgents)
       .catch(() => setLoadError("无法加载智能体列表，请确认后端服务已启动"))
       .finally(() => setLoading(false));
   }, []);
+
+  const workbenchHref = (id: number) => {
+    const query = new URLSearchParams(atlasRuntimeQuery);
+    if (query.has("atlas_agent_id")) query.set("atlas_gateway_agent_id", String(id));
+    const suffix = query.toString();
+    return `/workbench/${id}${suffix ? `?${suffix}` : ""}`;
+  };
 
   const reloadAgents = () => {
     api.listAgents().then(setAgents);
@@ -137,7 +152,7 @@ export default function WorkbenchPage() {
         ],
       });
       await api.saveDAGGraph(agent.id, defaultDAG);
-      router.push(`/workbench/${agent.id}`);
+      router.push(workbenchHref(agent.id));
     } catch {
       toast.error("创建失败，请确认后端服务已启动");
     } finally {
@@ -150,7 +165,7 @@ export default function WorkbenchPage() {
     setCreating(true);
     try {
       const result = await api.applyDAGTemplate(templateId);
-      router.push(`/workbench/${result.agent_id}`);
+      router.push(workbenchHref(result.agent_id));
     } catch {
       toast.error("从模板创建失败");
       setCreating(false);
@@ -229,7 +244,7 @@ export default function WorkbenchPage() {
         builderRec.prompt.role_name || "新建智能体"
       );
       closeBuilder();
-      router.push(`/workbench/${agent.id}`);
+      router.push(workbenchHref(agent.id));
     } catch {
       toast.error("应用失败");
       setBuilderApplying(false);
@@ -303,7 +318,7 @@ export default function WorkbenchPage() {
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
           {agents.map((agent) => (
-            <Link key={agent.id} href={`/workbench/${agent.id}`}>
+            <Link key={agent.id} href={workbenchHref(agent.id)}>
               <Card className="hover:border-primary transition-colors cursor-pointer h-full">
                 <CardContent className="p-3">
                   <div className="flex items-start justify-between gap-1 mb-1">

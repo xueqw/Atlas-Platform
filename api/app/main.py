@@ -2,7 +2,7 @@ import json
 import asyncio
 import secrets
 import re
-from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import select, text
@@ -23,6 +23,7 @@ from .api_invoke import invoke_router
 from .evaluation import router as evaluation_router
 from .memory import router as memory_router
 from .runtime_api import router as runtime_router
+from .multi_agent_api import router as multi_agent_router
 from .object_storage import knowledge_object_key, object_storage
 from .state_store import state_store
 from .code_runner import runner_health
@@ -39,11 +40,18 @@ app.include_router(invoke_router)
 app.include_router(evaluation_router)
 app.include_router(memory_router)
 app.include_router(runtime_router)
+app.include_router(multi_agent_router)
 
 @app.on_event("startup")
 def startup():
     if settings.environment == "production" and not settings.secret_encryption_key:
         raise RuntimeError("SECRET_ENCRYPTION_KEY_FILE is required in production")
+    if (
+        settings.environment == "production"
+        and settings.object_storage_required
+        and settings.object_storage_backend.strip().lower() != "minio"
+    ):
+        raise RuntimeError("Production object storage requires OBJECT_STORAGE_BACKEND=minio")
     ensure_schema()
     if settings.object_storage_required and not object_storage.ping():
         raise RuntimeError("Required object storage is unavailable")
@@ -595,7 +603,9 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
         enabled_connectors.insert(0, "fetcher")
 
     # 本次可用 skill 池：规划器只见元数据；正文仅在权限通过且实际选中后读取。
-    skill_rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
+    skill_rows = db.scalars(select(Skill).where(
+        Skill.workspace_id == ws, Skill.status.in_(("active", "published"))
+    )).all()
     skill_catalog = [{"id": s.id, "name": s.name, "description": s.description,
                       "summary": s.summary, "category_path": s.category_path,
                       "trigger_phrases": s.trigger_phrases} for s in skill_rows]
@@ -663,7 +673,8 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 skill_catalog=skill_catalog,
             )
             # M3：手动勾选 ∪ 自动选取，覆写为解析后的对象数组随 plan_json 落库
-            from .skill_router import load_selected_skill_content, route_skills
+            from .skill_router import load_selected_skill_content, persisted_vector_scores, persist_router_decision, route_skills
+            from .memory_ledger import MemoryScope
             # The planner proposes candidates; the deterministic router is the
             # policy gate and emits the auditable no-selection/selection record.
             rows_by_skill_id = {row.id: row for row in skill_rows}
@@ -676,13 +687,30 @@ async def send_message(conversation_id: str, payload: ChatRequest, user: User = 
                 for skill in skill_catalog
             ]
             proposed_ids = set(plan.get("skills", []))
+            query_embedding = await embed_query(payload.content)
+            stored_vector_scores = persisted_vector_scores(skill_rows, query_embedding or [])
+            proposed_vector_scores = {
+                skill_id: max(stored_vector_scores.get(skill_id, 0.0), 1.0 if skill_id in proposed_ids else 0.0)
+                for skill_id in {row.id for row in skill_rows}
+            }
             router_audit = route_skills(
                 router_catalog, query=payload.content,
                 permitted_ids=[skill["id"] for skill in skill_catalog], manual_ids=manual_skill_ids,
                 # A model proposal is retained as a vector-stage signal; lexical
                 # scoring remains deterministic and negative scenarios can veto it.
-                vector_scores={skill_id: 1.0 if skill_id in proposed_ids else 0.0 for skill_id in proposed_ids},
+                vector_scores=proposed_vector_scores,
+                allowed_statuses=("active", "published"),
             )
+            with SessionLocal() as audit_db:
+                persist_router_decision(
+                    audit_db,
+                    scope=MemoryScope(
+                        workspace_id=ws, user_id=user.id,
+                        agent_id=agent.id if agent else "__workbench__", run_id=run_id,
+                    ),
+                    decision=router_audit,
+                )
+                audit_db.commit()
             selected_ids = router_audit["selected_ids"]
             selection_sources = router_audit["selection_sources"]
             selected_skills = load_selected_skill_content(
@@ -883,10 +911,21 @@ def list_skills(ws: str = Depends(current_workspace_id), db: Session = Depends(g
 
 
 @app.get("/api/skills/discovery")
-def discover_skills(category: str | None = None, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+async def discover_skills(
+    category: str | None = None,
+    query: str = Query(default="", max_length=500),
+    status: list[str] | None = Query(default=None),
+    required_permission: list[str] = Query(default=[]),
+    sort_by: str = Query(default="relevance"),
+    descending: bool = Query(default=True),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    ws: str = Depends(current_workspace_id),
+    db: Session = Depends(get_db),
+):
     """Metadata-only Skill discovery; no unselected instruction body crosses this boundary."""
-    from .skill_router import build_category_tree, discover_skill_metadata
-    rows = db.scalars(select(Skill).where(Skill.workspace_id == ws, Skill.status == "active")).all()
+    from .skill_router import build_category_tree, persisted_vector_scores, search_skill_metadata
+    rows = db.scalars(select(Skill).where(Skill.workspace_id == ws)).all()
     catalog = [
         {
             "id": row.id, "name": row.name, "category_path": row.category_path,
@@ -899,10 +938,63 @@ def discover_skills(category: str | None = None, ws: str = Depends(current_works
             "requirements": json.loads(row.requirements or "[]"),
             "permissions": json.loads(row.permissions or "[]"),
             "version": row.version, "status": row.status,
+            "trigger_phrases": [phrase.strip() for phrase in row.trigger_phrases.split(",") if phrase.strip()],
+            "updated_at": row.updated_at.isoformat(),
         }
         for row in rows
     ]
-    return {"tree": build_category_tree(catalog), "skills": discover_skill_metadata(catalog, category_prefix=category)}
+    query_vector = await embed_query(query) if query else None
+    vector_scores = persisted_vector_scores(rows, query_vector or [])
+    try:
+        result = search_skill_metadata(
+            catalog,
+            query=query,
+            category_prefix=category,
+            statuses=status or ("active", "published"),
+            required_permissions=required_permission,
+            vector_scores=vector_scores,
+            sort_by=sort_by,
+            descending=descending,
+            page=page,
+            page_size=page_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "tree": build_category_tree(catalog),
+        # Keep the original key during the client migration while exposing the
+        # stable pagination envelope beside it.
+        "skills": result["items"],
+        **result,
+    }
+
+
+@app.get("/api/skills/discovery/{skill_id}/content")
+def load_discovered_skill_content(
+    skill_id: str,
+    decision_id: str = Query(min_length=1, max_length=36),
+    user: User = Depends(current_user),
+    ws: str = Depends(current_workspace_id),
+    db: Session = Depends(get_db),
+):
+    """Load a body only after the current user has an audited selection decision."""
+    from .governance_models import SkillRouterDecision
+
+    decision = db.scalar(select(SkillRouterDecision).where(
+        SkillRouterDecision.decision_id == decision_id,
+        SkillRouterDecision.workspace_id == ws,
+        SkillRouterDecision.user_id == user.id,
+    ))
+    if decision is None or skill_id not in decision.selected_ids:
+        raise HTTPException(status_code=403, detail="Skill 未通过本次路由策略选择")
+    skill = db.scalar(select(Skill).where(
+        Skill.id == skill_id,
+        Skill.workspace_id == ws,
+        Skill.status.in_(("active", "published")),
+    ))
+    if skill is None:
+        raise HTTPException(status_code=404, detail="Skill 不存在或不可执行")
+    return {"id": skill.id, "name": skill.name, "version": skill.version, "content": skill.content}
 
 
 def _skill_payload(data: dict) -> dict:
@@ -915,9 +1007,35 @@ def _skill_payload(data: dict) -> dict:
     return data
 
 
+def _validated_skill_payload(payload: SkillCreate) -> dict:
+    """Apply the same governed contract to both legacy-active and published Skills."""
+    from .skill_router import validate_skill_metadata
+
+    data = payload.model_dump()
+    # ``active`` is the legacy persisted spelling of runtime-eligible
+    # ``published``. Validation accepts both, while routing normalizes active at
+    # its boundary so old records remain deployable during migration.
+    validate_skill_metadata({"id": "validation", **data})
+    return data
+
+
+def _skill_embedding_text(payload: SkillCreate) -> str:
+    return "\n".join(filter(None, (
+        payload.name, payload.description, payload.summary,
+        *payload.use_when, *[item.strip() for item in payload.trigger_phrases.split(",") if item.strip()],
+    )))
+
+
 @app.post("/api/skills", response_model=SkillOut, status_code=201)
-def create_skill(payload: SkillCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
-    skill = Skill(workspace_id=ws, type="instruction", builtin=False, **_skill_payload(payload.model_dump()))
+async def create_skill(payload: SkillCreate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+    data = _validated_skill_payload(payload)
+    embedding = await embed_query(_skill_embedding_text(payload))
+    stored_embedding = json.dumps(embedding) if embedding and db.bind and db.bind.dialect.name == "sqlite" else embedding
+    skill = Skill(
+        workspace_id=ws, type="instruction", builtin=False,
+        embedding=stored_embedding, embedding_model=settings.embedding_model if embedding else "",
+        **_skill_payload(data),
+    )
     db.add(skill); db.commit(); db.refresh(skill)
     return skill
 
@@ -935,12 +1053,16 @@ def get_skill(skill_id: str, ws: str = Depends(current_workspace_id), db: Sessio
 
 
 @app.put("/api/skills/{skill_id}", response_model=SkillOut)
-def update_skill(skill_id: str, payload: SkillUpdate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
+async def update_skill(skill_id: str, payload: SkillUpdate, ws: str = Depends(current_workspace_id), db: Session = Depends(get_db)):
     skill = _get_owned_skill(skill_id, ws, db)
     if skill.builtin:
         raise HTTPException(403, "内置技能只读")
-    for k, v in _skill_payload(payload.model_dump()).items():
+    data = _validated_skill_payload(payload)
+    for k, v in _skill_payload(data).items():
         setattr(skill, k, v)
+    embedding = await embed_query(_skill_embedding_text(payload))
+    skill.embedding = json.dumps(embedding) if embedding and db.bind and db.bind.dialect.name == "sqlite" else embedding
+    skill.embedding_model = settings.embedding_model if embedding else ""
     db.commit(); db.refresh(skill)
     return skill
 
