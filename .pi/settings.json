@@ -1,0 +1,14 @@
+{
+  "packages": [
+    "npm:@juicesharp/rpiv-btw@1.20.0",
+    "npm:@juicesharp/rpiv-ask-user-question@1.20.0",
+    "npm:@juicesharp/rpiv-todo@1.20.0",
+    "npm:pi-lens@3.8.71",
+    "npm:pi-mcp-adapter@2.11.0",
+    "npm:context-mode@1.0.169",
+    "npm:@narumitw/pi-goal@0.20.0",
+    "npm:@narumitw/pi-statusline@0.23.0",
+    "npm:@tintinweb/pi-subagents@0.14.2",
+    "npm:pi-hermes-memory@0.8.1"
+  ]
+}
