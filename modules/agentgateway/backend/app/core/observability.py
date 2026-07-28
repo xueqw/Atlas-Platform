@@ -438,6 +438,8 @@ def record_evaluation_scores(case_ctx: dict, dimension_results: list) -> list[st
         "dag_version": case_ctx.get("dag_version"),
         "prompt_version": case_ctx.get("prompt_version"),
         "model": case_ctx.get("model") or "",
+        "pipeline_version": case_ctx.get("pipeline_version") or "",
+        "dataset_fingerprint": case_ctx.get("dataset_fingerprint") or "",
     }
 
     written: list[str] = []

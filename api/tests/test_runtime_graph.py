@@ -17,6 +17,26 @@ def test_direct_response_uses_stub_without_external_model():
     assert result.engine == "legacy-shim"
 
 
+def test_memory_context_is_injected_before_the_user_message():
+    captured = {}
+
+    async def model(runtime_state):
+        captured["messages"] = runtime_state.messages
+        captured["memory"] = runtime_state.memory_context
+        return "memory-aware"
+
+    graph = LegacyGraphShim(
+        model,
+        memory_loader=lambda _state: ({"source": "long_term", "items": [{"content": "客户偏好中文"}]},),
+    )
+    result = asyncio.run(graph.ainvoke(state()))
+
+    assert result.state.output == "memory-aware"
+    assert captured["memory"][0]["source"] == "long_term"
+    assert captured["messages"][-1] == {"role": "user", "content": "hello"}
+    assert "非可信记忆数据" in captured["messages"][-2]["content"]
+
+
 def test_read_only_tool_retries_and_write_tool_is_denied():
     calls = {"count": 0, "write": 0}
 

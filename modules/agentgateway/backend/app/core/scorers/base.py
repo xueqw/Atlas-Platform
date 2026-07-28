@@ -112,6 +112,9 @@ def skipped_result(dim_cfg: Dict[str, Any], reason: str,
     Used for degradation paths (ragas unavailable) and config errors so the
     dimension is recorded with its reason but excluded from scoring/pass logic.
     """
+    payload = dict(evidence or {"skipped_reason": reason})
+    if dim_cfg.get("gate_on_skip"):
+        payload["gate_on_skip"] = True
     return DimensionResult(
         dimension=str(dim_cfg.get("name", dim_cfg.get("type", "unknown"))),
         type=str(dim_cfg.get("type", "")),
@@ -121,6 +124,6 @@ def skipped_result(dim_cfg: Dict[str, Any], reason: str,
         weight=float(dim_cfg.get("weight", 0.0) or 0.0),
         required=bool(dim_cfg.get("required", False)),
         reason=reason,
-        evidence=evidence or {"skipped_reason": reason},
+        evidence=payload,
         skipped=True,
     )

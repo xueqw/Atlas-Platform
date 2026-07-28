@@ -27,6 +27,7 @@ from .models import Agent, AgentVersion, User
 from .runtime_contract import RuntimeAccessDenied, RuntimeSource, RuntimeStartRequest
 from .runtime_checkpoint import open_postgres_checkpointer
 from .runtime_graph import AtlasAgentState, RuntimePhaseOneGraph
+from .runtime_memory import RuntimeMemoryProvider
 from .runtime_persistence import SqlAlchemyRuntimeEventRepository, SqlAlchemyRuntimeRunRepository
 from .runtime_registry import RuntimeGraphRegistry, runtime_graph_registry
 from .runtime_service import AgentRuntimeService, GraphLegacyAdapter, RuntimeFeatureFlags
@@ -89,7 +90,11 @@ def _model_for_snapshot(snapshot: dict[str, Any]):
 
 
 def _legacy_for_snapshot(snapshot: dict[str, Any]) -> GraphLegacyAdapter:
-    return GraphLegacyAdapter(RuntimePhaseOneGraph(_model_for_snapshot(snapshot), prefer_langgraph=False))
+    return GraphLegacyAdapter(RuntimePhaseOneGraph(
+        _model_for_snapshot(snapshot),
+        prefer_langgraph=False,
+        memory_loader=RuntimeMemoryProvider(SessionLocal).load,
+    ))
 
 
 def _service_for_snapshot(snapshot: dict[str, Any], *, checkpointer: Any | None = None) -> AgentRuntimeService:
@@ -101,6 +106,7 @@ def _service_for_snapshot(snapshot: dict[str, Any], *, checkpointer: Any | None 
         RuntimeGraphRegistry.PHASE_ONE_REACT,
         _model_for_snapshot(snapshot),
         checkpointer=checkpointer,
+        memory_loader=RuntimeMemoryProvider(SessionLocal).load,
     )
     return AgentRuntimeService(
         graph,

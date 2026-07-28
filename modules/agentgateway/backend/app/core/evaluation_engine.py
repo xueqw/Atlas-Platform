@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +42,7 @@ from app.models.db import (
 _log = logging.getLogger(__name__)
 
 PASS_THRESHOLD = 0.6
+PIPELINE_VERSION = "langfuse-ragas-v1"
 # Re-exported for backward compatibility with anything importing them here.
 JUDGE_PROVIDER = scorers.judge.JUDGE_PROVIDER
 JUDGE_MODEL = scorers.judge.JUDGE_MODEL
@@ -216,7 +218,15 @@ def _aggregate(results: List[DimensionResult], case_threshold: float) -> tuple[f
         overall = sum(d.score * w for d, w in zip(scored, weights))
 
     required_failed = any(d.required and not d.passed for d in scored)
-    case_pass = (not required_failed) and overall >= case_threshold
+    # A required dimension normally remains optional when its evaluator is not
+    # available, preserving backwards compatibility. Evaluation suites can opt
+    # into a strict data contract with ``gate_on_skip`` so a RAG release cannot
+    # pass simply because its faithfulness metric had no contexts or evaluator.
+    strict_required_skipped = any(
+        d.required and d.skipped and bool(d.evidence.get("gate_on_skip"))
+        for d in results
+    )
+    case_pass = (not required_failed) and (not strict_required_skipped) and overall >= case_threshold
     return overall, case_pass
 
 
@@ -317,16 +327,23 @@ def build_summary(case_results: List[EvaluationCaseResult],
     # Per-dimension aggregation from each row's dimension_results_json.
     dim_scores: Dict[str, List[float]] = {}
     dim_fails: Dict[str, List[int]] = {}
+    dim_coverage: Dict[str, Dict[str, int]] = {}
     required_failures: List[dict] = []
     for r in case_results:
         payload = _safe_json(getattr(r, "dimension_results_json", "") or "{}", {})
         dims = payload.get("dimensions", []) if isinstance(payload, dict) else []
         for d in dims:
-            if not isinstance(d, dict) or d.get("skipped"):
+            if not isinstance(d, dict):
                 continue
             name = str(d.get("dimension", d.get("name", "")))
             if not name:
                 continue
+            coverage = dim_coverage.setdefault(name, {"declared": 0, "scored": 0, "skipped": 0})
+            coverage["declared"] += 1
+            if d.get("skipped"):
+                coverage["skipped"] += 1
+                continue
+            coverage["scored"] += 1
             try:
                 score = float(d.get("score", 0.0))
             except (TypeError, ValueError):
@@ -349,6 +366,13 @@ def build_summary(case_results: List[EvaluationCaseResult],
     dimension_fail_rates = {
         name: round(sum(vals) / len(vals), 4) for name, vals in dim_fails.items() if vals
     }
+    dimension_coverage = {
+        name: {
+            **counts,
+            "rate": round(counts["scored"] / counts["declared"], 4) if counts["declared"] else 0.0,
+        }
+        for name, counts in dim_coverage.items()
+    }
 
     return {
         "total_cases": total,
@@ -365,8 +389,41 @@ def build_summary(case_results: List[EvaluationCaseResult],
         "token_output": token_output,
         "dimension_averages": dimension_averages,
         "dimension_fail_rates": dimension_fail_rates,
+        "dimension_coverage": dimension_coverage,
         "required_dimension_failures": required_failures,
     }
+
+
+def _suite_fingerprint(suite: EvaluationSuite, cases: List[AgentTestCase]) -> str:
+    """Stable fingerprint for the exact suite contract used by one run.
+
+    It lets a Langfuse trace, local run result, and release decision refer to
+    the same immutable collection of prompts, references, contexts and metric
+    definitions without introducing another database table.
+    """
+    payload = {
+        "suite": {
+            "id": suite.id,
+            "type": suite.suite_type,
+            "pass_threshold": suite.pass_threshold,
+            "default_dimensions_json": suite.default_dimensions_json,
+        },
+        "cases": [
+            {
+                "id": case.id,
+                "input": case.input_message,
+                "reference": case.reference_output,
+                "contexts": case.context_json,
+                "dimensions": case.dimensions_json,
+                "constraints": case.constraints_json,
+                "metadata": case.metadata_json,
+                "turns": case.turns_json,
+            }
+            for case in cases
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
 def _parse_turns(case: "AgentTestCase") -> List[Dict[str, str]]:
@@ -485,6 +542,7 @@ async def run_suite(agent_id: int, suite_id: int, session: Session) -> Evaluatio
     prompt_version = prompt_version_row.version_number if prompt_version_row else agent.version
 
     suite_threshold = float(getattr(suite, "pass_threshold", PASS_THRESHOLD) or PASS_THRESHOLD)
+    dataset_fingerprint = _suite_fingerprint(suite, cases)
 
     run = EvaluationRun(
         agent_id=agent_id,
@@ -544,6 +602,8 @@ async def run_suite(agent_id: int, suite_id: int, session: Session) -> Evaluatio
                     "model": run.model,
                     "trace_id": trace_id,
                     "overall": case_score.overall,
+                    "pipeline_version": PIPELINE_VERSION,
+                    "dataset_fingerprint": dataset_fingerprint,
                 },
                 dim_payload["dimensions"],
             )
@@ -570,6 +630,11 @@ async def run_suite(agent_id: int, suite_id: int, session: Session) -> Evaluatio
         case_rows.append(row)
 
     summary = build_summary(case_rows, total_token_in, total_token_out)
+    summary["pipeline"] = {
+        "version": PIPELINE_VERSION,
+        "dataset_fingerprint": dataset_fingerprint,
+        "suite_type": suite.suite_type,
+    }
     run.trace_ids = json.dumps([t for t in trace_ids if t], ensure_ascii=False)
     run.summary = json.dumps(summary, ensure_ascii=False)
     # A run passes when every key case passes (or, absent key cases, all cases).

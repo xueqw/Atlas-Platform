@@ -17,19 +17,21 @@ class RuntimeGraphRegistry:
     PHASE_ONE_REACT = "phase1-react"
 
     def __init__(self) -> None:
-        self._templates: dict[str, Callable[[ModelInvoker, Any | None], RuntimePhaseOneGraph]] = {
-            self.PHASE_ONE_REACT: lambda model, checkpointer: RuntimePhaseOneGraph(
+        self._templates: dict[str, Callable[[ModelInvoker, Any | None, Any | None], RuntimePhaseOneGraph]] = {
+            self.PHASE_ONE_REACT: lambda model, checkpointer, memory_loader: RuntimePhaseOneGraph(
                 model,
                 prefer_langgraph=True,
                 checkpointer=checkpointer,
+                memory_loader=memory_loader,
             ),
         }
 
-    def create(self, template: str, model: ModelInvoker, *, checkpointer: Any | None = None) -> RuntimePhaseOneGraph:
+    def create(self, template: str, model: ModelInvoker, *, checkpointer: Any | None = None,
+               memory_loader: Any | None = None) -> RuntimePhaseOneGraph:
         factory = self._templates.get(template)
         if factory is None:
             raise ValueError(f"unknown runtime graph template: {template}")
-        return factory(model, checkpointer)
+        return factory(model, checkpointer, memory_loader)
 
 
 runtime_graph_registry = RuntimeGraphRegistry()

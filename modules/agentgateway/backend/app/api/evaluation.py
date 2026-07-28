@@ -234,6 +234,7 @@ def _suite_response(suite: EvaluationSuite, case_count: int = 0) -> SuiteRespons
         suite_type=suite.suite_type,
         default_dimensions_json=suite.default_dimensions_json,
         pass_threshold=suite.pass_threshold,
+        release_gate_policy_json=suite.release_gate_policy_json,
     )
 
 
@@ -274,6 +275,7 @@ def create_suite(agent_id: int, payload: SuiteCreate, session: Session = Depends
         suite_type=payload.suite_type,
         default_dimensions_json=default_dimensions_json,
         pass_threshold=payload.pass_threshold,
+        release_gate_policy_json=payload.release_gate_policy_json,
     )
     session.add(suite)
     session.commit()
@@ -307,6 +309,34 @@ def delete_suite(agent_id: int, suite_id: int, session: Session = Depends(get_se
     session.delete(suite)
     session.commit()
     return {"ok": True}
+
+
+@router.post("/{agent_id}/suites/{suite_id}/baseline/{run_id}", response_model=SuiteResponse)
+def set_suite_baseline(agent_id: int, suite_id: int, run_id: int,
+                       session: Session = Depends(get_session)):
+    """Promote a successful run to the suite's explicit regression baseline."""
+    suite = session.get(EvaluationSuite, suite_id)
+    run = session.get(EvaluationRun, run_id)
+    if not suite or suite.agent_id != agent_id:
+        raise HTTPException(status_code=404, detail="Suite not found")
+    if not run or run.agent_id != agent_id or run.suite_id != suite_id:
+        raise HTTPException(status_code=404, detail="Evaluation run not found")
+    if not run.passed:
+        raise HTTPException(status_code=409, detail="Only a passed run can become the baseline")
+    try:
+        policy = json.loads(suite.release_gate_policy_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        policy = {}
+    if not isinstance(policy, dict):
+        policy = {}
+    regression = policy.get("regression") if isinstance(policy.get("regression"), dict) else {}
+    regression.update({"enabled": True, "baseline_run_id": run.id})
+    policy["regression"] = regression
+    suite.release_gate_policy_json = json.dumps(policy, ensure_ascii=False)
+    session.add(suite)
+    session.commit()
+    session.refresh(suite)
+    return _suite_response(suite)
 
 
 # ─── Evaluation Runs ─────────────────────────────────────────────────────────

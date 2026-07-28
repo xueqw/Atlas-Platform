@@ -352,6 +352,7 @@ class SuiteCreate(BaseModel):
     suite_type: str = "general"
     default_dimensions_json: Optional[str] = None  # None → server fills from template
     pass_threshold: float = 0.6
+    release_gate_policy_json: str = "{}"
 
 
 class SuiteUpdate(BaseModel):
@@ -361,6 +362,7 @@ class SuiteUpdate(BaseModel):
     suite_type: Optional[str] = None
     default_dimensions_json: Optional[str] = None
     pass_threshold: Optional[float] = None
+    release_gate_policy_json: Optional[str] = None
 
 
 class SuiteResponse(BaseModel):
@@ -374,6 +376,7 @@ class SuiteResponse(BaseModel):
     suite_type: str = "general"
     default_dimensions_json: str = "{}"
     pass_threshold: float = 0.6
+    release_gate_policy_json: str = "{}"
 
 
 class CaseResultResponse(BaseModel):

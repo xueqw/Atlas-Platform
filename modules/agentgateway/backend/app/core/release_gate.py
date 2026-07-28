@@ -58,8 +58,24 @@ GATE_TEMPLATES: dict[str, list[dict]] = {
         {"name": "constraint_following", "min_avg": 0.9, "required_no_fail": True},
     ],
     "rag": [
-        {"name": "groundedness", "min_avg": 0.8, "required_no_fail": False},
+        {"name": "faithfulness", "min_avg": 0.85, "required_no_fail": True,
+         "min_coverage": 1.0},
+        {"name": "context_precision", "min_avg": 0.7, "required_no_fail": False,
+         "min_coverage": 0.9},
+        {"name": "answer_relevancy", "min_avg": 0.7, "required_no_fail": False,
+         "min_coverage": 0.9},
     ],
+}
+
+# Disabled until a team explicitly promotes a successful run to baseline. This
+# avoids treating a first-ever certification run as a regression while making
+# every later candidate compare against an intentional, versioned reference.
+DEFAULT_REGRESSION_POLICY: dict = {
+    "enabled": False,
+    "baseline_run_id": None,
+    "max_avg_score_drop": 0.03,
+    "max_pass_rate_drop": 0.02,
+    "max_new_case_regressions": 0,
 }
 
 
@@ -108,13 +124,14 @@ def resolve_gate_policy(agent: Agent, suite: Optional[EvaluationSuite]) -> dict:
     Priority (later overrides earlier, per key): system default ← suite_type
     template ← suite.release_gate_policy_json ← agent.release_gate_thresholds.
 
-    Returns ``{"generic": {...}, "dimensions": [{name, min_avg, required_no_fail}]}``.
+    Returns generic, dimension and baseline-regression policy sections.
     """
     # Generic thresholds start from system default; per-suite then per-agent override.
     generic = dict(DEFAULT_THRESHOLDS)
     # Dimensions start from the suite_type template.
     suite_type = (suite.suite_type if suite else "general") or "general"
     dimensions = [dict(d) for d in GATE_TEMPLATES.get(suite_type, [])]
+    regression = dict(DEFAULT_REGRESSION_POLICY)
 
     # Layer 3: per-suite policy override (generic + dimensions).
     if suite is not None:
@@ -125,6 +142,8 @@ def resolve_gate_policy(agent: Agent, suite: Optional[EvaluationSuite]) -> dict:
         suite_dims = suite_policy.get("dimensions")
         if isinstance(suite_dims, list):
             dimensions = _merge_dimensions(dimensions, suite_dims)
+        if isinstance(suite_policy.get("regression"), dict):
+            regression.update({k: v for k, v in suite_policy["regression"].items() if v is not None})
 
     # Layer 4: per-agent override. Back-compat: release_gate_thresholds may be a
     # flat generic-threshold object OR a structured {generic, dimensions} policy.
@@ -136,8 +155,11 @@ def resolve_gate_policy(agent: Agent, suite: Optional[EvaluationSuite]) -> dict:
     agent_dims = agent_policy.get("dimensions")
     if isinstance(agent_dims, list):
         dimensions = _merge_dimensions(dimensions, agent_dims)
+    if isinstance(agent_policy.get("regression"), dict):
+        regression.update({k: v for k, v in agent_policy["regression"].items() if v is not None})
 
-    return {"generic": generic, "dimensions": dimensions, "suite_type": suite_type}
+    return {"generic": generic, "dimensions": dimensions,
+            "regression": regression, "suite_type": suite_type}
 
 
 # ─── Result ──────────────────────────────────────────────────────────────────
@@ -237,6 +259,7 @@ def evaluate_release_gate(agent_id: int, session: Session) -> GateResult:
         "thresholds": thresholds,
         "suite_type": policy["suite_type"],
         "gate_dimensions": policy["dimensions"],
+        "regression_policy": policy["regression"],
     }
 
     if run is None:
@@ -286,6 +309,7 @@ def evaluate_release_gate(agent_id: int, session: Session) -> GateResult:
         # dimension data; a run without it falls back to generic checks only and
         # is NOT failed for the absence.
         _check_dimensions(eval_summary, policy["dimensions"], reasons, failures, summary)
+        _check_regression(run, policy["regression"], reasons, failures, summary, session)
 
     # (4)+(5) Observability metrics: error rate / latency / token.
     obs = _observability_metrics(agent_id, int(thresholds["run_window"]), session)
@@ -343,6 +367,7 @@ def _check_dimensions(
     absent — the gate must not penalize an evaluation for lacking a dimension.
     """
     dimension_averages = eval_summary.get("dimension_averages")
+    dimension_coverage = eval_summary.get("dimension_coverage") or {}
     required_dimension_failures = eval_summary.get("required_dimension_failures") or []
 
     # No dimension data at all → skip entirely, record nothing, fall back to generic.
@@ -359,9 +384,23 @@ def _check_dimensions(
         if not name:
             continue
         min_avg = gd.get("min_avg")
+        min_coverage = gd.get("min_coverage")
+        coverage = dimension_coverage.get(name) if isinstance(dimension_coverage, dict) else None
+        coverage_rate = coverage.get("rate") if isinstance(coverage, dict) else None
         # Dimension declared in policy but absent in this run → skip, don't fail.
         if name not in dimension_averages:
-            skipped.append(name)
+            if min_coverage is not None:
+                actual_rate = float(coverage_rate or 0.0)
+                reasons.append(f"维度 {name} 评测覆盖率 {actual_rate:.0%} 低于阈值 {float(min_coverage):.0%}")
+                failures.append({
+                    "code": "dimension_coverage_below",
+                    "label": f"维度 {name} 评测覆盖率 {actual_rate:.0%} 低于阈值 {float(min_coverage):.0%}",
+                    "dimension": name,
+                    "actual": actual_rate,
+                    "threshold": min_coverage,
+                })
+            else:
+                skipped.append(name)
             continue
         actual = dimension_averages.get(name)
         if min_avg is not None and isinstance(actual, (int, float)) and actual < min_avg:
@@ -372,6 +411,16 @@ def _check_dimensions(
                 "dimension": name,
                 "actual": actual,
                 "threshold": min_avg,
+            })
+        if min_coverage is not None and (not isinstance(coverage_rate, (int, float)) or coverage_rate < min_coverage):
+            actual_rate = float(coverage_rate or 0.0)
+            reasons.append(f"维度 {name} 评测覆盖率 {actual_rate:.0%} 低于阈值 {float(min_coverage):.0%}")
+            failures.append({
+                "code": "dimension_coverage_below",
+                "label": f"维度 {name} 评测覆盖率 {actual_rate:.0%} 低于阈值 {float(min_coverage):.0%}",
+                "dimension": name,
+                "actual": actual_rate,
+                "threshold": min_coverage,
             })
 
     # required_dimension_failures: any required dimension that failed on a case.
@@ -404,3 +453,73 @@ def _check_dimensions(
     if dimension_averages:
         worst_name = min(dimension_averages, key=lambda k: dimension_averages[k])
         summary["worst_dimension"] = {"dimension": worst_name, "avg": dimension_averages[worst_name]}
+
+
+def _check_regression(
+    run: EvaluationRun,
+    policy: dict,
+    reasons: list[str],
+    failures: list[dict],
+    summary: dict,
+    session: Session,
+) -> None:
+    """Compare the candidate run to an explicitly selected baseline."""
+    if not policy.get("enabled"):
+        summary["regression_checked"] = False
+        return
+
+    baseline_id = policy.get("baseline_run_id")
+    if not isinstance(baseline_id, int) or baseline_id <= 0:
+        summary["regression_checked"] = False
+        reasons.append("回归门禁已启用，但尚未设置基线评测运行")
+        failures.append({"code": "regression_baseline_missing", "label": "回归门禁已启用，但尚未设置基线评测运行"})
+        return
+    if baseline_id == run.id:
+        summary["regression_checked"] = False
+        reasons.append("候选运行不能同时作为回归基线")
+        failures.append({"code": "regression_baseline_same_run", "label": "候选运行不能同时作为回归基线"})
+        return
+
+    try:
+        from app.core.evaluation_compare import compare_runs
+        comparison = compare_runs(baseline_id, run.id, session)
+    except ValueError as exc:
+        summary["regression_checked"] = False
+        reasons.append("回归基线不可用")
+        failures.append({"code": "regression_baseline_invalid", "label": "回归基线不可用", "detail": str(exc)})
+        return
+
+    deltas = comparison["deltas"]
+    summary["regression_checked"] = True
+    summary["regression"] = {
+        "baseline": comparison["baseline"],
+        "deltas": deltas,
+        "new_case_regressions": len(comparison["regressions"]),
+    }
+    checks = (
+        ("avg_score", "max_avg_score_drop", "平均得分"),
+        ("pass_rate", "max_pass_rate_drop", "通过率"),
+    )
+    for delta_name, limit_name, label in checks:
+        delta = deltas.get(delta_name)
+        limit = policy.get(limit_name)
+        if isinstance(delta, (int, float)) and isinstance(limit, (int, float)) and delta < -float(limit):
+            reasons.append(f"相对基线的{label}下降 {abs(delta):.2%}，超过允许值 {float(limit):.2%}")
+            failures.append({
+                "code": "regression_drop_exceeded",
+                "label": f"相对基线的{label}下降 {abs(delta):.2%}，超过允许值 {float(limit):.2%}",
+                "metric": delta_name,
+                "actual": delta,
+                "threshold": -float(limit),
+            })
+
+    max_regressions = policy.get("max_new_case_regressions", 0)
+    if isinstance(max_regressions, int) and len(comparison["regressions"]) > max_regressions:
+        reasons.append(f"新增失败用例 {len(comparison['regressions'])} 个，超过允许值 {max_regressions} 个")
+        failures.append({
+            "code": "regression_cases_exceeded",
+            "label": f"新增失败用例 {len(comparison['regressions'])} 个，超过允许值 {max_regressions} 个",
+            "actual": len(comparison["regressions"]),
+            "threshold": max_regressions,
+            "cases": comparison["regressions"],
+        })

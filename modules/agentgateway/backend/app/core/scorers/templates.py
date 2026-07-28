@@ -44,8 +44,9 @@ PLANNER_TEMPLATE: Dict[str, Any] = {
 
 # rag: retrieval-aware quality. faithfulness (answer grounded in retrieved
 # context) is required; context_precision + answer_relevancy round it out, on a
-# light keyword/rule backbone. Ragas metrics skip gracefully when ragas is
-# absent or contexts are missing, so the keyword/rule dims still produce a score.
+# light keyword/rule backbone. Faithfulness is a strict release condition: a
+# RAG suite must provide contexts and a working Ragas evaluator rather than
+# silently publishing with an unevaluated groundedness claim.
 RAG_TEMPLATE: Dict[str, Any] = {
     "dimensions": [
         {"name": "keyword_coverage", "type": "keyword", "weight": 0.15,
@@ -53,7 +54,8 @@ RAG_TEMPLATE: Dict[str, Any] = {
         {"name": "format_compliance", "type": "rule", "weight": 0.15,
          "threshold": 0.6, "required": False},
         {"name": "faithfulness", "type": "faithfulness", "weight": 0.3,
-         "threshold": 0.7, "required": True, "metric": "faithfulness"},
+         "threshold": 0.85, "required": True, "gate_on_skip": True,
+         "metric": "faithfulness"},
         {"name": "context_precision", "type": "context_precision", "weight": 0.2,
          "threshold": 0.6, "required": False, "metric": "context_precision"},
         {"name": "answer_relevancy", "type": "answer_relevancy", "weight": 0.2,
