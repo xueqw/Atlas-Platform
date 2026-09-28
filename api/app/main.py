@@ -1,17 +1,16 @@
 import json
-import secrets
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 from .database import SessionLocal, ensure_schema, get_db
 from .knowledge import extract_pages, search_chunks, split_pages
-from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, stream_model, test_model
-from .connectors import feishu, github_mcp
+from .model_gateway import embed_query, embed_texts, list_providers, stream_agent, test_model
+from .connectors import github_mcp
 from . import tools as agent_tools
 from .models import Agent, Conversation, Document, DocumentChunk, KnowledgeBase, Message
-from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, FeishuConfigRequest, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest
+from .schemas import AgentCreate, AgentOut, AgentUpdate, ChatRequest, ConversationCreate, ConversationDetail, ConversationOut, GithubConfigRequest, KnowledgeBaseCreate, KnowledgeBaseOut, ModelTestRequest
 from .apps import router as apps_router
 from .version import __version__
 
@@ -172,10 +171,9 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
     db.delete(item); db.commit()
 
 
-_oauth_states: set[str] = set()  # Demo-only CSRF state storage; use an expiring store in production.
 _pending_actions: dict[str, dict] = {}  # conversation_id -> pending write action {name, args}
-_AFFIRM = {"确认", "确定", "是", "好", "好的", "发送", "可以", "行", "嗯", "confirm", "yes", "y", "ok"}
-_DENY = {"取消", "不", "不要", "否", "算了", "cancel", "no", "n"}
+_AFFIRM = {"confirm", "yes", "y", "ok", "approve", "approved"}
+_DENY = {"cancel", "no", "n", "deny", "denied", "stop"}
 
 
 def _affirm(text: str) -> bool:
@@ -187,19 +185,8 @@ def _deny(text: str) -> bool:
 
 
 @app.get("/api/connectors")
-async def list_connectors(db: Session = Depends(get_db)):
-    return {"connectors": [await feishu.get_status(db), await github_mcp.get_status()]}
-
-
-@app.post("/api/connectors/feishu/config")
-async def feishu_config(payload: FeishuConfigRequest, db: Session = Depends(get_db)):
-    feishu.save_config(db, payload.app_id.strip(), payload.app_secret.strip())
-    return await feishu.get_status(db)
-
-
-@app.delete("/api/connectors/feishu/config", status_code=204)
-def feishu_config_clear(db: Session = Depends(get_db)):
-    feishu.clear_config(db)
+async def list_connectors():
+    return {"connectors": [await github_mcp.get_status()]}
 
 
 @app.post("/api/connectors/github/config")
@@ -211,30 +198,6 @@ async def github_config(payload: GithubConfigRequest, db: Session = Depends(get_
 @app.delete("/api/connectors/github", status_code=204)
 def github_disconnect(db: Session = Depends(get_db)):
     github_mcp.clear(db)
-
-
-@app.get("/api/connectors/feishu/login")
-def feishu_login():
-    if not feishu.is_configured():
-        raise HTTPException(400, "Feishu is not configured (App ID or App Secret is missing)")
-    state = secrets.token_urlsafe(16)
-    _oauth_states.add(state)
-    return RedirectResponse(feishu.build_authorize_url(state))
-
-
-@app.get("/api/connectors/feishu/callback")
-async def feishu_callback(code: str = "", state: str = "", db: Session = Depends(get_db)):
-    if not code or state not in _oauth_states:
-        return HTMLResponse("<h3>Authorization failed: missing parameters or invalid state.</h3>", status_code=400)
-    _oauth_states.discard(state)
-    try:
-        token = await feishu.exchange_code(code)
-        info = await feishu.fetch_user_info(token["access_token"])
-        name = info.get("name", "Feishu user")
-        feishu.save_token(db, token, name, open_id=info.get("open_id", ""))
-    except Exception as exc:
-        return HTMLResponse(f"<h3>Authorization failed: {exc}</h3>", status_code=500)
-    return HTMLResponse(f"<h3>✅ Feishu connected: {name}</h3><p>You can close this page and return to Atlas.</p>")
 
 
 @app.post("/api/conversations/{conversation_id}/messages/stream")

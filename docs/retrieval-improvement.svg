@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="300" viewBox="0 0 960 300" role="img" aria-labelledby="title description">
-  <title id="title">Atlas retrieval improvements in version 1.1.0</title>
-  <desc id="description">HEFT ranking improved from ninth to first, a Chinese false-positive score fell from 0.60 to zero, and all ten retrieval regression tests pass.</desc>
+  <title id="title">Atlas retrieval quality safeguards</title>
+  <desc id="description">HEFT ranking improved from ninth to first, noisy partial matches are removed, and the retrieval regression suite passes.</desc>
   <style>
     .title { font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2328; }
     .label { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #57606a; }
@@ -22,7 +22,7 @@
     }
   </style>
 
-  <text class="title" x="32" y="38">Retrieval quality after v1.1.0</text>
+  <text class="title" x="32" y="38">Retrieval quality safeguards</text>
 
   <rect class="panel" x="32" y="62" width="282" height="202" rx="12"/>
   <text class="label" x="56" y="94">RARE-TERM RANKING</text>
@@ -34,17 +34,17 @@
   <text class="note" x="56" y="247">HEFT result gains eight positions</text>
 
   <rect class="panel" x="339" y="62" width="282" height="202" rx="12"/>
-  <text class="label" x="363" y="94">CHINESE FALSE POSITIVE</text>
+  <text class="label" x="363" y="94">LEXICAL FALSE POSITIVE</text>
   <text class="value" x="363" y="137">0.60 → 0</text>
   <line class="track" x1="370" y1="184" x2="590" y2="184"/>
   <line class="before" x1="370" y1="184" x2="502" y2="184" stroke-width="8" stroke-linecap="round"/>
   <circle class="after" cx="370" cy="184" r="7"/>
-  <text class="note" x="363" y="218">CJK bigrams reduce partial-match noise</text>
-  <text class="note" x="363" y="247">Chinese bigrams remove character noise</text>
+  <text class="note" x="363" y="218">BM25 reduces partial-match noise</text>
+  <text class="note" x="363" y="247">Rare terms outrank generic overlap</text>
 
   <rect class="panel" x="646" y="62" width="282" height="202" rx="12"/>
   <text class="label" x="670" y="94">CONTINUOUS VERIFICATION</text>
-  <text class="value" x="670" y="137">10 / 10</text>
+  <text class="value" x="670" y="137">12 / 12</text>
   <circle class="after" cx="677" cy="177" r="5"/>
   <text class="note" x="692" y="181">Python 3.10 and 3.12</text>
   <circle class="after" cx="677" cy="207" r="5"/>

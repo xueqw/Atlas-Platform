@@ -19,15 +19,6 @@ PROVIDERS = [
         "models": [settings.openai_model],
         "note": "Primary",
     },
-    {
-        "id": "zhipu",
-        "name": "Zhipu AI (optional)",
-        "base_url": settings.zhipu_base_url,
-        "api_key": settings.zhipu_api_key,
-        "prefix": "glm",
-        "models": ["glm-4-flash", "glm-4.5-flash"],
-        "note": "Optional international provider",
-    },
 ]
 
 
@@ -108,10 +99,6 @@ async def embed_texts(texts: list[str], batch_size: int = 32) -> list[list[float
         api_key = settings.embedding_api_key or settings.openai_api_key
         base_url = settings.embedding_base_url or settings.openai_base_url
         model = settings.embedding_model or "text-embedding-3-small"
-    elif settings.siliconflow_api_key:
-        api_key = settings.siliconflow_api_key
-        base_url = settings.siliconflow_base_url
-        model = settings.embedding_model or settings.siliconflow_embedding_model
     elif settings.openai_api_key:
         api_key = settings.openai_api_key
         base_url = settings.openai_base_url

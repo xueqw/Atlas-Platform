@@ -585,7 +585,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
           <p>Declare external systems used by the agent. Write actions require approval and audit controls.</p>
         </div>
         <div className="connector-grid">
-          {['feishu', 'github', 'bing', 'gaode'].map(item => {
+          {['github', 'slack', 'google-drive', 'jira'].map(item => {
             const active = manifest.connectors.includes(item)
             return (
               <button key={item} className={active ? 'active' : ''} onClick={() => updateManifest('connectors', active ? manifest.connectors.filter(v => v !== item) : [...manifest.connectors, item])}>
@@ -657,7 +657,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         </label>
         <label className="full-field">
           Declared secrets
-          <textarea value={stringifyList(manifest.permissions.secrets)} onChange={e => updatePermission('secrets', parseList(e.target.value))} placeholder="OPENAI_API_KEY&#10;FEISHU_APP_SECRET" />
+          <textarea value={stringifyList(manifest.permissions.secrets)} onChange={e => updatePermission('secrets', parseList(e.target.value))} placeholder="OPENAI_API_KEY&#10;GITHUB_TOKEN" />
         </label>
         <div className="check-list">
           {(validation?.errors || []).map(item => <p className="fail" key={item}>Blocking: {item}</p>)}

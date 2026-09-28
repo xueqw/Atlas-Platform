@@ -1,8 +1,9 @@
 {
-  "name": "atlas-agent-console-demo",
+  "name": "atlas-agent-platform",
   "version": "1.2.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "dev": "./start-dev.sh",
+    "check:version": "python3 scripts/check_version.py"
   }
 }

@@ -32,7 +32,7 @@ class ChatRequest(BaseModel):
     knowledge_base_id: str | None = None
     agent_id: str | None = None
     model: str | None = None
-    connectors: list[str] = []  # 本次对话启用的连接器（其工具才提供给模型）
+    connectors: list[str] = []
     attachment_name: str | None = None
     attachment_text: str | None = Field(default=None, max_length=40000)
 
@@ -43,11 +43,6 @@ class ModelTestRequest(BaseModel):
 
 class GithubConfigRequest(BaseModel):
     pat: str = Field(min_length=1, max_length=255)
-
-
-class FeishuConfigRequest(BaseModel):
-    app_id: str = Field(min_length=1, max_length=120)
-    app_secret: str = Field(min_length=1, max_length=255)
 
 
 class AgentCreate(BaseModel):

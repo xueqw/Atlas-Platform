@@ -21,12 +21,10 @@ def extract_pages(filename: str, raw: bytes) -> list[tuple[int, str]]:
         return [(1, text)]
     if suffix not in {".txt", ".md", ".csv", ".json"}:
         raise ValueError("Unsupported file type. Upload a PDF, DOCX, TXT, Markdown, CSV, or JSON file.")
-    for encoding in ("utf-8-sig", "gb18030"):
-        try:
-            return [(1, raw.decode(encoding))]
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("The file encoding could not be detected")
+    try:
+        return [(1, raw.decode("utf-8-sig"))]
+    except UnicodeDecodeError as exc:
+        raise ValueError("The file must use UTF-8 encoding") from exc
 
 
 def split_pages(pages: list[tuple[int, str]], size: int = 700, overlap: int = 100) -> list[tuple[int, str]]:
@@ -46,21 +44,8 @@ def split_pages(pages: list[tuple[int, str]], size: int = 700, overlap: int = 10
 
 
 def _tokens(text: str) -> list[str]:
-    """Tokenize mixed Chinese/Latin text without an external segmenter.
-
-    Latin words are kept intact. Chinese runs are represented by bigrams so a
-    shared, unrelated character does not create the false positives produced by
-    the previous single-character overlap score. A single-character run is
-    retained so short names can still be found.
-    """
-    lowered = text.lower()
-    tokens = re.findall(r"[a-z0-9_]+", lowered)
-    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
-        if len(run) == 1:
-            tokens.append(run)
-        else:
-            tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
-    return tokens
+    """Tokenize English text without an external dependency."""
+    return re.findall(r"[a-z0-9_]+", text.lower())
 
 
 def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
@@ -135,7 +120,7 @@ def _format(rows: list[tuple[float, "DocumentChunk", "Document"]], limit: int) -
 
 
 def search_chunks(db: Session, knowledge_base_id: str, query: str, query_vector: list[float] | None = None, limit: int = 4) -> list[dict]:
-    """优先向量语义检索；embedding 不可用时回退 BM25 关键词排序。"""
+    """Prefer semantic vectors and fall back to BM25 when they are unavailable."""
     rows = db.execute(
         select(DocumentChunk, Document)
         .join(Document, Document.id == DocumentChunk.document_id)
@@ -153,13 +138,11 @@ def search_chunks(db: Session, knowledge_base_id: str, query: str, query_vector:
             score = _cosine(query_vector, embedding)
             if score >= settings.retrieval_min_score:
                 ranked.append((score, chunk, document))
-        # embedding 正常工作时信任它：没有过阈值的就是真的没相关资料，直接返回（空也返回），
-        # 不再退关键词——否则会捞出一堆字面噪声（如"区块链"误匹配到"block"）。
-        # 关键词只兜底 embedding 不可用或索引不兼容的情况。
+        # Trust a compatible semantic index, including an empty result below
+        # the relevance threshold. BM25 is only a resilience fallback.
         if compatible_embeddings:
             return _format(ranked, limit)
-        # 查询向量与存量索引维度不一致（例如更换 embedding 模型）时，索引实际上不可用。
-        # 此时回退 BM25，避免知识库在重新索引完成前完全失效。
+        # An incompatible stored index falls back to BM25 until reindexing.
 
     raw_scores = _bm25_scores(query, [chunk.content for chunk, _ in rows])
     ranked = [

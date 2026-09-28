@@ -12,8 +12,6 @@ Current version: **v1.2.0** · [Changelog](CHANGELOG.md) · [Release process](do
 - **Human approval for write actions:** agents can research freely while actions such as sending a message or changing GitHub state require confirmation.
 - **Resilient retrieval:** semantic search automatically falls back to dependency-free BM25 when an embedding service is unavailable or an index is incompatible.
 
-Atlas remains multilingual. Existing Chinese retrieval tests and the optional Feishu connector are preserved, while the default product experience is designed for English-speaking users.
-
 ## Features
 
 ### Agent Workspace
@@ -27,18 +25,16 @@ Atlas remains multilingual. Existing Chinese retrieval tests and the optional Fe
 
 - Parse and chunk PDF, DOCX, TXT, Markdown, CSV, and JSON files.
 - Generate embeddings with OpenAI or another OpenAI-compatible provider.
-- Use BM25 ranking for reliable English and Chinese keyword retrieval when embeddings are unavailable or incompatible.
-- Support multilingual retrieval, including Chinese queries against English documents.
+- Use BM25 ranking for reliable English keyword retrieval when embeddings are unavailable or incompatible.
 - Show source cards with the document name, page number, excerpt, and relevance score.
 
-![Retrieval quality improvements introduced in version 1.1.0](docs/retrieval-improvement.svg)
+![Retrieval quality safeguards](docs/retrieval-improvement.svg)
 
 ### Models, Connectors, and Tools
 
 - Use OpenAI as the primary provider and add compatible endpoints through environment settings.
 - Connect to GitHub through its official remote MCP server for repository search, files, issues, and pull requests.
 - Require explicit confirmation before connector tools perform write actions.
-- Keep Feishu available as an optional connector for teams that need it.
 
 ## Quick Start
 
@@ -93,7 +89,7 @@ The most common settings in `api/.env` are:
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Optional explicit embedding model |
 | `GITHUB_PAT` | empty | Enables the GitHub MCP connector |
 
-`EMBEDDING_API_KEY` and `EMBEDDING_BASE_URL` can target a separate OpenAI-compatible embedding service. Legacy SiliconFlow settings remain supported for existing deployments.
+`EMBEDDING_API_KEY` and `EMBEDDING_BASE_URL` can target a separate OpenAI-compatible embedding service.
 
 ## Verification
 

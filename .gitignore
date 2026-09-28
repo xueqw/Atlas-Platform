@@ -2,7 +2,8 @@ api/.venv/
 api/data/
 **/__pycache__/
 *.py[cod]
-api/.env
+**/.env
+!**/.env.example
 data/
 web/node_modules/
 web/dist/

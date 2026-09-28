@@ -352,33 +352,14 @@ def run_python_entry(draft_dir: Path, input_text: str, timeout: int = 10) -> dic
         "elapsed_ms": elapsed_ms,
     }
 
-
-
-
-
-
-def zh(value: str) -> str:
-    try:
-        return value.encode("ascii").decode("unicode_escape")
-    except UnicodeEncodeError:
-        return value
-
-
 def clean_agent_name(value: str) -> str:
-    value = value.strip()
-    for mark in [" ", "\t", "\n", ",", ".", "!", "?", ";", ":", zh("\uff0c"), zh("\u3002"), zh("\uff01"), zh("\uff1f"), zh("\uff1b"), zh("\uff1a"), zh("\u3001")]:
-        value = value.strip(mark)
-    for prefix in [zh("\u4e00\u4e2a"), zh("\u4e00\u6b3e"), zh("\u53ef\u4ee5"), zh("\u80fd\u591f"), zh("\u80fd")]:
-        if value.startswith(prefix):
-            value = value[len(prefix):].strip()
+    value = value.strip(" \t\n,.!?;:")
     value = value.replace("agent", "Agent").replace("AGENT", "Agent")
     if not value:
         return "Custom Agent"
-    if value.isascii():
-        value = value[:1].upper() + value[1:]
-    suffixes = ["Agent", zh("\u52a9\u624b"), zh("\u5de5\u5177"), zh("\u673a\u5668\u4eba"), zh("\u5e94\u7528"), zh("\u4e13\u5bb6"), zh("\u5206\u6790\u5e08"), zh("\u751f\u6210\u5668")]
-    if not any(value.endswith(suffix) for suffix in suffixes):
-        value += " Agent" if value.isascii() else zh("\u52a9\u624b")
+    value = value[:1].upper() + value[1:]
+    if not value.endswith("Agent"):
+        value += " Agent"
     return value[:28]
 
 
@@ -390,39 +371,9 @@ def extract_agent_name(message: str) -> str:
     )
     if english:
         return clean_agent_name(english.group(1))
-    starters = [
-        zh("\u5e2e\u6211\u5236\u4f5c\u4e00\u4e2a"),
-        zh("\u5e2e\u6211\u521b\u5efa\u4e00\u4e2a"),
-        zh("\u5e2e\u6211\u505a\u4e00\u4e2a"),
-        zh("\u5236\u4f5c\u4e00\u4e2a"),
-        zh("\u521b\u5efa\u4e00\u4e2a"),
-        zh("\u751f\u6210\u4e00\u4e2a"),
-        zh("\u642d\u5efa\u4e00\u4e2a"),
-        zh("\u505a\u4e00\u4e2a"),
-        zh("\u5236\u4f5c"),
-        zh("\u521b\u5efa"),
-        zh("\u751f\u6210"),
-        zh("\u642d\u5efa"),
-        zh("\u505a"),
-    ]
-    stops = [zh("\u80fd"), zh("\u53ef\u4ee5"), zh("\u7528\u4e8e"), zh("\u5e2e"), zh("\u4e13\u95e8"), zh("\u4e3b\u8981"), zh("\u652f\u6301"), zh("\uff0c"), zh("\u3002"), ",", ".", ";"]
-    lowered = message.lower()
-    for starter in starters:
-        index = lowered.find(starter.lower())
-        if index < 0:
-            continue
-        candidate = message[index + len(starter):]
-        stop_positions = [candidate.find(stop) for stop in stops if candidate.find(stop) > 0]
-        if stop_positions:
-            candidate = candidate[:min(stop_positions)]
-        return clean_agent_name(candidate)
-    suffixes = ["Agent", "agent", zh("\u52a9\u624b"), zh("\u5de5\u5177"), zh("\u673a\u5668\u4eba"), zh("\u5e94\u7528"), zh("\u4e13\u5bb6"), zh("\u5206\u6790\u5e08"), zh("\u751f\u6210\u5668")]
-    for suffix in suffixes:
-        pos = message.find(suffix)
-        if pos > 0:
-            start_pos = max(0, pos - 12)
-            candidate = message[start_pos:pos + len(suffix)]
-            return clean_agent_name(candidate)
+    generic = re.search(r"([A-Za-z][A-Za-z0-9 -]{1,24}\s+[Aa]gent)\b", message)
+    if generic:
+        return clean_agent_name(generic.group(1))
     return "Custom Agent"
 
 def slug_skill(value: str) -> str:
@@ -458,40 +409,6 @@ def slug_skill(value: str) -> str:
         "repository": "repository-analysis",
         "pull request": "pull-request-review",
         "issue": "issue-triage",
-        zh("\u77e5\u8bc6\u5e93"): "knowledge-base-qa",
-        zh("\u95ee\u7b54"): "question-answering",
-        zh("\u6587\u6863"): "document-search",
-        zh("\u5ba2\u670d"): "customer-service",
-        zh("\u552e\u540e"): "after-sales-support",
-        zh("\u5de5\u5355"): "ticket-summary",
-        zh("\u9500\u552e"): "sales-assistant",
-        zh("\u7ebf\u7d22"): "lead-qualification",
-        zh("\u5ba2\u6237"): "customer-summary",
-        zh("\u6d41\u7a0b"): "workflow-guidance",
-        zh("\u5ba1\u6279"): "approval-checklist",
-        zh("\u5236\u5ea6"): "policy-search",
-        zh("\u62a5\u9500"): "reimbursement-guidance",
-        zh("\u5165\u804c"): "onboarding-guidance",
-        zh("\u7b80\u5386"): "resume-screening",
-        zh("\u62db\u8058"): "recruiting-assistant",
-        zh("\u9762\u8bd5"): "interview-questioning",
-        zh("PPT"): "ppt-generation",
-        zh("\u6f14\u793a"): "presentation-outline",
-        zh("\u5199\u4f5c"): "copywriting",
-        zh("\u6587\u6848"): "content-writing",
-        zh("Excel"): "spreadsheet-analysis",
-        zh("\u8868\u683c"): "spreadsheet-processing",
-        zh("\u7f51\u9875"): "web-page-generation",
-        zh("\u56fe\u8868"): "chart-generation",
-        zh("\u6570\u636e"): "data-analysis",
-        zh("\u8bdd\u9898"): "topic-tracking",
-        zh("\u64ad\u5ba2"): "podcast-script",
-        zh("\u8bbe\u8ba1"): "design-generation",
-        zh("\u80a1"): "stock-analysis",
-        zh("\u884c\u60c5"): "market-monitoring",
-        zh("\u8d22\u62a5"): "financial-report-analysis",
-        zh("\u516c\u544a"): "announcement-tracking",
-        zh("\u98ce\u9669"): "risk-check",
     }
     return mapping.get(value, "task-planning")
 
@@ -499,7 +416,7 @@ def slug_skill(value: str) -> str:
 def infer_agent_blueprint(message: str, project_name: str = "") -> dict:
     text = message.strip() or "Build a business task agent"
     lowered = text.lower()
-    old_default = {"Atlas Business Agent Project", zh("Atlas \u4f01\u4e1a\u52a9\u624b\u9879\u76ee"), zh("\u6263\u5b50\u7684\u65b0\u9879\u76ee"), "demo-agent-app"}
+    old_default = {"Atlas Business Agent Project", "demo-agent-app"}
     name = project_name.strip() if project_name.strip() and project_name.strip() not in old_default else extract_agent_name(text)
 
     keyword_groups = [
@@ -511,22 +428,12 @@ def infer_agent_blueprint(message: str, project_name: str = "") -> dict:
         ("presentation", "Presentation outlines and slide content", ["presentation", "slides", "pitch deck", "powerpoint"], []),
         ("spreadsheet", "Spreadsheet processing and data analysis", ["spreadsheet", "excel", "data analysis", "chart"], []),
         ("software", "GitHub repository and engineering workflow support", ["github", "repository", "pull request", "issue"], ["github"]),
-        (zh("\u5ba2\u670d"), zh("\u5ba2\u6237\u670d\u52a1\u4e0e\u552e\u540e\u5de5\u5355"), [zh("\u5ba2\u670d"), zh("\u552e\u540e"), zh("\u5de5\u5355"), zh("\u77e5\u8bc6\u5e93")], ["feishu"]),
-        (zh("\u6d41\u7a0b"), zh("\u5185\u90e8\u6d41\u7a0b\u4e0e\u5236\u5ea6\u529e\u7406"), [zh("\u6d41\u7a0b"), zh("\u5236\u5ea6"), zh("\u5ba1\u6279"), zh("\u62a5\u9500"), zh("\u5165\u804c")], ["feishu"]),
-        (zh("\u9500\u552e"), zh("\u9500\u552e\u7ebf\u7d22\u8ddf\u8fdb\u4e0e\u5ba2\u6237\u6458\u8981"), [zh("\u9500\u552e"), zh("\u7ebf\u7d22"), zh("\u5ba2\u6237")], ["feishu"]),
-        (zh("\u77e5\u8bc6\u5e93"), zh("\u4f01\u4e1a\u77e5\u8bc6\u5e93\u95ee\u7b54"), [zh("\u77e5\u8bc6\u5e93"), zh("\u95ee\u7b54"), zh("\u6587\u6863")], []),
-        (zh("\u62db\u8058"), zh("\u62db\u8058\u7b5b\u9009\u4e0e\u9762\u8bd5\u8f85\u52a9"), [zh("\u62db\u8058"), zh("\u7b80\u5386"), zh("\u9762\u8bd5")], []),
-        (zh("PPT"), zh("\u6f14\u793a\u6587\u7a3f\u4e0e PPT \u751f\u6210"), [zh("PPT"), zh("\u6f14\u793a"), zh("\u5199\u4f5c")], []),
-        (zh("\u5199\u4f5c"), zh("\u6587\u7ae0\u4e0e\u8425\u9500\u6587\u6848\u751f\u6210"), [zh("\u5199\u4f5c"), zh("\u6587\u6848"), zh("\u8bdd\u9898")], []),
-        (zh("Excel"), zh("\u8868\u683c\u5904\u7406\u4e0e\u6570\u636e\u5206\u6790"), [zh("Excel"), zh("\u8868\u683c"), zh("\u6570\u636e"), zh("\u56fe\u8868")], []),
-        (zh("\u7f51\u9875"), zh("\u7f51\u9875\u751f\u6210\u4e0e\u5185\u5bb9\u7f16\u6392"), [zh("\u7f51\u9875"), zh("\u8bbe\u8ba1"), zh("\u6587\u6848")], []),
-        (zh("\u80a1\u7968"), zh("\u80a1\u7968\u5206\u6790\u4e0e\u98ce\u9669\u63d0\u9192"), [zh("\u80a1"), zh("\u884c\u60c5"), zh("\u8d22\u62a5"), zh("\u516c\u544a"), zh("\u98ce\u9669")], []),
     ]
 
     matched = None
     best_score = 0
     for _, domain_value, words, connector_list in keyword_groups:
-        score = sum(1 for word in words if word.lower() in lowered or word in text)
+        score = sum(1 for word in words if word.lower() in lowered)
         if score > best_score:
             best_score = score
             matched = (domain_value, words, connector_list)
@@ -535,7 +442,7 @@ def infer_agent_blueprint(message: str, project_name: str = "") -> dict:
         domain, words, connectors = matched
     else:
         domain = text[:40] if len(text) <= 40 else text[:40] + "..."
-        words = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9][\u4e00-\u9fa5A-Za-z0-9 -]{1,18}", text)[:4] or ["task", "planning"]
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9 -]{1,18}", text)[:4] or ["task", "planning"]
         connectors = []
 
     skills = []

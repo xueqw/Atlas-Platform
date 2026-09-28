@@ -39,16 +39,8 @@ def row(name: str, content: str, embedding=None, page: int = 1):
 
 
 class TokenizationTests(unittest.TestCase):
-    def test_mixed_language_tokens_keep_words_and_chinese_bigrams(self):
-        self.assertEqual(
-            _tokens("HEFT 用于异构调度"),
-            ["heft", "用于", "于异", "异构", "构调", "调度"],
-        )
-
-    def test_unrelated_shared_chinese_character_does_not_match(self):
-        query = set(_tokens("区块链"))
-        unrelated = set(_tokens("区域块状链条"))
-        self.assertTrue(query.isdisjoint(unrelated))
+    def test_english_words_and_identifiers_are_preserved(self):
+        self.assertEqual(_tokens("HEFT schedules job_42"), ["heft", "schedules", "job_42"])
 
 
 class BM25Tests(unittest.TestCase):
@@ -67,17 +59,8 @@ class BM25Tests(unittest.TestCase):
         scores = _bm25_scores("HEFT workflow scheduling", documents)
         self.assertEqual(scores.index(max(scores)), 8)
 
-    def test_chinese_query_ranks_exact_topic_over_partial_noise(self):
-        documents = [
-            "无人机辅助边缘计算中的任务调度方法",
-            "无人机飞行控制与航线规划",
-            "边缘设备资源管理",
-        ]
-        scores = _bm25_scores("无人机边缘计算任务调度", documents)
-        self.assertEqual(scores.index(max(scores)), 0)
-
     def test_empty_query_has_zero_scores(self):
-        self.assertEqual(_bm25_scores("--", ["some text", "其他内容"]), [0.0, 0.0])
+        self.assertEqual(_bm25_scores("--", ["some text", "other content"]), [0.0, 0.0])
 
 
 class VectorSafetyTests(unittest.TestCase):

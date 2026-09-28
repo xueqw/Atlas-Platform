@@ -1,8 +1,7 @@
-"""给已入库但没有向量的 chunk 补算 embedding。
+"""Backfill embeddings for stored chunks that do not have a vector.
 
-用法（在 api/ 目录下）：
+Run from the api directory:
     python -m scripts.reindex
-新加向量检索后，跑一次把历史文档补上索引；之后上传的文档会自动带向量。
 """
 import asyncio
 import json
@@ -24,17 +23,17 @@ async def main() -> None:
             select(DocumentChunk).where(DocumentChunk.embedding.is_(None))
         ).all()
         if not pending:
-            print("没有待补向量的 chunk，全部已建索引。")
+            print("All document chunks already have embeddings.")
             return
-        print(f"待补 {len(pending)} 个 chunk，调用 embedding 中……")
+        print(f"Generating embeddings for {len(pending)} chunks...")
         vectors = await embed_texts([chunk.content for chunk in pending])
         if not vectors:
-            print("embedding 未返回结果（检查 SILICONFLOW_API_KEY 是否配置）。")
+            print("No embeddings were returned. Check the OpenAI embedding configuration.")
             return
         for chunk, vector in zip(pending, vectors):
             chunk.embedding = json.dumps(vector)
         db.commit()
-        print(f"完成：{len(vectors)} 个 chunk 已写入向量。")
+        print(f"Completed: stored {len(vectors)} embedding vectors.")
 
 
 if __name__ == "__main__":

@@ -4,13 +4,13 @@ import httpx
 BASE = "http://localhost:8000/api"
 
 with httpx.Client(base_url=BASE, timeout=30, trust_env=False) as client:
-    knowledge = client.post("/knowledge-bases", json={"name": "验收知识库", "description": "自动化测试"})
+    knowledge = client.post("/knowledge-bases", json={"name": "Acceptance knowledge base", "description": "Automated smoke test"})
     knowledge.raise_for_status()
     knowledge_id = knowledge.json()["id"]
 
     upload = client.post(
         f"/knowledge-bases/{knowledge_id}/documents",
-        files={"file": ("service.txt", "星河企业版支持私有知识库和运行审计，服务时间是工作日九点到十八点。", "text/plain")},
+        files={"file": ("service.txt", "The enterprise plan supports private knowledge bases and audit logs. Support hours are 9:00 AM to 6:00 PM ET on business days.", "text/plain")},
     )
     upload.raise_for_status()
     assert upload.json()["chunk_count"] == 1
@@ -18,9 +18,9 @@ with httpx.Client(base_url=BASE, timeout=30, trust_env=False) as client:
     agent = client.post(
         "/agents",
         json={
-            "name": "验收客服",
-            "description": "回答产品问题",
-            "system_prompt": "你是产品客服，只根据知识库回答。",
+            "name": "Support acceptance agent",
+            "description": "Answers product questions",
+            "system_prompt": "You are a product support agent. Answer only from the connected knowledge base.",
             "model": "gpt-4.1-mini",
             "knowledge_base_id": knowledge_id,
         },
@@ -28,13 +28,13 @@ with httpx.Client(base_url=BASE, timeout=30, trust_env=False) as client:
     agent.raise_for_status()
     agent_id = agent.json()["id"]
 
-    conversation = client.post("/conversations", json={"title": "RAG 迁移验收"})
+    conversation = client.post("/conversations", json={"title": "RAG acceptance test"})
     conversation.raise_for_status()
     conversation_id = conversation.json()["id"]
 
     stream = client.post(
         f"/conversations/{conversation_id}/messages/stream",
-        json={"content": "企业版支持什么？", "agent_id": agent_id},
+        json={"content": "What does the enterprise plan support?", "agent_id": agent_id},
     )
     stream.raise_for_status()
     events = stream.text
