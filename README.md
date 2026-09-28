@@ -2,6 +2,8 @@
 
 Atlas is an enterprise agent platform built with React, TypeScript, FastAPI, and SQLAlchemy. It provides a unified workspace for multi-turn task sessions, server-sent event (SSE) streaming, semantic knowledge-base retrieval, multi-model routing, and an extensible connector and tool system.
 
+Current version: **v1.1.0** · [Changelog](CHANGELOG.md) · [Release process](docs/RELEASING.md)
+
 ## Features
 
 ### Agent Workspace
@@ -14,8 +16,11 @@ Atlas is an enterprise agent platform built with React, TypeScript, FastAPI, and
 
 - Upload and automatically parse and chunk PDF, DOCX, TXT, Markdown, CSV, and JSON files.
 - Generate `bge-m3` embeddings through SiliconFlow and perform cosine-similarity search with keyword fallback.
+- Use dependency-free BM25 ranking for resilient Chinese and English keyword retrieval when embeddings are unavailable or incompatible.
 - Support cross-lingual retrieval, including Chinese queries against English-language documents.
 - Display citation cards containing the document name, page number, and relevant source excerpt.
+
+![Retrieval quality improvements in version 1.1.0](docs/retrieval-improvement.svg)
 
 ### Model Gateway
 
@@ -60,6 +65,25 @@ Once the services are running, the main interfaces are available at:
 - FastAPI documentation: <http://localhost:8000/docs>
 
 By default, the application uses `api/data/atlas.db` and does not require a separate database installation for local development.
+
+## Verification
+
+Run the API regression suite from the project root:
+
+```bash
+cd api
+python -m unittest discover -s tests -v
+```
+
+Build the web application with the locked dependency versions:
+
+```bash
+cd web
+npm ci
+npm run build
+```
+
+The same checks run automatically for every pull request and every push to `main`.
 
 ## Technology Stack
 

@@ -1,4 +1,4 @@
-"""对指定知识库批量跑测试问题,打印每题命中的文档/页码/cos分数。用来检验语义检索质量和阈值。"""
+"""对指定知识库批量跑测试问题，打印命中文档、页码和检索分数。"""
 import asyncio
 import sys
 
@@ -34,7 +34,7 @@ async def main() -> None:
             hits = search_chunks(db, kb.id, q, qv, limit=3)
             print(f"\n【{tag}】问：{q}")
             if not hits:
-                print("   → 0 命中(被阈值挡住,正确拒答)")
+                print("   → 0 命中（没有达到检索条件）")
                 continue
             for h in hits:
                 doc = h["document"][:46]
