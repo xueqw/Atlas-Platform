@@ -1,44 +1,71 @@
-# Atlas 智能体平台
+# Atlas Agent Platform
 
-基于 React + TypeScript + FastAPI + SQLAlchemy 的企业智能体平台。
-打通任务会话、SSE 流式回答、知识库语义检索、多模型网关，以及可扩展的连接器 / 工具体系。
+Atlas is an enterprise agent platform built with React, TypeScript, FastAPI, and SQLAlchemy. It provides a unified workspace for multi-turn task sessions, server-sent event (SSE) streaming, semantic knowledge-base retrieval, multi-model routing, and an extensible connector and tool system.
 
-## 功能
+## Features
 
-### 智能工作台
-- 多轮任务会话，自动保存与恢复
-- SSE 流式回答，带知识库引用来源
-- 可选择智能体、知识库、模型、连接器
+### Agent Workspace
 
-### 知识库（RAG 语义检索）
-- 上传 PDF / DOCX / TXT / Markdown / CSV / JSON，自动解析与切块
-- bge-m3 向量化（硅基流动）+ 余弦相似度语义检索，关键词兜底
-- 跨语言检索（中文提问也能命中英文文献）
-- 带文档名 + 页码 + 原文的引用卡片
+- Persistent multi-turn task sessions with automatic saving and recovery.
+- SSE streaming responses with references to relevant knowledge-base sources.
+- Configurable selection of agents, knowledge bases, models, and connectors for each session.
 
-### 模型网关
-- 多供应商按模型名自动路由：智谱 GLM、阿里通义千问
-- 连通性测试，密钥配置在 `api/.env`
+### Knowledge Base and RAG Retrieval
 
-### 连接器与工具
-- 工具调用循环：智能体自主决定调用工具 -> 执行 -> 回填 -> 续答
-- 写操作确认闸门：发消息 / 建 issue 等执行前需用户回「确认」
-- **飞书**（OAuth 2.0）：代发飞书消息（发给自己 / 邮箱 / 手机号）
-- **GitHub**（官方远程 MCP Server）：动态接入 40+ 工具，平台即 MCP 客户端
-- 对话框底部可勾选启用哪些连接器
+- Upload and automatically parse and chunk PDF, DOCX, TXT, Markdown, CSV, and JSON files.
+- Generate `bge-m3` embeddings through SiliconFlow and perform cosine-similarity search with keyword fallback.
+- Support cross-lingual retrieval, including Chinese queries against English-language documents.
+- Display citation cards containing the document name, page number, and relevant source excerpt.
 
-## 一键启动
+### Model Gateway
+
+- Route requests automatically to multiple providers based on the selected model name, including Zhipu GLM and Alibaba Qwen.
+- Test provider connectivity and manage credentials through `api/.env`.
+
+### Connectors and Tools
+
+- Support an agent-driven tool execution loop: the agent selects a tool, executes it, receives the result, and continues the response.
+- Require explicit user confirmation before write operations such as sending messages or creating issues.
+- Integrate with Feishu through OAuth 2.0 for sending messages to the current user, an email address, or a mobile number.
+- Connect to GitHub through its official remote MCP server and dynamically expose more than 40 tools.
+- Allow users to enable or disable individual connectors from the conversation composer.
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js and npm
+- Python 3.10 or later
+- Docker and Docker Compose
+
+### Start Supporting Services
+
+Start PostgreSQL with the `pgvector` extension and Redis from the project root:
+
+```bash
+docker compose up -d postgres redis
+```
+
+### Start the Development Environment
+
+Run the project development script from the project root:
 
 ```powershell
-cd E:/codex/ai-agent-platform-demo
 ./start-dev.ps1
 ```
 
-- React 工作台：<http://localhost:5173>
-- FastAPI 文档：<http://localhost:8000/docs>
+Once the services are running, the main interfaces are available at:
 
-默认使用 `api/data/atlas.db`，无需安装数据库。
+- React workspace: <http://localhost:5173>
+- FastAPI documentation: <http://localhost:8000/docs>
 
-## 技术栈
+By default, the application uses `api/data/atlas.db` and does not require a separate database installation for local development.
 
-React - TypeScript - FastAPI - SQLAlchemy - MCP - bge-m3
+## Technology Stack
+
+- React
+- TypeScript
+- FastAPI
+- SQLAlchemy
+- Model Context Protocol (MCP)
+- `bge-m3`
