@@ -8,6 +8,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 <!-- Add future changes here under Added, Changed, Deprecated, Removed, Fixed, or Security. -->
 
+## 1.2.0 - 2026-09-28
+
+### Added
+
+- Added a macOS and Linux development launcher alongside the existing Windows PowerShell launcher.
+- Added generic OpenAI-compatible embedding settings with an OpenAI default and legacy SiliconFlow compatibility.
+- Added English intent recognition and U.S.-oriented starter scenarios to the conversational Agent Builder.
+
+### Changed
+
+- Made the primary workspace, Agent Builder, Web IDE, API messages, examples, and generated agent files English-first.
+- Repositioned Atlas as a self-hosted, OpenAI-ready agent workspace for U.S. teams and developers.
+- Made OpenAI and GitHub the primary model and connector experience; Feishu and Zhipu remain optional integrations.
+- Updated the README with cross-platform setup, environment configuration, and the project's security model.
+
+### Fixed
+
+- Removed a stale generated-app fallback expression that could raise an error after a failed model request.
+- Generated English agent requests now receive useful names and capability mappings instead of Chinese defaults.
+
 ## 1.1.0 - 2026-09-28
 
 ### Added

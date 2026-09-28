@@ -12,7 +12,7 @@ class MessageOut(BaseModel):
 
 
 class ConversationCreate(BaseModel):
-    title: str = Field(default="新任务", max_length=160)
+    title: str = Field(default="New task", max_length=160)
 
 
 class ConversationOut(BaseModel):
@@ -53,7 +53,7 @@ class FeishuConfigRequest(BaseModel):
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
-    system_prompt: str = Field(default="你是一名可靠、严谨的企业智能助手。", max_length=12000)
+    system_prompt: str = Field(default="You are a reliable, precise AI assistant for business teams.", max_length=12000)
     model: str = Field(default="gpt-4.1-mini", max_length=120)
     knowledge_base_id: str | None = None
 

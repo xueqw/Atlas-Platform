@@ -16,7 +16,7 @@ def now() -> datetime:
 class Conversation(Base):
     __tablename__ = "conversations"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    title: Mapped[str] = mapped_column(String(160), default="新任务")
+    title: Mapped[str] = mapped_column(String(160), default="New task")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan", order_by="Message.created_at")
@@ -38,7 +38,7 @@ class Agent(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(String(500), default="")
-    system_prompt: Mapped[str] = mapped_column(Text, default="你是一名可靠、严谨的企业智能助手。")
+    system_prompt: Mapped[str] = mapped_column(Text, default="You are a reliable, precise AI assistant for business teams.")
     model: Mapped[str] = mapped_column(String(120), default="gpt-4.1-mini")
     knowledge_base_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="SET NULL"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="draft")

@@ -1,9 +1,4 @@
-"""GitHub 连接器：通过官方远程 MCP Server 动态接入 GitHub 工具。
-
-平台在这里扮演 MCP 客户端：连上 https://api.githubcopilot.com/mcp/（PAT 认证），
-tools/list 拿到 GitHub 的全部工具，转成 OpenAI 兼容声明给模型；模型调用时 tools/call 转发。
-不需要为每个 GitHub 操作手写代码——这就是"路线 B"（MCP 当统一协议）。
-"""
+"""GitHub connector backed by GitHub's remote MCP server."""
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -18,11 +13,11 @@ from ..database import SessionLocal
 from ..models import ConnectorToken
 
 PROVIDER = "github"
-_cache: dict = {"specs": None, "writes": None}  # 工具清单缓存，避免每条消息都重新拉
+_cache: dict = {"specs": None, "writes": None}
 
 
 def resolve_pat() -> str:
-    """优先用界面里配置（存数据库）的 PAT，其次回退 .env。"""
+    """Prefer a PAT saved in the UI, then fall back to the environment."""
     with SessionLocal() as db:
         row = db.scalar(select(ConnectorToken).where(ConnectorToken.provider == PROVIDER))
         if row and row.access_token:
@@ -36,10 +31,10 @@ def save_pat(db: Session, pat: str) -> None:
         row = ConnectorToken(provider=PROVIDER)
         db.add(row)
     row.access_token = pat
-    row.expires_at = datetime.now(timezone.utc) + timedelta(days=36500)  # PAT 无固定过期，占位
+    row.expires_at = datetime.now(timezone.utc) + timedelta(days=36500)
     row.account_name = "PAT"
     db.commit()
-    _cache["specs"] = None  # PAT 变了，工具缓存作废，下次重新拉
+    _cache["specs"] = None
 
 
 def clear(db: Session) -> None:
@@ -73,7 +68,7 @@ async def _fetch_specs() -> tuple[list[dict], set[str]]:
             "parameters": t.inputSchema or {"type": "object", "properties": {}},
         }})
         ann = getattr(t, "annotations", None)
-        if not (ann and getattr(ann, "readOnlyHint", False)):  # 非只读 = 写操作，需确认
+        if not (ann and getattr(ann, "readOnlyHint", False)):
             writes.add(t.name)
     return specs, writes
 
@@ -89,7 +84,7 @@ async def call_tool(name: str, arguments: str) -> str:
     async with _session() as session:
         result = await session.call_tool(name, args)
     parts = [c.text for c in result.content if getattr(c, "type", None) == "text"]
-    text = "\n".join(parts).strip() or "（GitHub 工具已执行，无文本返回）"
+    text = "\n".join(parts).strip() or "GitHub completed the action without returning text."
     return text[:4000]
 
 
@@ -97,7 +92,7 @@ async def get_status() -> dict:
     status = {
         "provider": PROVIDER,
         "name": "GitHub",
-        "description": "通过官方 MCP Server 接入：搜索仓库、读文件、管理 issue / PR 等，工具由 MCP 动态提供。",
+        "description": "Search repositories, read files, and manage issues and pull requests through GitHub's remote MCP server.",
         "configured": is_configured(),
         "connected": False,
         "account_name": "",
@@ -108,8 +103,8 @@ async def get_status() -> dict:
     try:
         specs, _ = await tool_specs()
         status["connected"] = True
-        status["account_name"] = f"PAT 已配置 · {len(specs)} 个工具"
+        status["account_name"] = f"PAT configured · {len(specs)} tools"
         status["actions"] = [s["function"]["name"] for s in specs[:6]]
     except Exception as exc:
-        status["account_name"] = f"连接失败：{exc}"[:80]
+        status["account_name"] = f"Connection failed: {exc}"[:80]
     return status

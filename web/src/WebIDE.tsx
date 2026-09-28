@@ -40,11 +40,11 @@ type ManifestDraft = {
 
 const defaultManifest: ManifestDraft = {
   name: 'demo-agent-app',
-  description: '企业内部智能应用草稿',
+  description: 'AI agent app draft',
   entry: 'main.py',
   runtime: 'python',
-  model: 'qwen-turbo',
-  prompt: '你是一个可靠的企业智能体，请根据输入给出清晰、可执行的回答。',
+  model: 'gpt-4.1-mini',
+  prompt: 'You are a reliable business AI agent. Give clear, actionable answers grounded in the available context.',
   knowledge_bases: [],
   skills: [],
   connectors: [],
@@ -65,7 +65,7 @@ if __name__ == "__main__":
 `,
   'manifest.json': JSON.stringify(defaultManifest, null, 2),
   'tests.json': JSON.stringify([
-    { name: '基础问候', input: 'Atlas', expected: 'Hello Atlas: Atlas' }
+    { name: 'Basic greeting', input: 'Atlas', expected: 'Hello Atlas: Atlas' }
   ], null, 2)
 }
 
@@ -76,14 +76,14 @@ const fallbackFileTree: AppFile[] = [
 ]
 
 const panels: Array<{ key: Panel; label: string; desc: string }> = [
-  { key: 'overview', label: '应用概览', desc: '名称、描述、入口与运行时' },
-  { key: 'workflow', label: '工作流', desc: '输入、处理、输出链路' },
-  { key: 'code', label: '代码文件', desc: '文件树、编辑器、草稿保存' },
-  { key: 'prompt', label: 'Prompt', desc: '系统提示词与模型' },
-  { key: 'knowledge', label: '知识与 Skill', desc: '知识库、Skill 依赖声明' },
-  { key: 'tools', label: '连接器工具', desc: '外部工具与写操作策略' },
-  { key: 'tests', label: '效果评测', desc: '样例输入、期望结果、通过率' },
-  { key: 'security', label: '安全发布', desc: '权限、secrets、沙箱检查' }
+  { key: 'overview', label: 'App Overview', desc: 'Name, description, entry point, and runtime' },
+  { key: 'workflow', label: 'Workflow', desc: 'Input, processing, output, and evaluation' },
+  { key: 'code', label: 'Code', desc: 'File tree, editor, and draft saves' },
+  { key: 'prompt', label: 'Prompt', desc: 'System prompt and model' },
+  { key: 'knowledge', label: 'Knowledge & Skills', desc: 'Knowledge base and skill dependencies' },
+  { key: 'tools', label: 'Connector Tools', desc: 'External tools and write-action policies' },
+  { key: 'tests', label: 'Evaluation', desc: 'Test inputs, expected results, and pass rate' },
+  { key: 'security', label: 'Security & Release', desc: 'Permissions, secrets, and sandbox checks' }
 ]
 
 function parseList(value: string) {
@@ -124,9 +124,9 @@ function normalizeManifest(raw: unknown): ManifestDraft {
 }
 
 function statusText(validation: ManifestValidation | null, serverMode: boolean) {
-  if (!serverMode) return 'Mock 模式'
-  if (!validation) return '草稿已连接'
-  return validation.ok ? '校验通过' : '需要修复'
+  if (!serverMode) return 'Mock mode'
+  if (!validation) return 'Draft connected'
+  return validation.ok ? 'Validation passed' : 'Needs fixes'
 }
 
 export default function WebIDE({ notice, initialDraft }: { notice: (text: string) => void; initialDraft?: AppDraft | null }) {
@@ -150,9 +150,9 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
   const [manifest, setManifest] = useState<ManifestDraft>(defaultManifest)
   const [validation, setValidation] = useState<ManifestValidation | null>(null)
   const [inputText, setInputText] = useState('Atlas')
-  const [logs, setLogs] = useState('等待运行。保存草稿后点击“运行预览”，这里会显示沙箱日志。')
+  const [logs, setLogs] = useState('Ready. Save the draft and run a preview to see sandbox logs here.')
   const [testCases, setTestCases] = useState<EvaluationCase[]>([
-    { name: '基础问候', input: 'Atlas', expected: 'Hello Atlas: Atlas' }
+    { name: 'Basic greeting', input: 'Atlas', expected: 'Hello Atlas: Atlas' }
   ])
   const [evaluation, setEvaluation] = useState<EvaluationResult | null>(null)
 
@@ -184,9 +184,9 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       const firstPath = tree.find(item => item.path === 'manifest.json')?.path || tree[0]?.path || 'main.py'
       await openFile(draft.id, firstPath)
       await refreshValidation(draft.id)
-      notice(`已打开 ${draft.name} Agent`)
+      notice(`Opened ${draft.name}`)
     } catch (error) {
-      notice('打开草稿失败')
+      notice('Could not open the draft')
     } finally {
       setLoading(false)
     }
@@ -208,7 +208,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       const firstPath = tree.find(item => item.path === 'manifest.json')?.path || tree[0]?.path || 'main.py'
       await openFile(draft.id, firstPath)
       await refreshValidation(draft.id)
-      notice('Web IDE 草稿已连接')
+      notice('Web IDE draft connected')
     } catch (error) {
       setServerMode(false)
       setFileTree(fallbackFileTree)
@@ -217,7 +217,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       setCurrentContent(fallbackFiles['main.py'])
       setManifest(defaultManifest)
       setValidation(null)
-      notice('服务端接口不可用，当前使用 Mock 文件')
+      notice('API unavailable; using mock files')
     } finally {
       setLoading(false)
     }
@@ -236,7 +236,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       setValidation(result)
       setManifest(normalizeManifest(result.manifest))
     } catch (error) {
-      setValidation({ ok: false, manifest: {}, errors: ['manifest.json 无法解析'], warnings: [] })
+      setValidation({ ok: false, manifest: {}, errors: ['Could not parse manifest.json'], warnings: [] })
     }
   }
 
@@ -261,7 +261,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       }
     } catch (error) {
       setCurrentContent(files[path] || '')
-      notice('读取文件失败，已使用本地缓存')
+      notice('Could not read the file; using the local cache')
     }
   }
 
@@ -277,10 +277,10 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       if (serverMode && draftId) {
         await saveDraftFile(draftId, path, content)
         if (path === 'manifest.json') await refreshValidation()
-        notice(`已保存 ${path}`)
+        notice(`Saved ${path}`)
       } else {
         setFiles(old => ({ ...old, [path]: content }))
-        notice('已保存到前端 Mock 缓存')
+        notice('Saved to the browser mock cache')
       }
     } finally {
       setSaving(false)
@@ -305,7 +305,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
     }
 
     setNewFilePath('')
-    notice(`已创建 ${path}`)
+    notice(`Created ${path}`)
   }
 
   async function renameFile() {
@@ -313,7 +313,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
     if (!nextPath || nextPath === selectedFile) return
 
     if (selectedFile === 'main.py' || selectedFile === 'manifest.json') {
-      notice('核心文件不能重命名')
+      notice('Core files cannot be renamed')
       return
     }
 
@@ -331,16 +331,16 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       setSelectedFile(nextPath)
     }
 
-    notice(`已重命名为 ${nextPath}`)
+    notice(`Renamed to ${nextPath}`)
   }
 
   async function removeFile() {
     if (selectedFile === 'main.py' || selectedFile === 'manifest.json') {
-      notice('核心文件不能删除')
+      notice('Core files cannot be deleted')
       return
     }
 
-    if (!window.confirm(`确认删除 ${selectedFile}？`)) return
+    if (!window.confirm(`Delete ${selectedFile}?`)) return
 
     if (serverMode && draftId) {
       await deleteDraftFile(draftId, selectedFile)
@@ -353,7 +353,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       setCurrentContent(files['main.py'] || fallbackFiles['main.py'])
     }
 
-    notice('文件已删除')
+    notice('File deleted')
   }
 
   function updateManifest<K extends keyof ManifestDraft>(key: K, value: ManifestDraft[K]) {
@@ -385,7 +385,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
 
   async function runPreview() {
     setRunning(true)
-    setLogs('正在保存草稿并启动沙箱预览...')
+    setLogs('Saving the draft and starting the sandbox preview...')
 
     try {
       if (selectedFile) await saveFile(selectedFile, currentContent)
@@ -393,14 +393,14 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
 
       if (serverMode && draftId) {
         const result = await runDraftApp(draftId, inputText)
-        setLogs(result.logs || '运行结束，但没有返回日志。')
-        notice(result.ok ? '运行预览完成' : '运行失败，请查看日志')
+        setLogs(result.logs || 'The run completed without logs.')
+        notice(result.ok ? 'Preview completed' : 'Run failed. Check the logs.')
       } else {
         setLogs(`Mock run\n> input: ${inputText}\nHello Atlas: ${inputText}`)
       }
     } catch (error) {
-      setLogs(error instanceof Error ? error.message : '运行失败')
-      notice('运行失败')
+      setLogs(error instanceof Error ? error.message : 'Run failed')
+      notice('Run failed')
     } finally {
       setRunning(false)
     }
@@ -417,7 +417,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       if (serverMode && draftId) {
         const result = await evaluateDraftApp(draftId, testCases)
         setEvaluation(result)
-        notice(`评测完成：${result.passed}/${result.total}`)
+        notice(`Evaluation complete: ${result.passed}/${result.total}`)
       } else {
         setEvaluation({
           ok: true,
@@ -441,41 +441,41 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="webide-panel overview-panel">
         <div className="panel-title">
           <span>Overview</span>
-          <h2>应用概览</h2>
-          <p>这里决定应用在工作台和应用市场中的基本身份。</p>
+          <h2>App overview</h2>
+          <p>Define how this agent appears in the workspace and future app catalog.</p>
         </div>
 
         <div className="form-grid">
           <label>
-            应用名称
+            App name
             <input value={manifest.name} onChange={e => updateManifest('name', e.target.value)} />
           </label>
           <label>
-            入口文件
+            Entry file
             <input value={manifest.entry} onChange={e => updateManifest('entry', e.target.value)} />
           </label>
           <label>
-            运行时
+            Runtime
             <select value={manifest.runtime} onChange={e => updateManifest('runtime', e.target.value)}>
               <option value="python">Python Sandbox</option>
             </select>
           </label>
           <label>
-            推荐模型
+            Recommended model
             <input value={manifest.model} onChange={e => updateManifest('model', e.target.value)} />
           </label>
         </div>
 
         <label className="full-field">
-          应用描述
+          App description
           <textarea value={manifest.description} onChange={e => updateManifest('description', e.target.value)} />
         </label>
 
         <div className="metrics-row">
-          <div><strong>{fileTree.length}</strong><span>草稿文件</span></div>
-          <div><strong>{validation?.errors.length || 0}</strong><span>阻断问题</span></div>
-          <div><strong>{validation?.warnings.length || 0}</strong><span>发布提醒</span></div>
-          <div><strong>{serverMode ? '在线' : 'Mock'}</strong><span>后端状态</span></div>
+          <div><strong>{fileTree.length}</strong><span>Draft files</span></div>
+          <div><strong>{validation?.errors.length || 0}</strong><span>Blocking issues</span></div>
+          <div><strong>{validation?.warnings.length || 0}</strong><span>Release warnings</span></div>
+          <div><strong>{serverMode ? 'Online' : 'Mock'}</strong><span>API status</span></div>
         </div>
       </div>
     )
@@ -486,14 +486,14 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="webide-panel workflow-panel">
         <div className="panel-title">
           <span>Workflow</span>
-          <h2>运行链路</h2>
-          <p>先把“输入 - 处理 - 输出 - 评测”这条链路跑通，后续再接工作台预设和发布。</p>
+          <h2>Runtime flow</h2>
+          <p>Validate the input, processing, output, and evaluation loop before publishing.</p>
         </div>
         <div className="flow-line">
-          <div><b>1</b><strong>用户输入</strong><span>{inputText || '等待输入'}</span></div>
-          <div><b>2</b><strong>Manifest 校验</strong><span>{validation?.ok ? '通过' : '待检查'}</span></div>
-          <div><b>3</b><strong>Python 沙箱</strong><span>{manifest.entry}</span></div>
-          <div><b>4</b><strong>运行日志</strong><span>右侧预览面板</span></div>
+          <div><b>1</b><strong>User input</strong><span>{inputText || 'Waiting for input'}</span></div>
+          <div><b>2</b><strong>Manifest validation</strong><span>{validation?.ok ? 'Passed' : 'Needs review'}</span></div>
+          <div><b>3</b><strong>Python sandbox</strong><span>{manifest.entry}</span></div>
+          <div><b>4</b><strong>Runtime logs</strong><span>Preview panel</span></div>
         </div>
       </div>
     )
@@ -504,12 +504,12 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="code-workspace">
         <aside className="file-rail">
           <div className="rail-head">
-            <strong>文件</strong>
+            <strong>Files</strong>
             <span>{fileTree.length}</span>
           </div>
           <div className="new-file-row">
             <input placeholder="src/helper.py" value={newFilePath} onChange={e => setNewFilePath(e.target.value)} />
-            <button onClick={createFile}>新建</button>
+            <button onClick={createFile}>New</button>
           </div>
           <div className="file-list">
             {fileTree.map(file => (
@@ -524,9 +524,9 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         <main className="editor-shell">
           <div className="editor-toolbar">
             <input value={renamePath} onChange={e => setRenamePath(e.target.value)} />
-            <button onClick={renameFile}>重命名</button>
-            <button onClick={removeFile}>删除</button>
-            <button className="primary" onClick={() => saveFile()} disabled={saving}>{saving ? '保存中' : '保存文件'}</button>
+            <button onClick={renameFile}>Rename</button>
+            <button onClick={removeFile}>Delete</button>
+            <button className="primary" onClick={() => saveFile()} disabled={saving}>{saving ? 'Saving' : 'Save file'}</button>
           </div>
           <textarea value={currentContent} onChange={e => updateFile(e.target.value)} spellCheck={false} />
         </main>
@@ -539,15 +539,15 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="webide-panel prompt-panel">
         <div className="panel-title">
           <span>Prompt</span>
-          <h2>提示词与模型</h2>
-          <p>把应用的人设、边界、输出风格沉淀到 manifest，便于后续发布和复用。</p>
+          <h2>Prompt and model</h2>
+          <p>Keep the agent's role, boundaries, and response style in the manifest for reuse and release.</p>
         </div>
         <label className="full-field">
-          系统提示词
+          System prompt
           <textarea className="large-textarea" value={manifest.prompt} onChange={e => updateManifest('prompt', e.target.value)} />
         </label>
         <label>
-          模型
+          Model
           <input value={manifest.model} onChange={e => updateManifest('model', e.target.value)} />
         </label>
       </div>
@@ -560,15 +560,15 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         <div>
           <div className="panel-title">
             <span>Knowledge</span>
-            <h2>知识库</h2>
-            <p>声明应用依赖的知识库，后续由工作台和权限系统接入真实资源。</p>
+            <h2>Knowledge bases</h2>
+            <p>Declare the knowledge sources this agent requires. Access controls are applied in the workspace.</p>
           </div>
           <textarea value={stringifyList(manifest.knowledge_bases)} onChange={e => updateManifest('knowledge_bases', parseList(e.target.value))} placeholder="policy-kb&#10;sales-playbook" />
         </div>
         <div>
           <div className="panel-title compact">
             <span>Skills</span>
-            <h2>Skill 能力</h2>
+            <h2>Skills</h2>
           </div>
           <textarea value={stringifyList(manifest.skills)} onChange={e => updateManifest('skills', parseList(e.target.value))} placeholder="meeting-summary&#10;proposal-writer" />
         </div>
@@ -581,8 +581,8 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="webide-panel tools-panel">
         <div className="panel-title">
           <span>Tools</span>
-          <h2>连接器与工具声明</h2>
-          <p>声明应用需要哪些外部连接器。涉及写操作时，发布前必须进入确认和审计。</p>
+          <h2>Connectors and tools</h2>
+          <p>Declare external systems used by the agent. Write actions require approval and audit controls.</p>
         </div>
         <div className="connector-grid">
           {['feishu', 'github', 'bing', 'gaode'].map(item => {
@@ -590,7 +590,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
             return (
               <button key={item} className={active ? 'active' : ''} onClick={() => updateManifest('connectors', active ? manifest.connectors.filter(v => v !== item) : [...manifest.connectors, item])}>
                 <strong>{item}</strong>
-                <span>{active ? '已启用' : '未启用'}</span>
+                <span>{active ? 'Enabled' : 'Disabled'}</span>
               </button>
             )
           })}
@@ -605,10 +605,10 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         <div className="panel-title row-title">
           <div>
             <span>Evaluation</span>
-            <h2>效果评测</h2>
-            <p>用样例输入检查应用输出是否稳定，这是后续发布前的最小验收。</p>
+            <h2>Evaluation</h2>
+            <p>Use representative cases to check output stability before publishing.</p>
           </div>
-          <button className="primary" onClick={runEvaluation} disabled={evaluating}>{evaluating ? '评测中' : '运行评测'}</button>
+          <button className="primary" onClick={runEvaluation} disabled={evaluating}>{evaluating ? 'Evaluating' : 'Run evaluation'}</button>
         </div>
 
         <div className="case-list">
@@ -617,18 +617,18 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
               <input value={item.name} onChange={e => updateTestCase(index, { name: e.target.value })} />
               <input value={item.input} onChange={e => updateTestCase(index, { input: e.target.value })} />
               <input value={item.expected} onChange={e => updateTestCase(index, { expected: e.target.value })} />
-              <button onClick={() => setTestCases(old => old.filter((_, i) => i !== index))}>删除</button>
+              <button onClick={() => setTestCases(old => old.filter((_, i) => i !== index))}>Delete</button>
             </div>
           ))}
         </div>
-        <button onClick={() => setTestCases(old => [...old, { name: `样例 ${old.length + 1}`, input: '', expected: '' }])}>添加样例</button>
+        <button onClick={() => setTestCases(old => [...old, { name: `Case ${old.length + 1}`, input: '', expected: '' }])}>Add case</button>
 
         {evaluation && (
           <div className="evaluation-box">
-            <strong>通过率 {(evaluation.pass_rate * 100).toFixed(0)}%</strong>
-            <span>{evaluation.passed}/{evaluation.total} 通过</span>
+            <strong>Pass rate {(evaluation.pass_rate * 100).toFixed(0)}%</strong>
+            <span>{evaluation.passed}/{evaluation.total} passed</span>
             {evaluation.results.map(item => (
-              <p key={item.name} className={item.ok ? 'pass' : 'fail'}>{item.ok ? '通过' : '失败'} - {item.name} - {item.elapsed_ms}ms</p>
+              <p key={item.name} className={item.ok ? 'pass' : 'fail'}>{item.ok ? 'Passed' : 'Failed'} - {item.name} - {item.elapsed_ms}ms</p>
             ))}
           </div>
         )}
@@ -641,28 +641,28 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <div className="webide-panel security-panel">
         <div className="panel-title">
           <span>Security</span>
-          <h2>安全与发布检查</h2>
-          <p>草稿可以运行，但发布前需要通过权限、网络、secrets 和入口文件检查。</p>
+          <h2>Security and release checks</h2>
+          <p>Review permissions, network access, secrets, and the entry point before publishing.</p>
         </div>
         <label className="toggle-line">
           <input type="checkbox" checked={manifest.permissions.network} onChange={e => updatePermission('network', e.target.checked)} />
-          需要访问外网
+          Requires outbound network access
         </label>
         <label>
-          文件系统权限
+          File system access
           <select value={manifest.permissions.filesystem} onChange={e => updatePermission('filesystem', e.target.value)}>
-            <option value="sandbox">仅沙箱目录</option>
-            <option value="readonly">只读工作区</option>
+            <option value="sandbox">Sandbox directory only</option>
+            <option value="readonly">Read-only workspace</option>
           </select>
         </label>
         <label className="full-field">
-          Secrets 声明
+          Declared secrets
           <textarea value={stringifyList(manifest.permissions.secrets)} onChange={e => updatePermission('secrets', parseList(e.target.value))} placeholder="OPENAI_API_KEY&#10;FEISHU_APP_SECRET" />
         </label>
         <div className="check-list">
-          {(validation?.errors || []).map(item => <p className="fail" key={item}>阻断：{item}</p>)}
-          {(validation?.warnings || []).map(item => <p className="warn" key={item}>提醒：{item}</p>)}
-          {validation?.ok && <p className="pass">Manifest 校验通过，可以继续评测。</p>}
+          {(validation?.errors || []).map(item => <p className="fail" key={item}>Blocking: {item}</p>)}
+          {(validation?.warnings || []).map(item => <p className="warn" key={item}>Warning: {item}</p>)}
+          {validation?.ok && <p className="pass">Manifest validation passed. The draft is ready for evaluation.</p>}
         </div>
       </div>
     )
@@ -678,9 +678,9 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
           <div className="agent-use-hero">
             <span>READY TO USE AGENT</span>
             <h2>{manifest.name || appName}</h2>
-            <p>{manifest.description || '这个 Agent 已经生成完成，可直接运行、验证并作为投放原型使用。'}</p>
+            <p>{manifest.description || 'This agent is ready to run, evaluate, and use as a deployment prototype.'}</p>
             <div className="agent-use-badges">
-              <b>{ready ? '可投放' : '准备中'}</b>
+              <b>{ready ? 'Ready' : 'Preparing'}</b>
               <b>{manifest.model}</b>
               <b>{manifest.skills.length || 0} Skills</b>
               <b>{fileTree.length} Files</b>
@@ -692,60 +692,60 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
               <span>A</span>
               <div>
                 <strong>{manifest.name || 'Atlas Agent'}</strong>
-                <p>你好，我已经可以使用。你可以直接输入业务问题，我会按照已生成的提示词、Skill 和沙箱代码输出结果。</p>
+                <p>I am ready. Enter a task and I will respond using the generated prompt, skills, and sandbox code.</p>
               </div>
             </div>
 
             <label className="agent-use-input">
-              让 Agent 处理什么任务？
+              What should this agent do?
               <textarea
                 value={inputText}
                 onChange={e => setInputText(e.target.value)}
-                placeholder="例如：请根据知识库说明售后处理流程，并生成一段给客户的回复。"
+                placeholder="For example: Explain our return policy from the knowledge base and draft a customer response."
               />
             </label>
 
             <div className="agent-use-actions">
               <button className="primary" onClick={runPreview} disabled={running || !inputText.trim()}>
-                {running ? 'Agent 正在处理...' : '运行 Agent'}
+                {running ? 'Agent is working...' : 'Run agent'}
               </button>
-              <button onClick={() => setInputText('请帮我总结这个需求，并给出下一步处理建议。')}>试用示例</button>
+              <button onClick={() => setInputText('Summarize this request and recommend the next steps.')}>Try example</button>
             </div>
 
             <div className="agent-answer-card">
               <div className="answer-title">
-                <span>Agent 输出</span>
-                <b>{running ? '运行中' : logs.includes('exit code') ? '已完成' : '等待输入'}</b>
+                <span>Agent output</span>
+                <b>{running ? 'Running' : logs.includes('exit code') ? 'Complete' : 'Waiting for input'}</b>
               </div>
-              <pre>{visibleLogs || '运行后这里会直接显示 Agent 的回答，不需要先调整配置。'}</pre>
+              <pre>{visibleLogs || 'The agent response will appear here after you run it.'}</pre>
             </div>
           </div>
         </section>
 
         <aside className="agent-use-side">
           <div className="agent-side-card">
-            <span>上线准备</span>
-            <h3>可用 Agent 已生成</h3>
-            <p>系统已自动生成配置、代码、Skill 和测试文件。普通用户直接使用，高级用户再进入编辑。</p>
+            <span>Release readiness</span>
+            <h3>Your agent is ready</h3>
+            <p>Atlas generated the configuration, code, skill spec, and tests. Run it now or open advanced editing when needed.</p>
           </div>
 
           <div className="agent-side-card">
-            <span>能力</span>
+            <span>Capabilities</span>
             <div className="skill-tags use-tags">
-              {manifest.skills.length ? manifest.skills.map(item => <span key={item}>{item}</span>) : <span>上线准备</span>}
+              {manifest.skills.length ? manifest.skills.map(item => <span key={item}>{item}</span>) : <span>Release ready</span>}
               {manifest.connectors.map(item => <span key={item}>{item}</span>)}
             </div>
           </div>
 
           <div className="agent-side-card">
-            <span>应用文件</span>
+            <span>App files</span>
             <div className="file-chips">
               {fileTree.map(file => <b key={file.path}>{file.name}</b>)}
             </div>
           </div>
 
           <button className="advanced-toggle" onClick={() => setAdvancedMode(true)}>
-            高级编辑：查看代码和配置
+            Advanced editing: code and configuration
           </button>
         </aside>
       </div>
@@ -768,17 +768,17 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
       <header className="webide-header use-header">
         <div>
           <span className="eyebrow">Agent Ready</span>
-          <h1>{advancedMode ? '高级编辑 Web IDE' : '直接使用 Agent'}</h1>
-          <p>{advancedMode ? '仅在需要修改代码、Prompt 或发布配置时进入这里。' : '这个 Agent 已经自动生成完成，可以直接输入任务运行，不需要手动调整配置。'}</p>
+          <h1>{advancedMode ? 'Advanced Web IDE' : 'Run your agent'}</h1>
+          <p>{advancedMode ? 'Edit code, prompts, and release settings here.' : 'This agent is generated and ready to run without manual configuration.'}</p>
         </div>
         <div className="actions">
           {advancedMode ? (
-            <button onClick={() => setAdvancedMode(false)}>返回使用 Agent</button>
+            <button onClick={() => setAdvancedMode(false)}>Back to agent</button>
           ) : (
-            <button onClick={() => setAdvancedMode(true)}>试用示例</button>
+            <button onClick={() => setAdvancedMode(true)}>Advanced editing</button>
           )}
-          <button onClick={initDraft} disabled={loading}>{loading ? '加载中' : '新建 Agent'}</button>
-          <button className="primary" onClick={runPreview} disabled={running || !inputText.trim()}>{running ? '运行中' : '运行 Agent'}</button>
+          <button onClick={initDraft} disabled={loading}>{loading ? 'Loading' : 'New agent'}</button>
+          <button className="primary" onClick={runPreview} disabled={running || !inputText.trim()}>{running ? 'Running' : 'Run agent'}</button>
         </div>
       </header>
 
@@ -786,7 +786,7 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
         <div className={validation?.ok ? 'status-pill online' : 'status-pill'}>{statusText(validation, serverMode)}</div>
         <span>{manifest.name || appName}</span>
         <span>{manifest.model}</span>
-        <span>{advancedMode ? '高级编辑已打开' : '可直接使用'}</span>
+        <span>{advancedMode ? 'Advanced editing open' : 'Ready to use'}</span>
       </div>
 
       {advancedMode ? (
@@ -805,13 +805,13 @@ export default function WebIDE({ notice, initialDraft }: { notice: (text: string
           <aside className="debug">
             <div className="preview-head">
               <div>
-                <h3>运行预览</h3>
-                <span>沙箱日志与错误定位</span>
+                <h3>Runtime preview</h3>
+                <span>Sandbox logs and errors</span>
               </div>
-              <button onClick={runPreview} disabled={running}>{running ? '运行中' : 'Run'}</button>
+              <button onClick={runPreview} disabled={running}>{running ? 'Running' : 'Run'}</button>
             </div>
             <label>
-              输入
+              Input
               <textarea className="run-input" value={inputText} onChange={e => setInputText(e.target.value)} />
             </label>
             <pre>{logs}</pre>

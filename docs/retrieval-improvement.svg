@@ -39,7 +39,7 @@
   <line class="track" x1="370" y1="184" x2="590" y2="184"/>
   <line class="before" x1="370" y1="184" x2="502" y2="184" stroke-width="8" stroke-linecap="round"/>
   <circle class="after" cx="370" cy="184" r="7"/>
-  <text class="note" x="363" y="218">区块链 ≠ 区域块状链条</text>
+  <text class="note" x="363" y="218">CJK bigrams reduce partial-match noise</text>
   <text class="note" x="363" y="247">Chinese bigrams remove character noise</text>
 
   <rect class="panel" x="646" y="62" width="282" height="202" rx="12"/>

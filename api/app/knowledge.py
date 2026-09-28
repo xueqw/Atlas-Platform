@@ -20,13 +20,13 @@ def extract_pages(filename: str, raw: bytes) -> list[tuple[int, str]]:
         text = "\n".join(paragraph.text for paragraph in DocxDocument(io.BytesIO(raw)).paragraphs)
         return [(1, text)]
     if suffix not in {".txt", ".md", ".csv", ".json"}:
-        raise ValueError("暂不支持该文件格式，请上传 PDF、DOCX、TXT、Markdown、CSV 或 JSON")
+        raise ValueError("Unsupported file type. Upload a PDF, DOCX, TXT, Markdown, CSV, or JSON file.")
     for encoding in ("utf-8-sig", "gb18030"):
         try:
             return [(1, raw.decode(encoding))]
         except UnicodeDecodeError:
             continue
-    raise ValueError("无法识别文件编码")
+    raise ValueError("The file encoding could not be detected")
 
 
 def split_pages(pages: list[tuple[int, str]], size: int = 700, overlap: int = 100) -> list[tuple[int, str]]:

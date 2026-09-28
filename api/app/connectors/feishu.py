@@ -1,8 +1,4 @@
-"""飞书连接器：OAuth 2.0 授权码流程 + 基础能力（拿用户信息、发消息）。
-
-链路：login(拼授权URL) → 用户在飞书授权 → callback(code换token,存库) → 之后用 token 调飞书 API。
-凭证从 settings 读（.env），绝不硬编码、绝不传给模型。
-"""
+"""Optional Feishu connector for OAuth and messaging."""
 import json
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -23,12 +19,12 @@ MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
 TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 BATCH_GET_ID_URL = "https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id"
 
-# 先要最小权限：拿用户身份。发消息能力后续再加 im:message。
+# Request only the minimum identity scope here.
 SCOPES = "contact:user.base:readonly"
 
 
 def _config() -> dict:
-    """读公司统一配置（管理员在界面配的 app_id/app_secret），回退 .env。"""
+    """Read organization settings saved by an admin, then fall back to .env."""
     with SessionLocal() as db:
         row = db.scalar(select(ConnectorConfig).where(ConnectorConfig.provider == PROVIDER))
         cfg = json.loads(row.data) if row and row.data else {}
@@ -75,7 +71,7 @@ def build_authorize_url(state: str) -> str:
 
 
 async def exchange_code(code: str) -> dict:
-    """用授权码换 user_access_token。"""
+    """Exchange an authorization code for a user access token."""
     cfg = _config()
     payload = {
         "grant_type": "authorization_code",
@@ -112,26 +108,26 @@ def save_token(db: Session, token_resp: dict, account_name: str, open_id: str = 
 
 
 async def get_tenant_access_token() -> str:
-    """以应用身份拿 tenant_access_token（发消息用，无需用户 OAuth）。"""
+    """Get an app-level tenant token for messaging."""
     cfg = _config()
     async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
         r = await client.post(TENANT_TOKEN_URL, json={"app_id": cfg["app_id"], "app_secret": cfg["app_secret"]})
         r.raise_for_status()
         data = r.json()
         if data.get("code", -1) != 0:
-            raise RuntimeError(f"飞书应用凭证无效 {data.get('code')}：{data.get('msg')}")
+            raise RuntimeError(f"Invalid Feishu app credentials ({data.get('code')}): {data.get('msg')}")
         return data["tenant_access_token"]
 
 
 async def lookup_open_id_by_mobile(mobile: str) -> str | None:
-    """用手机号查 open_id（需权限 contact:user.id:readonly）。查不到返回 None。"""
+    """Look up a Feishu open_id by mobile number."""
     token = await get_tenant_access_token()
     async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
         r = await client.post(BATCH_GET_ID_URL + "?user_id_type=open_id",
                               headers={"Authorization": f"Bearer {token}"}, json={"mobiles": [mobile]})
     data = r.json()
     if data.get("code", -1) != 0:
-        raise RuntimeError(f"飞书查用户失败 {data.get('code')}：{data.get('msg')}")
+        raise RuntimeError(f"Feishu user lookup failed ({data.get('code')}): {data.get('msg')}")
     for user in data.get("data", {}).get("user_list", []):
         if user.get("user_id"):  # user_id_type=open_id 时此字段即 open_id
             return user["user_id"]
@@ -139,8 +135,7 @@ async def lookup_open_id_by_mobile(mobile: str) -> str | None:
 
 
 async def send_message(receive_id: str, text: str, receive_id_type: str = "open_id") -> dict:
-    """以机器人身份发文本消息。receive_id_type 可为 open_id（默认）或 email。
-    失败时把飞书的错误码+原因带出来。"""
+    """Send a text message as the app bot using an open_id or email address."""
     token = await get_tenant_access_token()
     payload = {"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}
     async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
@@ -148,21 +143,20 @@ async def send_message(receive_id: str, text: str, receive_id_type: str = "open_
                               headers={"Authorization": f"Bearer {token}"}, json=payload)
     data = r.json()
     if data.get("code", -1) != 0:  # 飞书业务错误码，0 才是成功
-        raise RuntimeError(f"飞书错误 {data.get('code')}：{data.get('msg')}")
+        raise RuntimeError(f"Feishu error ({data.get('code')}): {data.get('msg')}")
     return data
 
 
 async def get_status(db: Session) -> dict:
-    """公司统一：configured=已配应用凭证；connected=凭证有效(能拿 tenant_token)。
-    不再依赖某个用户去 OAuth——机器人以应用身份给全公司成员发消息。"""
+    """Return organization-level configuration and connectivity status."""
     status = {
         "provider": PROVIDER,
-        "name": "飞书",
-        "description": "公司统一接入：管理员配置应用凭证后，智能体即可给本公司成员发飞书消息（邮箱 / 手机号）。",
+        "name": "Feishu (optional)",
+        "description": "Optional organization connector for sending Feishu messages by email address or mobile number.",
         "configured": is_configured(),
         "connected": False,
         "account_name": "",
-        "actions": ["发送飞书消息"],
+        "actions": ["Send Feishu messages"],
     }
     if not is_configured():
         return status
@@ -170,7 +164,7 @@ async def get_status(db: Session) -> dict:
         await get_tenant_access_token()  # 凭证有效才算连上
         status["connected"] = True
         row = db.scalar(select(ConnectorToken).where(ConnectorToken.provider == PROVIDER))
-        status["account_name"] = "应用已就绪" + (f" · 默认收件人 {row.account_name}" if row else "")
+        status["account_name"] = "App ready" + (f" · default recipient {row.account_name}" if row else "")
     except Exception as exc:
-        status["account_name"] = f"凭证无效：{exc}"[:80]
+        status["account_name"] = f"Invalid credentials: {exc}"[:80]
     return status

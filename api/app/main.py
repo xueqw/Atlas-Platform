@@ -37,7 +37,7 @@ def list_conversations(db: Session = Depends(get_db)):
 
 @app.post("/api/conversations", response_model=ConversationOut, status_code=201)
 def create_conversation(payload: ConversationCreate, db: Session = Depends(get_db)):
-    item = Conversation(title=payload.title.strip() or "新任务")
+    item = Conversation(title=payload.title.strip() or "New task")
     db.add(item); db.commit(); db.refresh(item)
     return item
 
@@ -46,7 +46,7 @@ def create_conversation(payload: ConversationCreate, db: Session = Depends(get_d
 def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
     item = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id))
     if not item:
-        raise HTTPException(404, "任务不存在")
+        raise HTTPException(404, "Task not found")
     return item
 
 
@@ -54,7 +54,7 @@ def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
 def delete_conversation(conversation_id: str, db: Session = Depends(get_db)):
     item = db.get(Conversation, conversation_id)
     if not item:
-        raise HTTPException(404, "任务不存在")
+        raise HTTPException(404, "Task not found")
     db.delete(item); db.commit()
 
 
@@ -84,7 +84,7 @@ def create_agent(payload: AgentCreate, db: Session = Depends(get_db)):
 def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_db)):
     item = db.get(Agent, agent_id)
     if not item:
-        raise HTTPException(404, "智能体不存在")
+        raise HTTPException(404, "Agent not found")
     for key, value in payload.model_dump().items():
         setattr(item, key, value)
     db.commit(); db.refresh(item)
@@ -95,7 +95,7 @@ def update_agent(agent_id: str, payload: AgentUpdate, db: Session = Depends(get_
 def delete_agent(agent_id: str, db: Session = Depends(get_db)):
     item = db.get(Agent, agent_id)
     if not item:
-        raise HTTPException(404, "智能体不存在")
+        raise HTTPException(404, "Agent not found")
     db.delete(item); db.commit()
 
 
@@ -115,7 +115,7 @@ def create_knowledge_base(payload: KnowledgeBaseCreate, db: Session = Depends(ge
 def delete_knowledge_base(knowledge_base_id: str, db: Session = Depends(get_db)):
     item = db.get(KnowledgeBase, knowledge_base_id)
     if not item:
-        raise HTTPException(404, "知识库不存在")
+        raise HTTPException(404, "Knowledge base not found")
     db.delete(item); db.commit()
 
 
@@ -123,22 +123,22 @@ def delete_knowledge_base(knowledge_base_id: str, db: Session = Depends(get_db))
 async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     knowledge_base = db.get(KnowledgeBase, knowledge_base_id)
     if not knowledge_base:
-        raise HTTPException(404, "知识库不存在")
+        raise HTTPException(404, "Knowledge base not found")
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(413, "文件不能超过 10 MB")
+        raise HTTPException(413, "Files must be 10 MB or smaller")
     try:
         pieces = split_pages(extract_pages(file.filename or "document.txt", raw))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not pieces:
-        raise HTTPException(400, "文档中没有可索引的文本")
-    document = Document(knowledge_base_id=knowledge_base_id, name=file.filename or "未命名文档", content_type=file.content_type or "application/octet-stream", size=len(raw), chunk_count=len(pieces))
+        raise HTTPException(400, "The document does not contain indexable text")
+    document = Document(knowledge_base_id=knowledge_base_id, name=file.filename or "Untitled document", content_type=file.content_type or "application/octet-stream", size=len(raw), chunk_count=len(pieces))
     db.add(document); db.flush()
     try:
         vectors = await embed_texts([content for _, content in pieces])
     except Exception:
-        vectors = []  # embedding 服务异常时仍入库，检索阶段自动回退关键词
+        vectors = []  # Preserve the document and let retrieval fall back to BM25.
     db.add_all([
         DocumentChunk(
             document_id=document.id, chunk_index=index, page=page, content=content,
@@ -154,28 +154,28 @@ async def upload_document(knowledge_base_id: str, file: UploadFile = File(...), 
 async def extract_attachment(file: UploadFile = File(...)):
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(413, "文件不能超过 10 MB")
+        raise HTTPException(413, "Files must be 10 MB or smaller")
     try:
         text = "\n".join(content for _, content in extract_pages(file.filename or "attachment.txt", raw)).strip()
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not text:
-        raise HTTPException(400, "文件中没有可读取的文本")
-    return {"name": file.filename or "未命名文件", "text": text[:40000]}
+        raise HTTPException(400, "The file does not contain readable text")
+    return {"name": file.filename or "Untitled file", "text": text[:40000]}
 
 
 @app.delete("/api/documents/{document_id}", status_code=204)
 def delete_document(document_id: str, db: Session = Depends(get_db)):
     item = db.get(Document, document_id)
     if not item:
-        raise HTTPException(404, "文档不存在")
+        raise HTTPException(404, "Document not found")
     db.delete(item); db.commit()
 
 
-_oauth_states: set[str] = set()  # demo 级 CSRF state 暂存；生产应放带过期的存储
-_pending_actions: dict[str, dict] = {}  # conversation_id -> 待确认的写操作 {name, args}
-_AFFIRM = {"确认", "确定", "是", "好", "好的", "发送", "可以", "行", "嗯", "yes", "y", "ok"}
-_DENY = {"取消", "不", "不要", "否", "算了", "no", "n"}
+_oauth_states: set[str] = set()  # Demo-only CSRF state storage; use an expiring store in production.
+_pending_actions: dict[str, dict] = {}  # conversation_id -> pending write action {name, args}
+_AFFIRM = {"确认", "确定", "是", "好", "好的", "发送", "可以", "行", "嗯", "confirm", "yes", "y", "ok"}
+_DENY = {"取消", "不", "不要", "否", "算了", "cancel", "no", "n"}
 
 
 def _affirm(text: str) -> bool:
@@ -194,7 +194,7 @@ async def list_connectors(db: Session = Depends(get_db)):
 @app.post("/api/connectors/feishu/config")
 async def feishu_config(payload: FeishuConfigRequest, db: Session = Depends(get_db)):
     feishu.save_config(db, payload.app_id.strip(), payload.app_secret.strip())
-    return await feishu.get_status(db)  # 立刻校验凭证
+    return await feishu.get_status(db)
 
 
 @app.delete("/api/connectors/feishu/config", status_code=204)
@@ -205,7 +205,7 @@ def feishu_config_clear(db: Session = Depends(get_db)):
 @app.post("/api/connectors/github/config")
 async def github_config(payload: GithubConfigRequest, db: Session = Depends(get_db)):
     github_mcp.save_pat(db, payload.pat.strip())
-    return await github_mcp.get_status()  # 立刻验证：返回连接状态+工具数
+    return await github_mcp.get_status()
 
 
 @app.delete("/api/connectors/github", status_code=204)
@@ -216,7 +216,7 @@ def github_disconnect(db: Session = Depends(get_db)):
 @app.get("/api/connectors/feishu/login")
 def feishu_login():
     if not feishu.is_configured():
-        raise HTTPException(400, "飞书未配置（缺 App ID / App Secret）")
+        raise HTTPException(400, "Feishu is not configured (App ID or App Secret is missing)")
     state = secrets.token_urlsafe(16)
     _oauth_states.add(state)
     return RedirectResponse(feishu.build_authorize_url(state))
@@ -225,27 +225,27 @@ def feishu_login():
 @app.get("/api/connectors/feishu/callback")
 async def feishu_callback(code: str = "", state: str = "", db: Session = Depends(get_db)):
     if not code or state not in _oauth_states:
-        return HTMLResponse("<h3>授权失败：参数缺失或 state 不匹配</h3>", status_code=400)
+        return HTMLResponse("<h3>Authorization failed: missing parameters or invalid state.</h3>", status_code=400)
     _oauth_states.discard(state)
     try:
         token = await feishu.exchange_code(code)
         info = await feishu.fetch_user_info(token["access_token"])
-        name = info.get("name", "飞书用户")
+        name = info.get("name", "Feishu user")
         feishu.save_token(db, token, name, open_id=info.get("open_id", ""))
     except Exception as exc:
-        return HTMLResponse(f"<h3>授权失败：{exc}</h3>", status_code=500)
-    return HTMLResponse(f"<h3>✅ 已连接飞书：{name}</h3><p>可以关闭此页返回工作台。</p>")
+        return HTMLResponse(f"<h3>Authorization failed: {exc}</h3>", status_code=500)
+    return HTMLResponse(f"<h3>✅ Feishu connected: {name}</h3><p>You can close this page and return to Atlas.</p>")
 
 
 @app.post("/api/conversations/{conversation_id}/messages/stream")
 async def send_message(conversation_id: str, payload: ChatRequest, db: Session = Depends(get_db)):
     conversation = db.scalar(select(Conversation).options(selectinload(Conversation.messages)).where(Conversation.id == conversation_id))
     if not conversation:
-        raise HTTPException(404, "任务不存在")
+        raise HTTPException(404, "Task not found")
 
     async def execute_tool(name: str, arguments: str) -> str:
         if name not in agent_tools.TOOLS and github_mcp.is_configured():
-            return await github_mcp.call_tool(name, arguments)  # 非静态工具 = GitHub MCP 工具
+            return await github_mcp.call_tool(name, arguments)
         with SessionLocal() as tool_db:
             return await agent_tools.dispatch(tool_db, name, arguments)
 
@@ -258,7 +258,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
                 saved.updated_at = datetime.now(timezone.utc)
             wdb.commit()
 
-    # === 待确认的写操作：把本条消息当作「确认/取消」处理，不走模型 ===
+    # Handle approval or cancellation of a pending write action without invoking the model.
     pending = _pending_actions.pop(conversation_id, None)
     if pending and (_affirm(payload.content) or _deny(payload.content)):
         approved = _affirm(payload.content)
@@ -268,7 +268,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
             if approved:
                 result = await execute_tool(pending["name"], json.dumps(pending["args"], ensure_ascii=False))
             else:
-                result = "好的，已取消，未执行。"
+                result = "Canceled. No action was taken."
             save_assistant(result)
             for ch in result:
                 yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
@@ -277,8 +277,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
         return StreamingResponse(confirm_events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     agent = db.get(Agent, payload.agent_id) if payload.agent_id else None
-    # 以前端选择为准：选智能体时前端会自动把它的库填进下拉框；选「不使用知识库」即真的不用，
-    # 不再用 agent.knowledge_base_id 偷偷回退（否则「不使用知识库」会被智能体绑定库覆盖）。
+    # Respect the explicit knowledge-base selection made by the client.
     knowledge_base_id = payload.knowledge_base_id
     query_vector = await embed_query(payload.content) if knowledge_base_id else None
     sources = search_chunks(db, knowledge_base_id, payload.content, query_vector) if knowledge_base_id else []
@@ -288,16 +287,16 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
     db.add(user_message); db.commit()
     history = [{"role": message.role, "content": message.content} for message in conversation.messages]
     if agent:
-        history.append({"role": "system", "content": f"智能体身份与规则：\n{agent.system_prompt}"})
+        history.append({"role": "system", "content": f"Agent identity and rules:\n{agent.system_prompt}"})
     if sources:
-        context = "\n\n".join(f"[{item['document']} 第{item['page']}页]\n{item['content']}" for item in sources)
-        history.append({"role": "system", "content": "知识库资料（仅依据这些资料回答）：\n" + context})
+        context = "\n\n".join(f"[{item['document']}, page {item['page']}]\n{item['content']}" for item in sources)
+        history.append({"role": "system", "content": "Knowledge base sources (answer only from these sources):\n" + context})
     if payload.attachment_text:
-        history.append({"role": "system", "content": f"用户上传的文件「{payload.attachment_name or '附件'}」内容：\n{payload.attachment_text[:8000]}"})
+        history.append({"role": "system", "content": f"User-uploaded file '{payload.attachment_name or 'attachment'}':\n{payload.attachment_text[:8000]}"})
     history.append({"role": "user", "content": payload.content})
     model = payload.model
 
-    # 组装本次可用工具：静态连接器（飞书）+ 动态 MCP 连接器（GitHub）
+    # Combine static connector tools with tools discovered through GitHub MCP.
     tool_specs = agent_tools.specs(payload.connectors)
     mcp_write_names: set[str] = set()
     if "github" in payload.connectors and github_mcp.is_configured():
@@ -305,7 +304,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
             gh_specs, mcp_write_names = await github_mcp.tool_specs()
             tool_specs = tool_specs + gh_specs
         except Exception:
-            pass  # GitHub MCP 拉取失败就跳过其工具，不影响整体对话
+            pass  # Keep chat available if GitHub MCP discovery fails.
 
     def needs_confirm(name: str) -> bool:
         return agent_tools.is_write(name) or name in mcp_write_names
@@ -320,7 +319,7 @@ async def send_message(conversation_id: str, payload: ChatRequest, db: Session =
                 if ev["type"] == "confirm_required":
                     args = json.loads(ev["args"] or "{}") if isinstance(ev["args"], str) else ev["args"]
                     _pending_actions[conversation_id] = {"name": ev["name"], "args": args}
-                    prompt = agent_tools.describe_call(ev["name"], args) + "\n\n确认请回复「确认」，取消请回复「取消」。"
+                    prompt = agent_tools.describe_call(ev["name"], args) + "\n\nReply `confirm` to continue or `cancel` to stop."
                     parts.append(prompt)
                     yield f"data: {json.dumps({'type': 'token', 'content': prompt}, ensure_ascii=False)}\n\n"
                     continue

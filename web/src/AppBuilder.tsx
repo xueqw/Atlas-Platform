@@ -33,7 +33,7 @@ export default function AppBuilder({
           className={tab === 'project' ? 'active' : ''}
           onClick={() => setTab('project')}
         >
-          项目对话生成
+          Generate App
         </button>
 
         <button
@@ -41,7 +41,7 @@ export default function AppBuilder({
           className={tab === 'agent' ? 'active' : ''}
           onClick={() => setTab('agent')}
         >
-          智能体配置
+          Agent Settings
         </button>
 
         <button

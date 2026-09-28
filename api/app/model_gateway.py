@@ -4,35 +4,35 @@ import time
 import httpx
 from .config import settings
 
-SYSTEM_PROMPT = "你是一名严谨、清晰的企业智能助手。优先依据知识库回答，并明确指出资料不足之处。"
+SYSTEM_PROMPT = "You are a careful enterprise AI assistant. Ground answers in the connected knowledge base, cite relevant sources, and clearly state when the available information is insufficient."
 
-DEFAULT_MODEL = "glm-4-flash"
+DEFAULT_MODEL = settings.openai_model
 
-# 供应商注册表：模型路由、模型管理页、连接测试的唯一数据源。
+# Single source of truth for model routing and the provider settings screen.
 PROVIDERS = [
     {
+        "id": "openai",
+        "name": "OpenAI",
+        "base_url": settings.openai_base_url,
+        "api_key": settings.openai_api_key,
+        "prefix": "gpt",
+        "models": [settings.openai_model],
+        "note": "Primary",
+    },
+    {
         "id": "zhipu",
-        "name": "智谱 AI",
+        "name": "Zhipu AI (optional)",
         "base_url": settings.zhipu_base_url,
         "api_key": settings.zhipu_api_key,
         "prefix": "glm",
         "models": ["glm-4-flash", "glm-4.5-flash"],
-        "note": "免费",
-    },
-    {
-        "id": "aliyun",
-        "name": "阿里云百炼",
-        "base_url": settings.openai_base_url,
-        "api_key": settings.openai_api_key,
-        "prefix": "qwen",
-        "models": ["qwen-turbo", "qwen-plus", "qwen-max"],
-        "note": "通义千问",
+        "note": "Optional international provider",
     },
 ]
 
 
 def resolve_provider(model: str | None) -> tuple[str, str, str]:
-    """根据模型名路由到对应供应商，返回 (base_url, api_key, model)。"""
+    """Route a model name to its provider and return (base_url, api_key, model)."""
     for p in PROVIDERS:
         if model and (model in p["models"] or (p["prefix"] and model.lower().startswith(p["prefix"]))):
             return p["base_url"], p["api_key"], model
@@ -40,7 +40,7 @@ def resolve_provider(model: str | None) -> tuple[str, str, str]:
 
 
 def list_providers() -> dict:
-    """模型管理页用：列出所有供应商、各自模型、是否已配置 key。"""
+    """List providers and configuration status for the model settings page."""
     return {
         "default": DEFAULT_MODEL,
         "providers": [
@@ -58,10 +58,10 @@ def list_providers() -> dict:
 
 
 async def test_model(model: str) -> dict:
-    """对指定模型发一次最小请求，测连通性与延迟。"""
+    """Send a minimal request to test provider connectivity and latency."""
     base_url, api_key, real_model = resolve_provider(model)
     if not api_key:
-        return {"ok": False, "message": "该供应商未配置 API Key（当前为演示模式）"}
+        return {"ok": False, "message": "This provider does not have an API key configured."}
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": real_model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
@@ -88,7 +88,6 @@ async def stream_model(messages: list[dict], model: str | None = None):
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"model": real_model, "stream": True, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages[-14:]]}
-    # trust_env=False：国内 API 直连，不走系统代理（如 Clash），避免被代理拦截
     async with httpx.AsyncClient(timeout=90, trust_env=False) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as response:
             response.raise_for_status()
@@ -102,16 +101,30 @@ async def stream_model(messages: list[dict], model: str | None = None):
 
 
 async def embed_texts(texts: list[str], batch_size: int = 32) -> list[list[float]]:
-    """把多段文本转成向量（硅基流动 bge-m3）。未配置 key 时返回空列表，让调用方回退关键词检索。"""
-    if not settings.siliconflow_api_key or not texts:
+    """Embed text with an OpenAI-compatible endpoint; return [] for BM25 fallback."""
+    if not texts:
         return []
-    url = settings.siliconflow_base_url.rstrip("/") + "/embeddings"
-    headers = {"Authorization": f"Bearer {settings.siliconflow_api_key}", "Content-Type": "application/json"}
+    if settings.embedding_api_key or settings.embedding_base_url:
+        api_key = settings.embedding_api_key or settings.openai_api_key
+        base_url = settings.embedding_base_url or settings.openai_base_url
+        model = settings.embedding_model or "text-embedding-3-small"
+    elif settings.siliconflow_api_key:
+        api_key = settings.siliconflow_api_key
+        base_url = settings.siliconflow_base_url
+        model = settings.embedding_model or settings.siliconflow_embedding_model
+    elif settings.openai_api_key:
+        api_key = settings.openai_api_key
+        base_url = settings.openai_base_url
+        model = settings.embedding_model or "text-embedding-3-small"
+    else:
+        return []
+    url = base_url.rstrip("/") + "/embeddings"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     vectors: list[list[float]] = []
     async with httpx.AsyncClient(timeout=60, trust_env=False) as client:
         for start in range(0, len(texts), batch_size):
             batch = texts[start:start + batch_size]
-            payload = {"model": settings.embedding_model, "input": batch}
+            payload = {"model": model, "input": batch}
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = sorted(response.json()["data"], key=lambda item: item["index"])
@@ -120,7 +133,7 @@ async def embed_texts(texts: list[str], batch_size: int = 32) -> list[list[float
 
 
 async def embed_query(text: str) -> list[float] | None:
-    """单条文本转向量；失败或未配置时返回 None，触发关键词回退。"""
+    """Embed one query, returning None to trigger BM25 when unavailable."""
     try:
         vectors = await embed_texts([text])
     except Exception:
@@ -129,14 +142,10 @@ async def embed_query(text: str) -> list[float] | None:
 
 
 async def stream_agent(messages: list[dict], model: str | None, tool_specs: list[dict], execute_tool, needs_confirm=None, max_rounds: int = 4):
-    """带工具调用的对话循环。yield 事件 dict：
-    {type:token, content} / {type:tool_call, name, args} / {type:tool_result, name, content}
-    / {type:confirm_required, name, args}（写操作，停下等用户确认）。
-    模型决定调工具→（写操作先确认）→执行→把结果塞回→再问，直到给出文字回答或达到轮数上限。
-    """
+    """Stream a model response and execute approved tool calls."""
     needs_confirm = needs_confirm or (lambda _name: False)
     base_url, api_key, real_model = resolve_provider(model)
-    if not api_key:  # 演示模式：无 key，退化成纯文本
+    if not api_key:
         for ch in demo_answer(messages):
             yield {"type": "token", "content": ch}
         return
@@ -146,7 +155,7 @@ async def stream_agent(messages: list[dict], model: str | None, tool_specs: list
 
     for _ in range(max_rounds):
         payload = {"model": real_model, "stream": True, "messages": convo}
-        if tool_specs:  # 没有启用任何连接器时就当普通对话，不带 tools 字段
+        if tool_specs:
             payload["tools"] = tool_specs
         tool_calls: dict[int, dict] = {}
         finish = None
@@ -175,15 +184,15 @@ async def stream_agent(messages: list[dict], model: str | None, tool_specs: list
                             slot["arguments"] += fn["arguments"]
 
         if finish != "tool_calls" or not tool_calls:
-            return  # 模型给出最终回答，结束
+            return
 
         calls = [tool_calls[i] for i in sorted(tool_calls)]
-        # 写操作：停下，发确认请求给上层，本轮不执行
+        # Write operations pause for explicit user confirmation.
         for c in calls:
             if needs_confirm(c["name"]):
                 yield {"type": "confirm_required", "name": c["name"], "args": c["arguments"]}
                 return
-        # 只读工具：直接执行并把结果回填，继续循环
+        # Read-only tools execute immediately and feed results back to the model.
         convo.append({"role": "assistant", "content": None,
                       "tool_calls": [{"id": c["id"], "type": "function",
                                       "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]})
@@ -192,15 +201,15 @@ async def stream_agent(messages: list[dict], model: str | None, tool_specs: list
             result = await execute_tool(c["name"], c["arguments"])
             yield {"type": "tool_result", "name": c["name"], "content": result}
             convo.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-    # 达到轮数上限仍在调工具，兜底结束
+    # Stop if the model reaches the tool-call round limit.
 
 
 def demo_answer(messages: list[dict]) -> str:
     question = messages[-1]["content"]
-    context = next((item["content"] for item in reversed(messages) if item["role"] == "system" and item["content"].startswith("知识库资料")), "")
+    context = next((item["content"] for item in reversed(messages) if item["role"] == "system" and item["content"].startswith("Knowledge base sources")), "")
     if context:
         excerpt = context.split("\n", 2)[-1][:420]
-        return f"根据已连接的知识库资料：{excerpt}\n\n以上内容来自本地检索结果。配置模型密钥后会生成更完整的归纳回答。"
-    if any(word in question for word in ("企业版", "功能", "权限")):
-        return "企业版支持私有知识库、模型统一接入、工具调用、权限管理与运行审计。"
-    return "任务已由 FastAPI 会话服务接收并持久化。你可以连接知识库，让回答基于自己的资料。"
+        return f"Based on the connected knowledge base: {excerpt}\n\nThis excerpt comes from local retrieval. Configure a model API key for a complete synthesized answer."
+    if any(word in question.lower() for word in ("enterprise", "features", "permissions")):
+        return "The enterprise workspace supports private knowledge bases, centralized model access, tool calls, access controls, and audit-ready workflows."
+    return "The FastAPI service received and saved this task. Connect a knowledge base to ground future answers in your own source material."
